@@ -14279,7 +14279,7 @@ async fn api_sales_order_sort_items_by_purchaser() -> impl IntoResponse {
 
 async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, so.remark as order_remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
@@ -14320,7 +14320,7 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "amount": r.get::<f64, _>("amount"),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
-            "remark": r.get::<Option<String>, _>("order_remark").unwrap_or_default(),
+            "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
         }));
     }
     
