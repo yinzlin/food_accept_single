@@ -4025,11 +4025,11 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     
                     const input = event.target;
                     if (cellIndex === 3) {{
-                        items[index].unit_price = parseFloat(input.value) || 0;
-                        items[index].amount = items[index].unit_price * items[index].quantity;
-                    }} else if (cellIndex === 4) {{
                         items[index].quantity = parseFloat(input.value) || 0;
                         items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
+                        items[index].amount = items[index].unit_price * items[index].quantity;
+                    }} else if (cellIndex === 4) {{
+                        items[index].unit_price = parseFloat(input.value) || 0;
                         items[index].amount = items[index].unit_price * items[index].quantity;
                     }}
                     renderItems();
@@ -4568,11 +4568,11 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     
                     const input = event.target;
                     if (cellIndex === 3) {{
-                        items[index].unit_price = parseFloat(input.value) || 0;
-                        items[index].amount = items[index].unit_price * items[index].quantity;
-                    }} else if (cellIndex === 4) {{
                         items[index].quantity = parseFloat(input.value) || 0;
                         items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
+                        items[index].amount = items[index].unit_price * items[index].quantity;
+                    }} else if (cellIndex === 4) {{
+                        items[index].unit_price = parseFloat(input.value) || 0;
                         items[index].amount = items[index].unit_price * items[index].quantity;
                     }}
                     renderItems();
@@ -14279,7 +14279,7 @@ async fn api_sales_order_sort_items_by_purchaser() -> impl IntoResponse {
 
 async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, so.remark as order_remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
@@ -14320,7 +14320,7 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "amount": r.get::<f64, _>("amount"),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
-            "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
+            "remark": r.get::<Option<String>, _>("order_remark").unwrap_or_default(),
         }));
     }
     
@@ -14366,12 +14366,6 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             .set_border(FormatBorder::Thin)
             .set_align(FormatAlign::Left)
             .set_align(FormatAlign::VerticalCenter);
-
-        let price_format = Format::new()
-            .set_font_size(10)
-            .set_border(FormatBorder::Thin)
-            .set_align(FormatAlign::Right)
-            .set_num_format("0.00");
 
         worksheet.merge_range(0, 0, 0, 4, "按单位分拣清单", &title_format)?;
         worksheet.set_row_height(0, 28)?;
