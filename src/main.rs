@@ -14295,11 +14295,31 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
     .await
     .unwrap_or_default();
     
+    let price_rows = sqlx::query(
+        "SELECT poi.product_id, MAX(poi.unit_price) as max_price, MIN(poi.unit_price) as min_price,
+                (SELECT unit_price FROM purchase_order_item WHERE product_id = poi.product_id ORDER BY id DESC LIMIT 1) as latest_price
+         FROM purchase_order_item poi
+         GROUP BY poi.product_id"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let mut price_map: std::collections::HashMap<i64, (f64, f64, f64)> = std::collections::HashMap::new();
+    for r in &price_rows {
+        let product_id = r.get::<i64, _>("product_id");
+        let max_price = r.get::<Option<f64>, _>("max_price").unwrap_or(0.0);
+        let min_price = r.get::<Option<f64>, _>("min_price").unwrap_or(0.0);
+        let latest_price = r.get::<Option<f64>, _>("latest_price").unwrap_or(0.0);
+        price_map.insert(product_id, (max_price, min_price, latest_price));
+    }
+    
     let mut purchaser_map: std::collections::HashMap<i64, serde_json::Value> = std::collections::HashMap::new();
     
     for r in &rows {
         let purchaser_id = r.get::<i64, _>("purchaser_id");
         let purchaser_name = r.get::<Option<String>, _>("purchaser_name").unwrap_or_default();
+        let product_id = r.get::<i64, _>("product_id");
         
         let purchaser = purchaser_map.entry(purchaser_id).or_insert_with(|| {
             serde_json::json!({
@@ -14318,10 +14338,12 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
         
+        let (max_price, min_price, latest_price) = price_map.get(&product_id).copied().unwrap_or((0.0, 0.0, 0.0));
+        
         let items = purchaser["items"].as_array_mut().unwrap();
         items.push(serde_json::json!({
             "id": r.get::<i64, _>("id"),
-            "product_id": r.get::<i64, _>("product_id"),
+            "product_id": product_id,
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "unit_price": r.get::<f64, _>("unit_price"),
@@ -14330,6 +14352,10 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
             "sort_key": sort_key,
+            "max_price": max_price,
+            "min_price": min_price,
+            "latest_price": latest_price,
+            "selling_price": r.get::<f64, _>("unit_price"),
         }));
     }
     
@@ -14380,15 +14406,21 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             .set_align(FormatAlign::Left)
             .set_align(FormatAlign::VerticalCenter);
 
-        worksheet.merge_range(0, 0, 0, 4, "按单位分拣清单", &title_format)?;
+        let price_format = Format::new()
+            .set_font_size(10)
+            .set_border(FormatBorder::Thin)
+            .set_align(FormatAlign::Right)
+            .set_num_format("0.00");
+
+        worksheet.merge_range(0, 0, 0, 8, "按单位分拣清单", &title_format)?;
         worksheet.set_row_height(0, 28)?;
 
-        let headers = ["序号", "商品名称", "单位", "数量", "备注"];
+        let headers = ["序号", "商品名称", "单位", "数量", "备注", "历史最高", "历史最低", "历史最近", "售价"];
         let mut current_row = 2;
 
         for purchaser in &purchasers {
             current_row += 1;
-            worksheet.merge_range(current_row, 0, current_row, 4, purchaser["purchaser_name"].as_str().unwrap_or_default(), &section_title_format)?;
+            worksheet.merge_range(current_row, 0, current_row, 8, purchaser["purchaser_name"].as_str().unwrap_or_default(), &section_title_format)?;
 
             current_row += 1;
             for (i, h) in headers.iter().enumerate() {
@@ -14404,6 +14436,10 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
                 worksheet.write_with_format(current_row, 2, item["unit"].as_str().unwrap_or_default(), &cell_format)?;
                 worksheet.write_with_format(current_row, 3, item["quantity"].as_f64().unwrap_or(0.0), &cell_format)?;
                 worksheet.write_with_format(current_row, 4, item["remark"].as_str().unwrap_or_default(), &cell_left_format)?;
+                worksheet.write_with_format(current_row, 5, item["max_price"].as_f64().unwrap_or(0.0), &price_format)?;
+                worksheet.write_with_format(current_row, 6, item["min_price"].as_f64().unwrap_or(0.0), &price_format)?;
+                worksheet.write_with_format(current_row, 7, item["latest_price"].as_f64().unwrap_or(0.0), &price_format)?;
+                worksheet.write_with_format(current_row, 8, item["selling_price"].as_f64().unwrap_or(0.0), &price_format)?;
                 index += 1;
             }
 
@@ -14414,7 +14450,11 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
         worksheet.set_column_width(1, 30)?;
         worksheet.set_column_width(2, 12)?;
         worksheet.set_column_width(3, 12)?;
-        worksheet.set_column_width(4, 30)?;
+        worksheet.set_column_width(4, 20)?;
+        worksheet.set_column_width(5, 12)?;
+        worksheet.set_column_width(6, 12)?;
+        worksheet.set_column_width(7, 12)?;
+        worksheet.set_column_width(8, 12)?;
 
         let buf = workbook.save_to_buffer()?;
         Ok(buf)
