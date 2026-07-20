@@ -666,13 +666,12 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .fetch_one(pool)
         .await?;
     
-    let super_admin_pwd = bcrypt::hash("admin123", bcrypt::DEFAULT_COST).unwrap();
     if super_admin_exists {
-        sqlx::query("UPDATE user_account SET password = ?, nickname = '超级管理员', role = 'super_admin', status = 1 WHERE username = 'super_admin'")
-            .bind(&super_admin_pwd)
+        sqlx::query("UPDATE user_account SET nickname = '超级管理员', role = COALESCE(NULLIF(role, ''), 'super_admin'), status = 1 WHERE username = 'super_admin'")
             .execute(pool)
             .await?;
     } else {
+        let super_admin_pwd = bcrypt::hash("admin123", bcrypt::DEFAULT_COST).unwrap();
         sqlx::query("INSERT INTO user_account (username, password, nickname, role) VALUES (?, ?, ?, ?)")
             .bind("super_admin")
             .bind(&super_admin_pwd)
@@ -8591,14 +8590,24 @@ async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::Value
             .ok();
     }
     
-    sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(username)
-        .bind(nickname)
-        .bind(role)
-        .bind(id)
-        .execute(pool())
-        .await
-        .ok();
+    if role.is_empty() {
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(username)
+            .bind(nickname)
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+    } else {
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(username)
+            .bind(nickname)
+            .bind(role)
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+    }
     
     (StatusCode::OK, serde_json::to_string(&serde_json::json!({
         "success": true,
