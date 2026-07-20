@@ -14373,16 +14373,16 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             .set_align(FormatAlign::Right)
             .set_num_format("0.00");
 
-        worksheet.merge_range(0, 0, 0, 5, "按单位分拣清单", &title_format)?;
+        worksheet.merge_range(0, 0, 0, 4, "按单位分拣清单", &title_format)?;
         worksheet.set_row_height(0, 28)?;
 
-        let headers = ["序号", "商品名称", "单位", "单价", "数量", "金额"];
+        let headers = ["序号", "商品名称", "单位", "数量", "备注"];
         let mut current_row = 2;
 
         let mut global_index = 1;
         for purchaser in &purchasers {
             current_row += 1;
-            worksheet.merge_range(current_row, 0, current_row, 5, purchaser["purchaser_name"].as_str().unwrap_or_default(), &section_title_format)?;
+            worksheet.merge_range(current_row, 0, current_row, 4, purchaser["purchaser_name"].as_str().unwrap_or_default(), &section_title_format)?;
 
             current_row += 1;
             for (i, h) in headers.iter().enumerate() {
@@ -14395,16 +14395,10 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
                 worksheet.write_with_format(current_row, 0, global_index as f64, &cell_format)?;
                 worksheet.write_with_format(current_row, 1, item["product_name"].as_str().unwrap_or_default(), &cell_left_format)?;
                 worksheet.write_with_format(current_row, 2, item["unit"].as_str().unwrap_or_default(), &cell_format)?;
-                worksheet.write_with_format(current_row, 3, item["unit_price"].as_f64().unwrap_or(0.0), &price_format)?;
-                worksheet.write_with_format(current_row, 4, item["quantity"].as_f64().unwrap_or(0.0), &cell_format)?;
-                worksheet.write_with_format(current_row, 5, item["amount"].as_f64().unwrap_or(0.0), &price_format)?;
+                worksheet.write_with_format(current_row, 3, item["quantity"].as_f64().unwrap_or(0.0), &cell_format)?;
+                worksheet.write_with_format(current_row, 4, item["remark"].as_str().unwrap_or_default(), &cell_left_format)?;
                 global_index += 1;
             }
-
-            current_row += 1;
-            worksheet.write_with_format(current_row, 0, "小计", &header_format)?;
-            worksheet.merge_range(current_row, 0, current_row, 4, "", &header_format)?;
-            worksheet.write_with_format(current_row, 5, purchaser["total_amount"].as_f64().unwrap_or(0.0), &price_format)?;
 
             current_row += 2;
         }
@@ -14413,8 +14407,7 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
         worksheet.set_column_width(1, 30)?;
         worksheet.set_column_width(2, 12)?;
         worksheet.set_column_width(3, 12)?;
-        worksheet.set_column_width(4, 12)?;
-        worksheet.set_column_width(5, 12)?;
+        worksheet.set_column_width(4, 30)?;
 
         let buf = workbook.save_to_buffer()?;
         Ok(buf)
