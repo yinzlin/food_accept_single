@@ -14373,7 +14373,6 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
         let headers = ["序号", "商品名称", "单位", "数量", "备注"];
         let mut current_row = 2;
 
-        let mut global_index = 1;
         for purchaser in &purchasers {
             current_row += 1;
             worksheet.merge_range(current_row, 0, current_row, 4, purchaser["purchaser_name"].as_str().unwrap_or_default(), &section_title_format)?;
@@ -14383,15 +14382,16 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
                 worksheet.write_with_format(current_row, i as u16, *h, &header_format)?;
             }
 
+            let mut index = 1;
             let items = purchaser["items"].as_array().unwrap();
             for item in items {
                 current_row += 1;
-                worksheet.write_with_format(current_row, 0, global_index as f64, &cell_format)?;
+                worksheet.write_with_format(current_row, 0, index as f64, &cell_format)?;
                 worksheet.write_with_format(current_row, 1, item["product_name"].as_str().unwrap_or_default(), &cell_left_format)?;
                 worksheet.write_with_format(current_row, 2, item["unit"].as_str().unwrap_or_default(), &cell_format)?;
                 worksheet.write_with_format(current_row, 3, item["quantity"].as_f64().unwrap_or(0.0), &cell_format)?;
                 worksheet.write_with_format(current_row, 4, item["remark"].as_str().unwrap_or_default(), &cell_left_format)?;
-                global_index += 1;
+                index += 1;
             }
 
             current_row += 2;
