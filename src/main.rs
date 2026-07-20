@@ -14280,10 +14280,14 @@ async fn api_sales_order_sort_items_by_purchaser() -> impl IntoResponse {
 async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
     let rows = sqlx::query(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
-                p.id as purchaser_id, p.name as purchaser_name, so.order_no
+                p.id as purchaser_id, p.name as purchaser_name, so.order_no,
+                pc.name as category_name, pc.parent_id, pc2.name as parent_name
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
+         LEFT JOIN product pr ON soi.product_id = pr.id
+         LEFT JOIN category pc ON pr.category_id = pc.id
+         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
          WHERE so.status IN ('pending', 'sorting')
          ORDER BY p.name, soi.product_name"
     )
@@ -14310,6 +14314,10 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
         purchaser["total_quantity"] = serde_json::json!(purchaser["total_quantity"].as_f64().unwrap_or(0.0) + r.get::<f64, _>("quantity"));
         purchaser["total_amount"] = serde_json::json!(purchaser["total_amount"].as_f64().unwrap_or(0.0) + r.get::<f64, _>("amount"));
         
+        let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
+        let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
+        let sort_key = get_category_sort_key(&category_name, &parent_name);
+        
         let items = purchaser["items"].as_array_mut().unwrap();
         items.push(serde_json::json!({
             "id": r.get::<i64, _>("id"),
@@ -14321,10 +14329,15 @@ async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
             "amount": r.get::<f64, _>("amount"),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
+            "sort_key": sort_key,
         }));
     }
     
-    let purchasers: Vec<serde_json::Value> = purchaser_map.values().cloned().collect();
+    let mut purchasers: Vec<serde_json::Value> = purchaser_map.values().cloned().collect();
+    for p in purchasers.iter_mut() {
+        let items = p["items"].as_array_mut().unwrap();
+        items.sort_by(|a, b| a["sort_key"].as_i64().unwrap_or(999).cmp(&b["sort_key"].as_i64().unwrap_or(999)));
+    }
 
     let excel_result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
