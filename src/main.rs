@@ -8655,16 +8655,22 @@ async fn api_backup() -> impl IntoResponse {
     }
 
     let backup_file = format!("{}/backup_{}.db", backup_dir, now);
-    match fs::copy("food_accept_v3.db", &backup_file) {
-        Ok(size) => {
-            sqlx::query("INSERT INTO backup_record (backup_time, file_name, size) VALUES (?, ?, ?)")
-                .bind(now)
-                .bind(&backup_file)
-                .bind(size as i64)
-                .execute(pool())
-                .await
-                .unwrap_or_default();
-            (StatusCode::OK, format!("备份成功，文件大小：{} 字节", size))
+    
+    let vacuum_sql = format!("VACUUM INTO '{}'", backup_file);
+    match sqlx::query(AssertSqlSafe(vacuum_sql.as_str())).execute(pool()).await {
+        Ok(_) => {
+            if let Ok(size) = fs::metadata(&backup_file) {
+                sqlx::query("INSERT INTO backup_record (backup_time, file_name, size) VALUES (?, ?, ?)")
+                    .bind(now)
+                    .bind(&backup_file)
+                    .bind(size.len() as i64)
+                    .execute(pool())
+                    .await
+                    .unwrap_or_default();
+                (StatusCode::OK, format!("备份成功，文件大小：{} 字节", size.len()))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "备份文件创建失败".to_string())
+            }
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("备份失败：{}", e)),
     }
@@ -8722,7 +8728,15 @@ async fn api_restore(Path(id): Path<i64>) -> impl IntoResponse {
     if let Some(row) = row {
         let file_name: String = row.get("file_name");
         match std::fs::copy(&file_name, "food_accept_v3.db") {
-            Ok(_) => (StatusCode::OK, "恢复成功".to_string()),
+            Ok(_) => {
+                let _ = std::fs::remove_file("food_accept_v3.db-wal");
+                let _ = std::fs::remove_file("food_accept_v3.db-shm");
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    std::process::exit(0);
+                });
+                (StatusCode::OK, "恢复成功，系统将在2秒后重启，请重新启动应用".to_string())
+            }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("恢复失败：{}", e)),
         }
     } else {
@@ -8730,20 +8744,49 @@ async fn api_restore(Path(id): Path<i64>) -> impl IntoResponse {
     }
 }
 
-async fn api_restore_file(content: String) -> impl IntoResponse {
+async fn api_restore_file(mut multipart: Multipart) -> impl IntoResponse {
     use std::fs;
+    
+    let mut file_bytes: Option<bytes::Bytes> = None;
+    
+    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+        if field.name() != Some("file") {
+            continue;
+        }
+        
+        let bytes = field.bytes().await.unwrap_or_default();
+        if bytes.is_empty() {
+            return (StatusCode::BAD_REQUEST, "文件内容为空".to_string());
+        }
+        
+        file_bytes = Some(bytes);
+        break;
+    }
+    
+    let bytes = match file_bytes {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, "未找到文件".to_string()),
+    };
+    
     let backup_dir = "temp_backups";
     if !std::path::Path::new(backup_dir).exists() {
         fs::create_dir_all(backup_dir).unwrap_or_default();
     }
     
     let temp_file = format!("{}/temp_restore.db", backup_dir);
-    match fs::write(&temp_file, content) {
+    
+    match fs::write(&temp_file, bytes.as_ref()) {
         Ok(_) => {
+            let _ = fs::remove_file("food_accept_v3.db-wal");
+            let _ = fs::remove_file("food_accept_v3.db-shm");
             match fs::copy(&temp_file, "food_accept_v3.db") {
                 Ok(_) => {
                     fs::remove_file(&temp_file).unwrap_or_default();
-                    (StatusCode::OK, "恢复成功".to_string())
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        std::process::exit(0);
+                    });
+                    (StatusCode::OK, "恢复成功，系统将在2秒后重启，请重新启动应用".to_string())
                 }
                 Err(e) => {
                     fs::remove_file(&temp_file).unwrap_or_default();
@@ -10877,27 +10920,25 @@ async fn generate_order_no(order_type: &str, order_date: &str) -> String {
     let date_str: Vec<&str> = order_date.split('-').collect();
     let date_part = format!("{}{}{}", date_str[0], date_str[1], date_str[2]);
     
-    let count: i64 = if order_type == "sales" {
-        sqlx::query(
-            "SELECT COUNT(*) FROM sales_order WHERE order_date = ?"
+    let max_seq: i64 = if order_type == "sales" {
+        sqlx::query_scalar(
+            "SELECT COALESCE(MAX(CAST(SUBSTR(order_no, 11, 3) AS INTEGER)), 0) FROM sales_order WHERE order_date = ?"
         )
         .bind(order_date)
         .fetch_one(pool())
         .await
-        .map(|row| row.get(0))
         .unwrap_or(0)
     } else {
-        sqlx::query(
-            "SELECT COUNT(*) FROM purchase_order WHERE order_date = ?"
+        sqlx::query_scalar(
+            "SELECT COALESCE(MAX(CAST(SUBSTR(order_no, 11, 3) AS INTEGER)), 0) FROM purchase_order WHERE order_date = ?"
         )
         .bind(order_date)
         .fetch_one(pool())
         .await
-        .map(|row| row.get(0))
         .unwrap_or(0)
     };
     
-    format!("{}{}{:03}", prefix, date_part, count + 1)
+    format!("{}{}{:03}", prefix, date_part, max_seq + 1)
 }
 
 async fn api_order_generate_no(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
@@ -12849,6 +12890,218 @@ async fn api_query_product_rank(axum::extract::Query(params): axum::extract::Que
         "top_selling": top_selling,
         "slow_moving": slow_moving,
     });
+    
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_overview(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let month = params.get("month").map(|s| s.as_str()).unwrap_or("");
+    
+    let purchase_total: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(po.total_amount), 0) FROM purchase_order po WHERE strftime('%Y-%m', po.order_date) = ?"
+    )
+    .bind(month)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+    
+    let sales_total: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(so.total_amount), 0) FROM sales_order so WHERE strftime('%Y-%m', so.order_date) = ?"
+    )
+    .bind(month)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+    
+    let stock_total: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(i.quantity * pr.selling_price), 0) FROM inventory i JOIN product pr ON i.product_id = pr.id"
+    )
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+    
+    let profit_total = sales_total - purchase_total;
+    
+    let purchase_by_supplier_rows = sqlx::query(
+        "SELECT s.name, COALESCE(SUM(poi.amount), 0) as amount, COALESCE(SUM(poi.quantity), 0) as quantity
+         FROM purchase_order_item poi
+         JOIN purchase_order po ON poi.order_id = po.id
+         JOIN supplier s ON po.supplier_id = s.id
+         WHERE strftime('%Y-%m', po.order_date) = ?
+         GROUP BY s.id, s.name
+         ORDER BY amount DESC"
+    )
+    .bind(month)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let purchase_by_supplier: Vec<serde_json::Value> = purchase_by_supplier_rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": row.get::<String, _>("name"),
+                "amount": row.get::<f64, _>("amount"),
+                "quantity": row.get::<f64, _>("quantity"),
+            })
+        })
+        .collect();
+    
+    let sales_by_purchaser_rows = sqlx::query(
+        "SELECT p.name, COALESCE(SUM(soi.amount), 0) as amount, COALESCE(SUM(soi.quantity), 0) as quantity
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         JOIN purchaser p ON so.purchaser_id = p.id
+         WHERE strftime('%Y-%m', so.order_date) = ?
+         GROUP BY p.id, p.name
+         ORDER BY amount DESC"
+    )
+    .bind(month)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let sales_by_purchaser: Vec<serde_json::Value> = sales_by_purchaser_rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": row.get::<String, _>("name"),
+                "amount": row.get::<f64, _>("amount"),
+                "quantity": row.get::<f64, _>("quantity"),
+            })
+        })
+        .collect();
+    
+    let result = serde_json::json!({
+        "purchase_total": purchase_total,
+        "sales_total": sales_total,
+        "stock_total": stock_total,
+        "profit_total": profit_total,
+        "purchase_by_supplier": purchase_by_supplier,
+        "sales_by_purchaser": sales_by_purchaser,
+    });
+    
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_category_stats(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    
+    let category_rows = sqlx::query(
+        "SELECT pc.id, pc.name as category_name,
+                COALESCE((SELECT SUM(poi.quantity) FROM purchase_order_item poi 
+                          JOIN purchase_order po ON poi.order_id = po.id
+                          JOIN product pr ON poi.product_id = pr.id
+                          WHERE pr.category_id = pc.id AND po.order_date >= ? AND po.order_date <= ?), 0) as purchase_quantity,
+                COALESCE((SELECT SUM(poi.amount) FROM purchase_order_item poi 
+                          JOIN purchase_order po ON poi.order_id = po.id
+                          JOIN product pr ON poi.product_id = pr.id
+                          WHERE pr.category_id = pc.id AND po.order_date >= ? AND po.order_date <= ?), 0) as purchase_amount,
+                COALESCE((SELECT SUM(soi.quantity) FROM sales_order_item soi 
+                          JOIN sales_order so ON soi.order_id = so.id
+                          JOIN product pr ON soi.product_id = pr.id
+                          WHERE pr.category_id = pc.id AND so.order_date >= ? AND so.order_date <= ?), 0) as sales_quantity,
+                COALESCE((SELECT SUM(soi.amount) FROM sales_order_item soi 
+                          JOIN sales_order so ON soi.order_id = so.id
+                          JOIN product pr ON soi.product_id = pr.id
+                          WHERE pr.category_id = pc.id AND so.order_date >= ? AND so.order_date <= ?), 0) as sales_amount,
+                COALESCE((SELECT SUM(i.quantity) FROM inventory i JOIN product pr ON i.product_id = pr.id WHERE pr.category_id = pc.id), 0) as stock_quantity,
+                COALESCE((SELECT SUM(i.quantity * pr.selling_price) FROM inventory i JOIN product pr ON i.product_id = pr.id WHERE pr.category_id = pc.id), 0) as stock_amount
+         FROM category pc
+         WHERE pc.entity_type = 'product' AND pc.parent_id IS NULL
+         ORDER BY pc.id"
+    )
+    .bind(start_date)
+    .bind(end_date)
+    .bind(start_date)
+    .bind(end_date)
+    .bind(start_date)
+    .bind(end_date)
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let result: Vec<serde_json::Value> = category_rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "category_name": row.get::<String, _>("category_name"),
+                "purchase_quantity": row.get::<f64, _>("purchase_quantity"),
+                "purchase_amount": row.get::<f64, _>("purchase_amount"),
+                "sales_quantity": row.get::<f64, _>("sales_quantity"),
+                "sales_amount": row.get::<f64, _>("sales_amount"),
+                "stock_quantity": row.get::<f64, _>("stock_quantity"),
+                "stock_amount": row.get::<f64, _>("stock_amount"),
+            })
+        })
+        .collect();
+    
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_document_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let month = params.get("month").map(|s| s.as_str()).unwrap_or("");
+    
+    let document_rows = sqlx::query(
+        "SELECT strftime('%Y-%m', po.order_date) as month,
+                COUNT(DISTINCT po.id) as purchase_count,
+                COALESCE(SUM(po.total_amount), 0) as purchase_amount,
+                COALESCE((SELECT COUNT(DISTINCT so.id) FROM sales_order so WHERE strftime('%Y-%m', so.order_date) = strftime('%Y-%m', po.order_date)), 0) as sales_count,
+                COALESCE((SELECT SUM(so.total_amount) FROM sales_order so WHERE strftime('%Y-%m', so.order_date) = strftime('%Y-%m', po.order_date)), 0) as sales_amount
+         FROM purchase_order po
+         WHERE strftime('%Y-%m', po.order_date) = ?
+         GROUP BY strftime('%Y-%m', po.order_date)
+         UNION ALL
+         SELECT strftime('%Y-%m', so.order_date) as month,
+                COALESCE((SELECT COUNT(DISTINCT po.id) FROM purchase_order po WHERE strftime('%Y-%m', po.order_date) = strftime('%Y-%m', so.order_date)), 0) as purchase_count,
+                COALESCE((SELECT SUM(po.total_amount) FROM purchase_order po WHERE strftime('%Y-%m', po.order_date) = strftime('%Y-%m', so.order_date)), 0) as purchase_amount,
+                COUNT(DISTINCT so.id) as sales_count,
+                COALESCE(SUM(so.total_amount), 0) as sales_amount
+         FROM sales_order so
+         WHERE strftime('%Y-%m', so.order_date) = ?
+         GROUP BY strftime('%Y-%m', so.order_date)"
+    )
+    .bind(month)
+    .bind(month)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let mut month_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    
+    for row in &document_rows {
+        let m = row.get::<String, _>("month");
+        let purchase_count: i64 = row.get("purchase_count");
+        let purchase_amount: f64 = row.get("purchase_amount");
+        let sales_count: i64 = row.get("sales_count");
+        let sales_amount: f64 = row.get("sales_amount");
+        
+        if let Some(existing) = month_map.get_mut(&m) {
+            let current_purchase_count = existing["purchase_count"].as_i64().unwrap_or(0);
+            let current_purchase_amount = existing["purchase_amount"].as_f64().unwrap_or(0.0);
+            let current_sales_count = existing["sales_count"].as_i64().unwrap_or(0);
+            let current_sales_amount = existing["sales_amount"].as_f64().unwrap_or(0.0);
+            
+            existing["purchase_count"] = serde_json::json!(std::cmp::max(current_purchase_count, purchase_count));
+            existing["purchase_amount"] = serde_json::json!(current_purchase_amount.max(purchase_amount));
+            existing["sales_count"] = serde_json::json!(std::cmp::max(current_sales_count, sales_count));
+            existing["sales_amount"] = serde_json::json!(current_sales_amount.max(sales_amount));
+        } else {
+            month_map.insert(m.clone(), serde_json::json!({
+                "month": m,
+                "purchase_count": purchase_count,
+                "purchase_amount": purchase_amount,
+                "sales_count": sales_count,
+                "sales_amount": sales_amount,
+            }));
+        }
+    }
+    
+    let mut result: Vec<serde_json::Value> = month_map.values().cloned().collect();
+    result.sort_by(|a, b| a["month"].as_str().unwrap_or("").cmp(b["month"].as_str().unwrap_or("")));
     
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
@@ -15220,6 +15473,9 @@ fn build_router() -> Router {
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
         .route("/api/query/purchaser_balance/export", get(api_query_purchaser_balance_export))
         .route("/api/query/product_rank", get(api_query_product_rank))
+        .route("/api/query/overview", get(api_query_overview))
+        .route("/api/query/category_stats", get(api_query_category_stats))
+        .route("/api/query/document_summary", get(api_query_document_summary))
         .route("/api/order/generate_no", get(api_order_generate_no))
         .route("/api/accept/create", post(api_accept_create))
         .route("/api/accept/list", get(api_accept_list))
