@@ -3970,8 +3970,8 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="number" step="0.01" value="${{item.quantity}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
-                            <td><input type="number" step="0.01" value="${{item.unit_price}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="number" step="0.01" value="${{(item.quantity || 0).toFixed(2)}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="number" step="0.01" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
                             <td>${{item.amount.toFixed(2)}}</td>
                             <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
                             <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
@@ -4073,13 +4073,13 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].unit = opt.value;
                 items[index].ratio = ratio;
                 if (purchasePrice > 0) {{
-                    items[index].unit_price = purchasePrice;
+                    items[index].unit_price = Math.round(purchasePrice * 100) / 100;
                 }} else {{
                     const basePrice = parseFloat(opt.getAttribute('data-base-price')) || items[index].unit_price;
-                    items[index].unit_price = basePrice * ratio;
+                    items[index].unit_price = Math.round(basePrice * ratio * 100) / 100;
                 }}
-                items[index].base_quantity = items[index].quantity * ratio;
-                items[index].amount = items[index].unit_price * items[index].quantity;
+                items[index].base_quantity = Math.round(items[index].quantity * ratio * 100) / 100;
+                items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
 
@@ -4088,14 +4088,14 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             function updateAlias2(index, input) {{ items[index].alias2 = input.value; }}
             function updateSpec(index, input) {{ items[index].spec = input.value; }}
             function updatePrice(index, input) {{ 
-                items[index].unit_price = parseFloat(input.value) || 0; 
-                items[index].amount = items[index].unit_price * items[index].quantity;
+                items[index].unit_price = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
+                items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
             function updateQty(index, input) {{ 
-                items[index].quantity = parseFloat(input.value) || 0; 
-                items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
-                items[index].amount = items[index].unit_price * items[index].quantity;
+                items[index].quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
+                items[index].base_quantity = Math.round(items[index].quantity * (items[index].ratio || 1) * 100) / 100;
+                items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
 
@@ -4523,8 +4523,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="number" step="0.01" value="${{item.quantity}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
-                            <td><input type="number" step="0.01" value="${{item.unit_price}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="number" step="0.01" value="${{(item.quantity || 0).toFixed(2)}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="number" step="0.01" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
                             <td>${{item.amount.toFixed(2)}}</td>
                             <td>
                                 <div class="position-relative">
@@ -4639,13 +4639,13 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].unit = opt.value;
                 items[index].ratio = ratio;
                 if (unitPrice > 0) {{
-                    items[index].unit_price = unitPrice;
+                    items[index].unit_price = Math.round(unitPrice * 100) / 100;
                 }} else {{
                     const basePrice = parseFloat(opt.getAttribute('data-base-price')) || items[index].unit_price;
-                    items[index].unit_price = basePrice * ratio;
+                    items[index].unit_price = Math.round(basePrice * ratio * 100) / 100;
                 }}
-                items[index].base_quantity = items[index].quantity * ratio;
-                items[index].amount = items[index].unit_price * items[index].quantity;
+                items[index].base_quantity = Math.round(items[index].quantity * ratio * 100) / 100;
+                items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
 
@@ -4654,14 +4654,14 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             function updateAlias2(index, input) {{ items[index].alias2 = input.value; }}
             function updateSpec(index, input) {{ items[index].spec = input.value; }}
             function updatePrice(index, input) {{ 
-                items[index].unit_price = parseFloat(input.value) || 0; 
-                items[index].amount = items[index].unit_price * items[index].quantity;
+                items[index].unit_price = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
+                items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
             function updateQty(index, input) {{ 
-                items[index].quantity = parseFloat(input.value) || 0; 
-                items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
-                items[index].amount = items[index].unit_price * items[index].quantity;
+                items[index].quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
+                items[index].base_quantity = Math.round(items[index].quantity * (items[index].ratio || 1) * 100) / 100;
+                items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
 
