@@ -196,11 +196,30 @@ async fn init_pool() {
             SqliteConnectOptions::new()
                 .filename("food_accept_v3.db")
                 .create_if_missing(true)
-                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
         )
         .await
         .expect("数据库连接失败");
     init_tables(&pool).await.expect("初始化数据表失败");
+    
+    // 清理所有孤儿数据
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE order_id NOT IN (SELECT id FROM sales_order)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE order_id NOT IN (SELECT id FROM purchase_order)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order WHERE id NOT IN (SELECT DISTINCT order_id FROM sales_order_item)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order WHERE id NOT IN (SELECT DISTINCT order_id FROM purchase_order_item)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order WHERE purchaser_id NOT IN (SELECT id FROM purchaser)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order WHERE supplier_id NOT IN (SELECT id FROM supplier)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM food_item WHERE accept_id NOT IN (SELECT id FROM food_accept)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM food_accept WHERE supplier_id NOT IN (SELECT id FROM supplier) OR purchaser_id NOT IN (SELECT id FROM purchaser)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM inventory WHERE product_id NOT IN (SELECT id FROM product) OR warehouse_id NOT IN (SELECT id FROM warehouse)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM product_unit WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM product_price WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("VACUUM").execute(&pool).await;
+    
     DB_POOL.set(pool).expect("数据库连接池已初始化");
 }
 
@@ -3629,7 +3648,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             <input type="file" id="purchaseOrderFileInput" style="display:none" accept=".csv" onchange="handlePurchaseOrderFile(this)">
         </div>
         <table class="table table-bordered">
-            <thead><tr><th>ID</th><th>订单号</th><th>日期</th><th>供应商</th><th>入库仓库</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">供应商<span id="sortIndicator_unit_name"></span></th><th>入库仓库</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
             <tbody id="orderListBody"></tbody>
         </table>
 
@@ -3638,6 +3657,29 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
         <script>
             let suppliers = [];
             let items = [];
+            let sortField = '';
+            let sortOrder = 'desc';
+
+            function sortOrders(field) {{
+                if (sortField === field) {{
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                }} else {{
+                    sortField = field;
+                    sortOrder = 'asc';
+                }}
+                updateSortIndicators();
+                loadOrders();
+            }}
+
+            function updateSortIndicators() {{
+                const fields = ['order_no', 'order_date', 'unit_name', 'status'];
+                fields.forEach(f => {{
+                    const el = document.getElementById('sortIndicator_' + f);
+                    if (el) {{
+                        el.textContent = (sortField === f) ? (sortOrder === 'asc' ? ' ▲' : ' ▼') : '';
+                    }}
+                }});
+            }}
 
             async function loadSuppliers() {{
                 const res = await fetch('/api/supplier/list');
@@ -3797,6 +3839,9 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 let url = '/api/purchase_order/list?page=' + currentPage + '&page_size=20';
                 if (currentKeyword) {{
                     url += '&keyword=' + encodeURIComponent(currentKeyword);
+                }}
+                if (sortField) {{
+                    url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
                 }}
                 const res = await fetch(url);
                 const result = await res.json();
@@ -4290,7 +4335,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             <input type="file" id="salesOrderFileInput" style="display:none" accept=".csv" onchange="handleSalesOrderFile(this)">
         </div>
         <table class="table table-bordered">
-            <thead><tr><th>ID</th><th>订单号</th><th>日期</th><th>采购单位</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">采购单位<span id="sortIndicator_unit_name"></span></th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
             <tbody id="orderListBody"></tbody>
         </table>
 
@@ -4299,6 +4344,29 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
         <script>
             let purchasers = [];
             let items = [];
+            let sortField = '';
+            let sortOrder = 'desc';
+
+            function sortOrders(field) {{
+                if (sortField === field) {{
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                }} else {{
+                    sortField = field;
+                    sortOrder = 'asc';
+                }}
+                updateSortIndicators();
+                loadOrders();
+            }}
+
+            function updateSortIndicators() {{
+                const fields = ['order_no', 'order_date', 'unit_name', 'status'];
+                fields.forEach(f => {{
+                    const el = document.getElementById('sortIndicator_' + f);
+                    if (el) {{
+                        el.textContent = (sortField === f) ? (sortOrder === 'asc' ? ' ▲' : ' ▼') : '';
+                    }}
+                }});
+            }}
 
             function showPurchaserDropdown(filter) {{
                 const dropdown = document.getElementById('purchaserDropdown');
@@ -4785,6 +4853,9 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 let url = '/api/sales_order/list?page=' + currentPage + '&page_size=20';
                 if (currentKeyword) {{
                     url += '&keyword=' + encodeURIComponent(currentKeyword);
+                }}
+                if (sortField) {{
+                    url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
                 }}
                 const res = await fetch(url);
                 const result = await res.json();
@@ -8729,13 +8800,15 @@ async fn api_restore(Path(id): Path<i64>) -> impl IntoResponse {
         let file_name: String = row.get("file_name");
         match std::fs::copy(&file_name, "food_accept_v3.db") {
             Ok(_) => {
-                let _ = std::fs::remove_file("food_accept_v3.db-wal");
-                let _ = std::fs::remove_file("food_accept_v3.db-shm");
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    if let Ok(exe_path) = std::env::current_exe() {
+                        let _ = std::process::Command::new(&exe_path)
+                            .spawn();
+                    }
                     std::process::exit(0);
                 });
-                (StatusCode::OK, "恢复成功，系统将在2秒后重启，请重新启动应用".to_string())
+                (StatusCode::OK, "恢复成功，系统将在2秒后自动重启，请稍后刷新页面".to_string())
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("恢复失败：{}", e)),
         }
@@ -8777,16 +8850,18 @@ async fn api_restore_file(mut multipart: Multipart) -> impl IntoResponse {
     
     match fs::write(&temp_file, bytes.as_ref()) {
         Ok(_) => {
-            let _ = fs::remove_file("food_accept_v3.db-wal");
-            let _ = fs::remove_file("food_accept_v3.db-shm");
             match fs::copy(&temp_file, "food_accept_v3.db") {
                 Ok(_) => {
                     fs::remove_file(&temp_file).unwrap_or_default();
                     tokio::spawn(async move {
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        if let Ok(exe_path) = std::env::current_exe() {
+                            let _ = std::process::Command::new(&exe_path)
+                                .spawn();
+                        }
                         std::process::exit(0);
                     });
-                    (StatusCode::OK, "恢复成功，系统将在2秒后重启，请重新启动应用".to_string())
+                    (StatusCode::OK, "恢复成功，系统将在2秒后自动重启，请稍后刷新页面".to_string())
                 }
                 Err(e) => {
                     fs::remove_file(&temp_file).unwrap_or_default();
@@ -8796,6 +8871,245 @@ async fn api_restore_file(mut multipart: Multipart) -> impl IntoResponse {
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("保存临时文件失败：{}", e)),
     }
+}
+
+async fn api_inspect_corrupted_items(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/inspect_corrupted_items").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+
+    let rows = sqlx::query(
+        "SELECT id, order_id, product_id, product_name, unit, unit_price, quantity, amount FROM sales_order_item WHERE (unit_price = 0 OR quantity = 0 OR amount = 0) AND product_name != '' LIMIT 100"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "order_id": r.get::<i64, _>("order_id"),
+            "product_id": r.get::<i64, _>("product_id"),
+            "product_name": r.get::<Option<String>, _>("product_name"),
+            "unit": r.get::<Option<String>, _>("unit"),
+            "unit_price": r.get::<Option<f64>, _>("unit_price"),
+            "quantity": r.get::<Option<f64>, _>("quantity"),
+            "amount": r.get::<f64, _>("amount"),
+        }))
+        .collect();
+
+    match serde_json::to_string(&items) {
+        Ok(json_str) => (StatusCode::OK, json_str),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("序列化失败：{}", e)),
+    }
+}
+
+async fn api_clean_corrupted_items(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/clean_corrupted_items").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+
+    let corrupted_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM sales_order_item WHERE id >= 5527 AND id <= 5619"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let count = corrupted_ids.len();
+
+    for id in &corrupted_ids {
+        sqlx::query("DELETE FROM sales_order_item WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+    }
+
+    let no_item_sales: Vec<i64> = sqlx::query_scalar(
+        "SELECT so.id FROM sales_order so LEFT JOIN sales_order_item soi ON so.id = soi.order_id WHERE soi.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &no_item_sales {
+        sqlx::query("DELETE FROM sales_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+    }
+
+    let _ = sqlx::query("VACUUM").execute(pool()).await;
+
+    (StatusCode::OK, format!("清理完成，共删除 {} 条损坏的订单明细记录", count))
+}
+
+async fn api_clean_invalid_orders(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/clean_invalid_orders").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+
+    use std::fs;
+    use std::path::Path;
+    let now = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let backup_dir = "backups";
+    if !Path::new(backup_dir).exists() {
+        fs::create_dir_all(backup_dir).unwrap_or_default();
+    }
+    let backup_file = format!("{}/backup_before_clean_{}.db", backup_dir, now);
+    let vacuum_sql = format!("VACUUM INTO '{}'", backup_file);
+    match sqlx::query(AssertSqlSafe(vacuum_sql.as_str())).execute(pool()).await {
+        Ok(_) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("清理前备份失败：{}", e)),
+    }
+
+    let mut deleted_count = 0;
+
+    let no_item_sales: Vec<i64> = sqlx::query_scalar(
+        "SELECT so.id FROM sales_order so LEFT JOIN sales_order_item soi ON so.id = soi.order_id WHERE soi.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &no_item_sales {
+        sqlx::query("DELETE FROM sales_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        deleted_count += 1;
+    }
+
+    let no_item_purchase: Vec<i64> = sqlx::query_scalar(
+        "SELECT po.id FROM purchase_order po LEFT JOIN purchase_order_item poi ON po.id = poi.order_id WHERE poi.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &no_item_purchase {
+        sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        deleted_count += 1;
+    }
+
+    let invalid_purchaser_sales: Vec<i64> = sqlx::query_scalar(
+        "SELECT so.id FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE p.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &invalid_purchaser_sales {
+        sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        sqlx::query("DELETE FROM sales_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        deleted_count += 1;
+    }
+
+    let invalid_supplier_purchase: Vec<i64> = sqlx::query_scalar(
+        "SELECT po.id FROM purchase_order po LEFT JOIN supplier s ON po.supplier_id = s.id WHERE s.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &invalid_supplier_purchase {
+        sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        deleted_count += 1;
+    }
+
+    let invalid_product_sales_items: Vec<i64> = sqlx::query_scalar(
+        "SELECT soi.id FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id WHERE p.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &invalid_product_sales_items {
+        sqlx::query("DELETE FROM sales_order_item WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+    }
+
+    let invalid_product_purchase_items: Vec<i64> = sqlx::query_scalar(
+        "SELECT poi.id FROM purchase_order_item poi LEFT JOIN product p ON poi.product_id = p.id WHERE p.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &invalid_product_purchase_items {
+        sqlx::query("DELETE FROM purchase_order_item WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+    }
+
+    let no_item_after_clean_sales: Vec<i64> = sqlx::query_scalar(
+        "SELECT so.id FROM sales_order so LEFT JOIN sales_order_item soi ON so.id = soi.order_id WHERE soi.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &no_item_after_clean_sales {
+        sqlx::query("DELETE FROM sales_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        deleted_count += 1;
+    }
+
+    let no_item_after_clean_purchase: Vec<i64> = sqlx::query_scalar(
+        "SELECT po.id FROM purchase_order po LEFT JOIN purchase_order_item poi ON po.id = poi.order_id WHERE poi.id IS NULL"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for id in &no_item_after_clean_purchase {
+        sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+        deleted_count += 1;
+    }
+
+    let _ = sqlx::query("VACUUM").execute(pool()).await;
+
+    (StatusCode::OK, format!("清理完成，共删除 {} 条无效订单。清理前已备份到 {}", deleted_count, backup_file))
 }
 
 fn parse_keyword_pattern(params: &std::collections::HashMap<String, String>) -> String {
@@ -11005,6 +11319,17 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
+    // 排序处理
+    let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
+    let sort_order = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
+    let order_clause = match sort_field {
+        "order_no" => format!("po.order_no {}", sort_order),
+        "order_date" => format!("po.order_date {}", sort_order),
+        "unit_name" => format!("s.name {}", sort_order),
+        "status" => format!("po.status {}", sort_order),
+        _ => format!("po.id {}", sort_order),
+    };
+    
     let total_rows = sqlx::query(
         "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
          WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?"
@@ -11017,20 +11342,23 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     .unwrap();
     let total: i64 = total_rows.get("count");
     
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
          WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?
-         ORDER BY po.id DESC LIMIT ? OFFSET ?"
-    )
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         ORDER BY {} LIMIT ? OFFSET ?",
+        order_clause
+    );
+    
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
     
     let orders: Vec<serde_json::Value> = rows
         .iter()
@@ -11466,28 +11794,45 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
 }
 
 async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+        .bind(id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(false);
+
+    if !exists {
+        return (StatusCode::NOT_FOUND, format!("订单不存在 (ID: {})", id).to_string());
+    }
+
     let order_row = sqlx::query(
-        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name
-         FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
+        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, COALESCE(p.name, '') as purchaser_name
+         FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
     )
     .bind(id)
     .fetch_optional(pool())
-    .await
-    .unwrap_or(None);
+    .await;
+
+    let row = match order_row {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("订单存在但JOIN查询失败 (ID: {})", id).to_string());
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败：{}", e).to_string());
+        }
+    };
     
-    if order_row.is_none() {
-        return (StatusCode::NOT_FOUND, "订单不存在".to_string());
-    }
-    
-    let row = order_row.unwrap();
-    
-    let item_rows = sqlx::query(
+    let item_rows = match sqlx::query(
         "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark FROM sales_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+    .await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询订单明细失败：{}", e).to_string());
+        }
+    };
     
     let items: Vec<serde_json::Value> = item_rows
         .iter()
@@ -11503,7 +11848,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "base_quantity": r.get::<Option<f64>, _>("base_quantity"),
             "amount": r.get::<f64, _>("amount"),
-            "supplier_id": r.get::<i64, _>("supplier_id"),
+            "supplier_id": r.get::<Option<i64>, _>("supplier_id"),
             "supplier_name": r.get::<Option<String>, _>("supplier_name"),
             "remark": r.get::<Option<String>, _>("remark"),
         }))
@@ -11518,7 +11863,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
         "discount_rate": row.get::<f64, _>("discount_rate"),
         "amount_reduction": row.get::<f64, _>("amount_reduction"),
         "final_amount": row.get::<f64, _>("final_amount"),
-        "warehouse_id": row.get::<i64, _>("warehouse_id"),
+        "warehouse_id": row.get::<Option<i64>, _>("warehouse_id"),
         "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
         "status": row.get::<String, _>("status"),
         "remark": row.get::<Option<String>, _>("remark"),
@@ -11526,7 +11871,10 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
         "items": items,
     });
     
-    (StatusCode::OK, serde_json::to_string(&order).unwrap())
+    match serde_json::to_string(&order) {
+        Ok(json_str) => (StatusCode::OK, json_str),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("序列化订单JSON失败：{}", e).to_string()),
+    }
 }
 
 async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
@@ -11592,12 +11940,30 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
         Err(e) => return e,
         Ok(_) => {}
     }
-    sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
+
+    let order_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+        .bind(id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(false);
+
+    if !order_exists {
+        return (StatusCode::NOT_FOUND, "订单不存在".to_string());
+    }
+
+    let delete_items_result = sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
         .bind(id)
         .execute(pool())
-        .await
-        .ok();
-    
+        .await;
+
+    if let Err(e) = delete_items_result {
+        let err_str = e.to_string();
+        if err_str.contains("foreign key constraint") || err_str.contains("FOREIGN KEY") {
+            return (StatusCode::BAD_REQUEST, format!("删除失败：订单明细存在外键约束冲突，请检查关联数据"));
+        }
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("删除订单明细失败：{}", e));
+    }
+
     let result = sqlx::query("DELETE FROM sales_order WHERE id = ?")
         .bind(id)
         .execute(pool())
@@ -11605,7 +11971,14 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
     
     match result {
         Ok(_) => (StatusCode::OK, "删除成功".to_string()),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("foreign key constraint") || err_str.contains("FOREIGN KEY") {
+                (StatusCode::BAD_REQUEST, format!("删除失败：存在外键约束冲突，请检查关联数据"))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败：{}", e))
+            }
+        }
     }
 }
 
@@ -13161,6 +13534,17 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
+    // 排序处理
+    let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
+    let sort_order = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
+    let order_clause = match sort_field {
+        "order_no" => format!("so.order_no {}", sort_order),
+        "order_date" => format!("so.order_date {}", sort_order),
+        "unit_name" => format!("p.name {}", sort_order),
+        "status" => format!("so.status {}", sort_order),
+        _ => format!("so.id {}", sort_order),
+    };
+    
     let total_rows = sqlx::query(
         "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
          WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?"
@@ -13173,20 +13557,23 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     .unwrap();
     let total: i64 = total_rows.get("count");
     
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
          FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
          WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
-         ORDER BY so.id DESC LIMIT ? OFFSET ?"
-    )
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         ORDER BY {} LIMIT ? OFFSET ?",
+        order_clause
+    );
+    
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
     
     let orders: Vec<serde_json::Value> = rows
         .iter()
@@ -15381,6 +15768,9 @@ fn build_router() -> Router {
         .route("/api/backup/delete/{id}", delete(api_backup_delete))
         .route("/api/restore/{id}", post(api_restore))
         .route("/api/restore/file", post(api_restore_file))
+        .route("/api/clean_invalid_orders", post(api_clean_invalid_orders))
+        .route("/api/inspect_corrupted_items", get(api_inspect_corrupted_items))
+        .route("/api/clean_corrupted_items", post(api_clean_corrupted_items))
         .route("/api/supplier/list", get(api_supplier_list))
         .route("/api/supplier/create", post(api_supplier_create))
         .route("/api/supplier/update", post(api_supplier_update))
