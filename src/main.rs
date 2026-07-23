@@ -191,15 +191,31 @@ async fn serve_bootstrap_js() -> impl IntoResponse {
 
 async fn init_pool() {
     let pool = SqlitePoolOptions::new()
-        .max_connections(32)
+        .max_connections(16)
+        .min_connections(4)
+        .idle_timeout(std::time::Duration::from_secs(300))
+        .max_lifetime(std::time::Duration::from_secs(3600))
         .connect_with(
             SqliteConnectOptions::new()
                 .filename("food_accept_v3.db")
                 .create_if_missing(true)
-                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete)
+                .pragma("cache_size", "-20000")
+                .pragma("synchronous", "NORMAL")
+                .pragma("temp_store", "MEMORY")
+                .pragma("journal_mode", "DELETE"),
         )
         .await
         .expect("数据库连接失败");
+    
+    let _ = sqlx::query("PRAGMA cache_size = -20000").execute(&pool).await;
+    let _ = sqlx::query("PRAGMA synchronous = NORMAL").execute(&pool).await;
+    let _ = sqlx::query("PRAGMA temp_store = MEMORY").execute(&pool).await;
+    let _ = sqlx::query("PRAGMA journal_mode = DELETE").execute(&pool).await;
+    let _ = sqlx::query("PRAGMA locking_mode = NORMAL").execute(&pool).await;
+    let _ = sqlx::query("PRAGMA auto_vacuum = INCREMENTAL").execute(&pool).await;
+    let _ = sqlx::query("PRAGMA page_size = 4096").execute(&pool).await;
+    
     init_tables(&pool).await.expect("初始化数据表失败");
     
     // 清理所有孤儿数据
@@ -808,6 +824,27 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     )
     .execute(pool)
     .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_purchaser_id ON sales_order(purchaser_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_order_no ON sales_order(order_no)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_order_date ON sales_order(order_date)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_item_order_id ON sales_order_item(order_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_item_product_id ON sales_order_item(product_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_supplier_id ON purchase_order(supplier_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_order_no ON purchase_order(order_no)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_item_order_id ON purchase_order_item(order_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_item_product_id ON purchase_order_item(product_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_product_category_id ON product(category_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_product_name ON product(name)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_inventory_product_id ON inventory(product_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_inventory_warehouse_id ON inventory(warehouse_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_food_accept_supplier_id ON food_accept(supplier_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_food_accept_purchaser_id ON food_accept(purchaser_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_food_item_accept_id ON food_item(accept_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_product_unit_product_id ON product_unit(product_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_product_price_product_id ON product_price(product_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_supplier_category_id ON supplier(category_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchaser_category_id ON purchaser(category_id)").execute(pool).await;
 
     Ok(())
 }
@@ -11286,25 +11323,32 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
     match result {
         Ok(res) => {
             let order_id = res.last_insert_rowid();
-            for item in req.items {
-                sqlx::query(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(order_id)
-                .bind(item.product_id)
-                .bind(&item.product_name)
-                .bind(&item.alias1)
-                .bind(&item.alias2)
-                .bind(&item.spec)
-                .bind(&item.unit)
-                .bind(item.unit_price)
-                .bind(item.quantity)
-                .bind(item.base_quantity.unwrap_or(0.0))
-                .bind(item.amount)
-                .bind(&item.remark)
-                .execute(pool())
-                .await
-                .ok();
+            if !req.items.is_empty() {
+                let placeholders: Vec<String> = req.items.iter()
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .collect();
+                let sql = format!(
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES {}",
+                    placeholders.join(", ")
+                );
+                
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+                for item in req.items {
+                    query = query
+                        .bind(order_id)
+                        .bind(item.product_id)
+                        .bind(&item.product_name)
+                        .bind(&item.alias1)
+                        .bind(&item.alias2)
+                        .bind(&item.spec)
+                        .bind(&item.unit)
+                        .bind(item.unit_price)
+                        .bind(item.quantity)
+                        .bind(item.base_quantity.unwrap_or(0.0))
+                        .bind(item.amount)
+                        .bind(&item.remark);
+                }
+                let _ = query.execute(pool()).await;
             }
             StatusCode::OK
         }
@@ -11481,25 +11525,33 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                 .await
                 .ok();
             
-            for item in req.items {
-                sqlx::query(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(req.id)
-                .bind(item.product_id)
-                .bind(&item.product_name)
-                .bind(&item.alias1)
-                .bind(&item.alias2)
-                .bind(&item.spec)
-                .bind(&item.unit)
-                .bind(item.unit_price)
-                .bind(item.quantity)
-                .bind(item.base_quantity.unwrap_or(0.0))
-                .bind(item.amount)
-                .bind(&item.remark)
-                .execute(pool())
-                .await
-                .ok();
+            if !req.items.is_empty() {
+                let placeholders: Vec<String> = req.items.iter()
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .collect();
+                let sql = format!(
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES {}",
+                    placeholders.join(", ")
+                );
+                
+                let order_id = req.id;
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+                for item in req.items {
+                    query = query
+                        .bind(order_id)
+                        .bind(item.product_id)
+                        .bind(&item.product_name)
+                        .bind(&item.alias1)
+                        .bind(&item.alias2)
+                        .bind(&item.spec)
+                        .bind(&item.unit)
+                        .bind(item.unit_price)
+                        .bind(item.quantity)
+                        .bind(item.base_quantity.unwrap_or(0.0))
+                        .bind(item.amount)
+                        .bind(&item.remark);
+                }
+                let _ = query.execute(pool()).await;
             }
             (StatusCode::OK, "更新成功".to_string())
         }
@@ -11907,27 +11959,35 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                 .await
                 .ok();
             
-            for item in req.items {
-                sqlx::query(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(req.id)
-                .bind(item.product_id)
-                .bind(&item.product_name)
-                .bind(&item.alias1)
-                .bind(&item.alias2)
-                .bind(&item.spec)
-                .bind(&item.unit)
-                .bind(item.unit_price)
-                .bind(item.quantity)
-                .bind(item.base_quantity.unwrap_or(0.0))
-                .bind(item.amount)
-                .bind(item.supplier_id)
-                .bind(&item.supplier_name)
-                .bind(&item.remark)
-                .execute(pool())
-                .await
-                .ok();
+            if !req.items.is_empty() {
+                let placeholders: Vec<String> = req.items.iter()
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .collect();
+                let sql = format!(
+                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES {}",
+                    placeholders.join(", ")
+                );
+                
+                let order_id = req.id;
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+                for item in req.items {
+                    query = query
+                        .bind(order_id)
+                        .bind(item.product_id)
+                        .bind(&item.product_name)
+                        .bind(&item.alias1)
+                        .bind(&item.alias2)
+                        .bind(&item.spec)
+                        .bind(&item.unit)
+                        .bind(item.unit_price)
+                        .bind(item.quantity)
+                        .bind(item.base_quantity.unwrap_or(0.0))
+                        .bind(item.amount)
+                        .bind(item.supplier_id)
+                        .bind(&item.supplier_name)
+                        .bind(&item.remark);
+                }
+                let _ = query.execute(pool()).await;
             }
             (StatusCode::OK, "更新成功".to_string())
         }
@@ -13813,27 +13873,34 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
     match result {
         Ok(res) => {
             let order_id = res.last_insert_rowid();
-            for item in req.items {
-                sqlx::query(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(order_id)
-                .bind(item.product_id)
-                .bind(&item.product_name)
-                .bind(&item.alias1)
-                .bind(&item.alias2)
-                .bind(&item.spec)
-                .bind(&item.unit)
-                .bind(item.unit_price)
-                .bind(item.quantity)
-                .bind(item.base_quantity.unwrap_or(0.0))
-                .bind(item.amount)
-                .bind(item.supplier_id)
-                .bind(&item.supplier_name)
-                .bind(&item.remark)
-                .execute(pool())
-                .await
-                .ok();
+            if !req.items.is_empty() {
+                let placeholders: Vec<String> = req.items.iter()
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .collect();
+                let sql = format!(
+                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES {}",
+                    placeholders.join(", ")
+                );
+                
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+                for item in req.items {
+                    query = query
+                        .bind(order_id)
+                        .bind(item.product_id)
+                        .bind(&item.product_name)
+                        .bind(&item.alias1)
+                        .bind(&item.alias2)
+                        .bind(&item.spec)
+                        .bind(&item.unit)
+                        .bind(item.unit_price)
+                        .bind(item.quantity)
+                        .bind(item.base_quantity.unwrap_or(0.0))
+                        .bind(item.amount)
+                        .bind(item.supplier_id)
+                        .bind(&item.supplier_name)
+                        .bind(&item.remark);
+                }
+                let _ = query.execute(pool()).await;
             }
             StatusCode::OK
         }
