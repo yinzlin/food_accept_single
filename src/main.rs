@@ -4144,6 +4144,11 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     alert('请选择供应商');
                     return;
                 }}
+                const validItems = items.filter(item => item.product_id > 0 && item.product_name.trim() !== '');
+                if (validItems.length === 0) {{
+                    alert('请添加商品明细');
+                    return;
+                }}
                 const data = {{
                     id: currentOrderId,
                     supplier_id: parseInt(supplierId),
@@ -4155,7 +4160,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
-                    items: items,
+                    items: validItems,
                     remark: document.getElementById('remarkInput').value || null
                 }};
                 const url = currentOrderId ? '/api/purchase_order/update' : '/api/purchase_order/create';
@@ -4831,7 +4836,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     alert('请选择采购单位');
                     return;
                 }}
-                if (items.length === 0) {{
+                const validItems = items.filter(item => item.product_id > 0 && item.product_name.trim() !== '');
+                if (validItems.length === 0) {{
                     alert('请添加商品明细');
                     return;
                 }}
@@ -4846,7 +4852,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
-                    items: items,
+                    items: validItems,
                     remark: document.getElementById('remarkInput').value || null
                 }};
                 const isNew = !currentOrderId;
