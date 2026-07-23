@@ -1324,6 +1324,8 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         .search-results li .text-muted {{
             color: #999;
         }}
+        .text-right {{ text-align: right !important; }}
+        .form-control-sm.text-right {{ text-align: right; }}
     </style>
 </head>
 <body>
@@ -3970,8 +3972,8 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="number" step="0.01" value="${{(item.quantity || 0).toFixed(2)}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
-                            <td><input type="number" step="0.01" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td>${{item.amount.toFixed(2)}}</td>
                             <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
                             <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
@@ -4528,8 +4530,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="number" step="0.01" value="${{(item.quantity || 0).toFixed(2)}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
-                            <td><input type="number" step="0.01" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td>${{item.amount.toFixed(2)}}</td>
                             <td>
                                 <div class="position-relative">
@@ -14187,6 +14189,12 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
             .set_align(FormatAlign::VerticalCenter)
             .set_border(FormatBorder::Thin);
 
+        let cell_right_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+
         let label_format = Format::new()
             .set_font_size(10)
             .set_align(FormatAlign::Right)
@@ -14259,7 +14267,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 worksheet.write_with_format(current_row, 0, seq_num, &cell_format)?;
                 worksheet.write_with_format(current_row, 1, food_name, &cell_left_format)?;
                 worksheet.write_with_format(current_row, 2, spec, &cell_format)?;
-                worksheet.write_with_format(current_row, 3, *quantity, &cell_format)?;
+                worksheet.write_with_format(current_row, 3, *quantity, &cell_right_format)?;
                 worksheet.write_with_format(current_row, 4, *unit_price, &money_format)?;
                 worksheet.write_with_format(current_row, 5, *amount, &money_format)?;
                 worksheet.write_with_format(current_row, 6, "", &cell_format)?;
@@ -14333,6 +14341,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 } else {
                     format = format.set_border_left(FormatBorder::Thin).set_border_right(FormatBorder::Thin);
                 }
+                worksheet.set_row_height(current_row, 13)?;
                 worksheet.merge_range(current_row, 0, current_row, 12, item, &format)?;
                 current_row += 1;
             }
@@ -14381,7 +14390,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 }
 
                 let row = current_row;
-                worksheet.set_row_height(row, 20)?;
+                worksheet.set_row_height(row, 35)?;
                 if sig_row == 0 {
                     worksheet.merge_range(row, 0, row, 1, "食材供应人员①：", &label_fmt)?;
                     worksheet.merge_range(row, 2, row, 3, "联系方式：", &contact_fmt)?;
