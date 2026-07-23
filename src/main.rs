@@ -202,18 +202,22 @@ async fn init_pool() {
         .expect("数据库连接失败");
     init_tables(&pool).await.expect("初始化数据表失败");
     
-    let _ = sqlx::query(
-        "DELETE FROM sales_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0"
-    )
-    .execute(&pool)
-    .await;
-    
-    let _ = sqlx::query(
-        "DELETE FROM sales_order WHERE id NOT IN (SELECT DISTINCT order_id FROM sales_order_item)"
-    )
-    .execute(&pool)
-    .await;
-    
+    // 清理所有孤儿数据
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE order_id NOT IN (SELECT id FROM sales_order)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE order_id NOT IN (SELECT id FROM purchase_order)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order WHERE id NOT IN (SELECT DISTINCT order_id FROM sales_order_item)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order WHERE id NOT IN (SELECT DISTINCT order_id FROM purchase_order_item)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM sales_order WHERE purchaser_id NOT IN (SELECT id FROM purchaser)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order WHERE supplier_id NOT IN (SELECT id FROM supplier)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM food_item WHERE accept_id NOT IN (SELECT id FROM food_accept)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM food_accept WHERE supplier_id NOT IN (SELECT id FROM supplier) OR purchaser_id NOT IN (SELECT id FROM purchaser)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM inventory WHERE product_id NOT IN (SELECT id FROM product) OR warehouse_id NOT IN (SELECT id FROM warehouse)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM product_unit WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM product_price WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
     let _ = sqlx::query("VACUUM").execute(&pool).await;
     
     DB_POOL.set(pool).expect("数据库连接池已初始化");
@@ -3644,7 +3648,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             <input type="file" id="purchaseOrderFileInput" style="display:none" accept=".csv" onchange="handlePurchaseOrderFile(this)">
         </div>
         <table class="table table-bordered">
-            <thead><tr><th>ID</th><th>订单号</th><th>日期</th><th>供应商</th><th>入库仓库</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">供应商<span id="sortIndicator_unit_name"></span></th><th>入库仓库</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
             <tbody id="orderListBody"></tbody>
         </table>
 
@@ -3653,6 +3657,29 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
         <script>
             let suppliers = [];
             let items = [];
+            let sortField = '';
+            let sortOrder = 'desc';
+
+            function sortOrders(field) {{
+                if (sortField === field) {{
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                }} else {{
+                    sortField = field;
+                    sortOrder = 'asc';
+                }}
+                updateSortIndicators();
+                loadOrders();
+            }}
+
+            function updateSortIndicators() {{
+                const fields = ['order_no', 'order_date', 'unit_name', 'status'];
+                fields.forEach(f => {{
+                    const el = document.getElementById('sortIndicator_' + f);
+                    if (el) {{
+                        el.textContent = (sortField === f) ? (sortOrder === 'asc' ? ' ▲' : ' ▼') : '';
+                    }}
+                }});
+            }}
 
             async function loadSuppliers() {{
                 const res = await fetch('/api/supplier/list');
@@ -3812,6 +3839,9 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 let url = '/api/purchase_order/list?page=' + currentPage + '&page_size=20';
                 if (currentKeyword) {{
                     url += '&keyword=' + encodeURIComponent(currentKeyword);
+                }}
+                if (sortField) {{
+                    url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
                 }}
                 const res = await fetch(url);
                 const result = await res.json();
@@ -4305,7 +4335,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             <input type="file" id="salesOrderFileInput" style="display:none" accept=".csv" onchange="handleSalesOrderFile(this)">
         </div>
         <table class="table table-bordered">
-            <thead><tr><th>ID</th><th>订单号</th><th>日期</th><th>采购单位</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">采购单位<span id="sortIndicator_unit_name"></span></th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
             <tbody id="orderListBody"></tbody>
         </table>
 
@@ -4314,6 +4344,29 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
         <script>
             let purchasers = [];
             let items = [];
+            let sortField = '';
+            let sortOrder = 'desc';
+
+            function sortOrders(field) {{
+                if (sortField === field) {{
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                }} else {{
+                    sortField = field;
+                    sortOrder = 'asc';
+                }}
+                updateSortIndicators();
+                loadOrders();
+            }}
+
+            function updateSortIndicators() {{
+                const fields = ['order_no', 'order_date', 'unit_name', 'status'];
+                fields.forEach(f => {{
+                    const el = document.getElementById('sortIndicator_' + f);
+                    if (el) {{
+                        el.textContent = (sortField === f) ? (sortOrder === 'asc' ? ' ▲' : ' ▼') : '';
+                    }}
+                }});
+            }}
 
             function showPurchaserDropdown(filter) {{
                 const dropdown = document.getElementById('purchaserDropdown');
@@ -4800,6 +4853,9 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 let url = '/api/sales_order/list?page=' + currentPage + '&page_size=20';
                 if (currentKeyword) {{
                     url += '&keyword=' + encodeURIComponent(currentKeyword);
+                }}
+                if (sortField) {{
+                    url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
                 }}
                 const res = await fetch(url);
                 const result = await res.json();
@@ -8913,11 +8969,6 @@ async fn api_clean_invalid_orders(headers: axum::http::HeaderMap) -> impl IntoRe
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("清理前备份失败：{}", e)),
     }
 
-    let result = sqlx::query("BEGIN TRANSACTION").execute(pool()).await;
-    if let Err(e) = result {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("开始事务失败：{}", e));
-    }
-
     let mut deleted_count = 0;
 
     let no_item_sales: Vec<i64> = sqlx::query_scalar(
@@ -9054,14 +9105,6 @@ async fn api_clean_invalid_orders(headers: axum::http::HeaderMap) -> impl IntoRe
             .await
             .ok();
         deleted_count += 1;
-    }
-
-    match sqlx::query("COMMIT TRANSACTION").execute(pool()).await {
-        Ok(_) => {}
-        Err(e) => {
-            let _ = sqlx::query("ROLLBACK TRANSACTION").execute(pool()).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("提交事务失败：{}", e));
-        }
     }
 
     let _ = sqlx::query("VACUUM").execute(pool()).await;
@@ -11276,6 +11319,17 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
+    // 排序处理
+    let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
+    let sort_order = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
+    let order_clause = match sort_field {
+        "order_no" => format!("po.order_no {}", sort_order),
+        "order_date" => format!("po.order_date {}", sort_order),
+        "unit_name" => format!("s.name {}", sort_order),
+        "status" => format!("po.status {}", sort_order),
+        _ => format!("po.id {}", sort_order),
+    };
+    
     let total_rows = sqlx::query(
         "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
          WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?"
@@ -11288,20 +11342,23 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     .unwrap();
     let total: i64 = total_rows.get("count");
     
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
          WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?
-         ORDER BY po.id DESC LIMIT ? OFFSET ?"
-    )
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         ORDER BY {} LIMIT ? OFFSET ?",
+        order_clause
+    );
+    
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
     
     let orders: Vec<serde_json::Value> = rows
         .iter()
@@ -13477,6 +13534,17 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
+    // 排序处理
+    let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
+    let sort_order = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
+    let order_clause = match sort_field {
+        "order_no" => format!("so.order_no {}", sort_order),
+        "order_date" => format!("so.order_date {}", sort_order),
+        "unit_name" => format!("p.name {}", sort_order),
+        "status" => format!("so.status {}", sort_order),
+        _ => format!("so.id {}", sort_order),
+    };
+    
     let total_rows = sqlx::query(
         "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
          WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?"
@@ -13489,20 +13557,23 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     .unwrap();
     let total: i64 = total_rows.get("count");
     
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
          FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
          WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
-         ORDER BY so.id DESC LIMIT ? OFFSET ?"
-    )
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         ORDER BY {} LIMIT ? OFFSET ?",
+        order_clause
+    );
+    
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(&keyword_pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
     
     let orders: Vec<serde_json::Value> = rows
         .iter()
