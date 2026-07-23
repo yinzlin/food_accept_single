@@ -14390,7 +14390,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 }
 
                 let row = current_row;
-                worksheet.set_row_height(row, 35)?;
+                worksheet.set_row_height(row, 25)?;
                 if sig_row == 0 {
                     worksheet.merge_range(row, 0, row, 1, "食材供应人员①：", &label_fmt)?;
                     worksheet.merge_range(row, 2, row, 3, "联系方式：", &contact_fmt)?;
