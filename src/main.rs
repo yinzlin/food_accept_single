@@ -13479,6 +13479,320 @@ async fn api_query_document_summary(axum::extract::Query(params): axum::extract:
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
+// === 补全缺失的查询 API ===
+
+async fn api_query_stock_balance(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
+    let category_id = params.get("category_id").map(|s| s.as_str()).unwrap_or("");
+    
+    let sql = if category_id.is_empty() {
+        format!(
+            "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
+                    p.name as product_name, p.spec, p.unit, p.base_price,
+                    (i.quantity * p.base_price) as amount
+             FROM inventory i JOIN product p ON i.product_id = p.id
+             WHERE p.name LIKE ? ORDER BY p.name"
+        )
+    } else {
+        format!(
+            "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
+                    p.name as product_name, p.spec, p.unit, p.base_price,
+                    (i.quantity * p.base_price) as amount
+             FROM inventory i JOIN product p ON i.product_id = p.id
+             WHERE p.name LIKE ? AND p.category_id = ? ORDER BY p.name"
+        )
+    };
+    
+    let pattern = format!("%{}%", product_name);
+    let rows = if category_id.is_empty() {
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&pattern)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default()
+    } else {
+        let cat_id: i64 = category_id.parse().unwrap_or(0);
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&pattern)
+            .bind(cat_id)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default()
+    };
+    
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let qty = row.try_get::<f64, _>("quantity").unwrap_or(0.0);
+        let amt = row.try_get::<f64, _>("amount").unwrap_or(0.0);
+        serde_json::json!({
+            "product_id": row.get::<i64, _>("product_id"),
+            "product_name": row.get::<String, _>("product_name"),
+            "spec": row.get::<Option<String>, _>("spec"),
+            "unit": row.get::<Option<String>, _>("unit"),
+            "quantity": qty,
+            "amount": amt,
+            "min_stock": row.try_get::<f64, _>("min_stock").unwrap_or(0.0),
+            "max_stock": row.try_get::<f64, _>("max_stock").unwrap_or(0.0),
+        })
+    }).collect();
+    
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let product_id = params.get("product_id").and_then(|s| s.parse::<i64>().ok());
+    
+    let pattern = format!("%{}%", product_name);
+    
+    let mut where_clause = String::from("WHERE 1=1");
+    let mut sales_where_clause = String::from("WHERE 1=1");
+    if let Some(pid) = product_id {
+        where_clause.push_str(&format!(" AND p.id = {}", pid));
+        sales_where_clause.push_str(&format!(" AND p.id = {}", pid));
+    } else if !product_name.is_empty() {
+        where_clause.push_str(" AND p.name LIKE ?");
+        sales_where_clause.push_str(" AND p.name LIKE ?");
+    }
+    if !start_date.is_empty() {
+        where_clause.push_str(&format!(" AND po.order_date >= '{}'", start_date));
+        sales_where_clause.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_clause.push_str(&format!(" AND po.order_date <= '{}'", end_date));
+        sales_where_clause.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    
+    // 采购入库 + 销售出库
+    let purchase_sql = format!(
+        "SELECT po.order_date as create_time, '采购入库' as type, p.name as product_name, p.spec,
+                poi.quantity as in_quantity, 0 as out_quantity, poi.remark
+         FROM purchase_order_item poi
+         JOIN purchase_order po ON poi.order_id = po.id
+         JOIN product p ON poi.product_id = p.id
+         {}
+         UNION ALL
+         SELECT so.order_date as create_time, '销售出库' as type, p.name as product_name, p.spec,
+                0 as in_quantity, soi.quantity as out_quantity, soi.remark
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         JOIN product p ON soi.product_id = p.id
+         {}
+         ORDER BY create_time",
+        where_clause, sales_where_clause
+    );
+    
+    let rows = if product_id.is_some() || product_name.is_empty() {
+        sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default()
+    };
+    
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let in_qty = row.try_get::<f64, _>("in_quantity").unwrap_or(0.0);
+        let out_qty = row.try_get::<f64, _>("out_quantity").unwrap_or(0.0);
+        serde_json::json!({
+            "create_time": row.get::<String, _>("create_time"),
+            "type": row.get::<String, _>("type"),
+            "product_name": row.get::<String, _>("product_name"),
+            "spec": row.get::<Option<String>, _>("spec"),
+            "in_quantity": in_qty,
+            "out_quantity": out_qty,
+            "remark": row.get::<Option<String>, _>("remark"),
+        })
+    }).collect();
+    
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_query_stock_warning() -> impl IntoResponse {
+    let low_rows = sqlx::query(
+        "SELECT p.name as product_name, p.spec, p.unit, i.quantity as current_stock, i.min_stock
+         FROM inventory i JOIN product p ON i.product_id = p.id
+         WHERE i.quantity < i.min_stock ORDER BY (i.min_stock - i.quantity) DESC"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let high_rows = sqlx::query(
+        "SELECT p.name as product_name, p.spec, p.unit, i.quantity as current_stock, i.max_stock
+         FROM inventory i JOIN product p ON i.product_id = p.id
+         WHERE i.quantity > i.max_stock ORDER BY (i.quantity - i.max_stock) DESC"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let low_stock: Vec<serde_json::Value> = low_rows.iter().map(|row| {
+        serde_json::json!({
+            "product_name": row.get::<String, _>("product_name"),
+            "spec": row.get::<Option<String>, _>("spec"),
+            "unit": row.get::<Option<String>, _>("unit"),
+            "current_stock": row.try_get::<f64, _>("current_stock").unwrap_or(0.0),
+            "min_stock": row.try_get::<f64, _>("min_stock").unwrap_or(0.0),
+        })
+    }).collect();
+    
+    let high_stock: Vec<serde_json::Value> = high_rows.iter().map(|row| {
+        serde_json::json!({
+            "product_name": row.get::<String, _>("product_name"),
+            "spec": row.get::<Option<String>, _>("spec"),
+            "unit": row.get::<Option<String>, _>("unit"),
+            "current_stock": row.try_get::<f64, _>("current_stock").unwrap_or(0.0),
+            "max_stock": row.try_get::<f64, _>("max_stock").unwrap_or(0.0),
+        })
+    }).collect();
+    
+    (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+        "low_stock": low_stock,
+        "high_stock": high_stock,
+    })).unwrap())
+}
+
+async fn api_query_slow_stock(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let days: i64 = params.get("days").and_then(|s| s.parse().ok()).unwrap_or(30);
+    
+    let rows = sqlx::query(
+        "SELECT p.id, p.name as product_name, p.spec, p.unit, i.quantity as current_stock,
+                COALESCE(soi.last_sale_date, '无销售记录') as last_sale_date
+         FROM inventory i
+         JOIN product p ON i.product_id = p.id
+         LEFT JOIN (
+             SELECT soi.product_id, MAX(so.order_date) as last_sale_date
+             FROM sales_order_item soi
+             JOIN sales_order so ON soi.order_id = so.id
+             GROUP BY soi.product_id
+         ) soi ON i.product_id = soi.product_id
+         WHERE soi.last_sale_date IS NULL
+            OR julianday('now') - julianday(soi.last_sale_date) > ?
+         ORDER BY soi.last_sale_date ASC NULLS FIRST"
+    )
+    .bind(days)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let curr_stock = row.try_get::<f64, _>("current_stock").unwrap_or(0.0);
+        serde_json::json!({
+            "product_id": row.get::<i64, _>("id"),
+            "product_name": row.get::<String, _>("product_name"),
+            "spec": row.get::<Option<String>, _>("spec"),
+            "unit": row.get::<Option<String>, _>("unit"),
+            "current_stock": curr_stock,
+            "last_sale_date": row.get::<String, _>("last_sale_date"),
+        })
+    }).collect();
+    
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_query_income_expense(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    
+    let mut date_filter = String::new();
+    if !start_date.is_empty() {
+        date_filter.push_str(&format!(" AND order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        date_filter.push_str(&format!(" AND order_date <= '{}'", end_date));
+    }
+    
+    let sql = format!(
+        "SELECT order_date, '销售订单' as type, CAST(total_amount AS REAL) as total_amount, CAST(final_amount AS REAL) as final_amount, '收入' as direction
+         FROM sales_order WHERE status != 'cancelled' {}
+         UNION ALL
+         SELECT order_date, '采购订单' as type, CAST(total_amount AS REAL) as total_amount, CAST(final_amount AS REAL) as final_amount, '支出' as direction
+         FROM purchase_order WHERE status != 'cancelled' {}
+         ORDER BY order_date",
+        date_filter, date_filter
+    );
+    
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let total_amt = row.try_get::<f64, _>("total_amount").unwrap_or(0.0);
+        let final_amt = row.try_get::<f64, _>("final_amount").unwrap_or(0.0);
+        serde_json::json!({
+            "order_date": row.get::<String, _>("order_date"),
+            "type": row.get::<String, _>("type"),
+            "total_amount": total_amt,
+            "final_amount": final_amt,
+            "direction": row.get::<String, _>("direction"),
+        })
+    }).collect();
+    
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_query_profit_detail(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    
+    let mut date_filter = String::new();
+    if !start_date.is_empty() {
+        date_filter.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        date_filter.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    
+    let sql = format!(
+        "SELECT so.order_no, so.order_date, soi.product_name, CAST(soi.quantity AS REAL) as quantity, CAST(soi.unit_price AS REAL) as sale_price,
+                COALESCE(CAST(p.purchase_price AS REAL), 0) as purchase_price,
+                (CAST(soi.unit_price AS REAL) - COALESCE(CAST(p.purchase_price AS REAL), 0)) * CAST(soi.quantity AS REAL) as profit,
+                CAST(soi.amount AS REAL) as sale_amount,
+                COALESCE(CAST(p.purchase_price AS REAL), 0) * CAST(soi.quantity AS REAL) as cost_amount
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         LEFT JOIN product p ON soi.product_id = p.id
+         WHERE so.status != 'cancelled' {}
+         ORDER BY so.order_date, so.order_no",
+        date_filter
+    );
+    
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let qty = row.try_get::<f64, _>("quantity").unwrap_or(0.0);
+        let sale_price = row.try_get::<f64, _>("sale_price").unwrap_or(0.0);
+        let purchase_price = row.try_get::<f64, _>("purchase_price").unwrap_or(0.0);
+        let profit = row.try_get::<f64, _>("profit").unwrap_or(0.0);
+        let sale_amount = row.try_get::<f64, _>("sale_amount").unwrap_or(0.0);
+        let cost_amount = row.try_get::<f64, _>("cost_amount").unwrap_or(0.0);
+        serde_json::json!({
+            "order_no": row.get::<String, _>("order_no"),
+            "order_date": row.get::<String, _>("order_date"),
+            "product_name": row.get::<String, _>("product_name"),
+            "quantity": qty,
+            "sale_price": sale_price,
+            "purchase_price": purchase_price,
+            "profit": profit,
+            "sale_amount": sale_amount,
+            "cost_amount": cost_amount,
+        })
+    }).collect();
+    
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
 async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
     let result = sqlx::query(
         "INSERT INTO sales_order(purchaser_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -15863,6 +16177,12 @@ fn build_router() -> Router {
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
         .route("/api/query/purchaser_balance/export", get(api_query_purchaser_balance_export))
         .route("/api/query/product_rank", get(api_query_product_rank))
+        .route("/api/query/stock_balance", get(api_query_stock_balance))
+        .route("/api/query/stock_flow", get(api_query_stock_flow))
+        .route("/api/query/stock_warning", get(api_query_stock_warning))
+        .route("/api/query/slow_stock", get(api_query_slow_stock))
+        .route("/api/query/income_expense", get(api_query_income_expense))
+        .route("/api/query/profit_detail", get(api_query_profit_detail))
         .route("/api/query/overview", get(api_query_overview))
         .route("/api/query/category_stats", get(api_query_category_stats))
         .route("/api/query/document_summary", get(api_query_document_summary))
