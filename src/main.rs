@@ -1024,7 +1024,7 @@ fn sidebar_html() -> String {
         <div class="sidebar">
             <div class="sidebar-header">
                 <div class="logo"><span class="logo-icon">🍽️</span></div>
-                <div class="logo-text">进销存管理系统</div>
+                <div class="logo-text">颍上食材配送管理系统</div>
             </div>
             <div class="sidebar-search">
                 <input type="text" id="treeSearch" placeholder="🔍 搜索菜单..." oninput="filterTree()">
@@ -2735,6 +2735,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 <tr><td colspan="12" class="text-center text-muted">加载中...</td></tr>
             </tbody>
         </table>
+        <div id="productPagination" class="mt-3"></div>
 
         <!-- 编辑模态框 -->
         <div class="modal fade" id="editProductModal" tabindex="-1">
@@ -2897,32 +2898,66 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             let currentCategoryName = '全部商品';
             let currentKeyword = '';
             let allProducts = [];
+            let currentPage = 1;
+            let pageSize = 20;
+            let totalPages = 1;
+            let totalCount = 0;
             let editingProductId = null;
             let pendingProductData = null;
 
-            async function loadProductsByCategory(categoryId) {{
-                currentCategoryId = categoryId;
+            async function loadProductsByCategory(categoryId, page) {{
+                const categoryChanged = categoryId !== undefined && categoryId !== currentCategoryId;
+                if (categoryChanged) currentCategoryId = categoryId;
+                if (page !== undefined) {{
+                    currentPage = page;
+                }} else if (categoryChanged || (categoryId === null && currentCategoryId !== null)) {{
+                    currentPage = 1;
+                }}
+                if (categoryId === null) currentCategoryId = null;
                 let params = [];
-                if (categoryId) {{ params.push('category_id=' + categoryId); }}
+                if (currentCategoryId) {{ params.push('category_id=' + currentCategoryId); }}
                 if (currentKeyword) {{ params.push('keyword=' + encodeURIComponent(currentKeyword)); }}
-                let url = '/api/product/list';
-                if (params.length > 0) {{ url += '?' + params.join('&'); }}
+                params.push('page=' + currentPage);
+                params.push('page_size=' + pageSize);
+                let url = '/api/product/list?' + params.join('&');
                 try {{
                     const res = await fetch(url);
-                    const products = await res.json();
+                    const result = await res.json();
+                    const products = result.data || result || [];
+                    allProducts = products;
+                    totalCount = result.total || products.length;
+                    totalPages = result.total_pages || 1;
+                    if (result.page) currentPage = result.page;
                     renderProductTable(products);
-                    updateCategoryTitle(categoryId);
-                    setFormCategory(categoryId);
+                    renderProductPagination();
+                    updateCategoryTitle(currentCategoryId);
+                    setFormCategory(currentCategoryId);
                 }} catch(e) {{
                     console.error('加载商品失败:', e);
                 }}
             }}
 
+            function renderProductPagination() {{
+                const container = document.getElementById('productPagination');
+                if (!container) return;
+                if (totalPages <= 1) {{ container.innerHTML = '<p class="text-center text-muted">共 ' + totalCount + ' 条商品</p>'; return; }}
+                let html = '<nav><ul class="pagination justify-content-center">';
+                html += '<li class="page-item ' + (currentPage <= 1 ? 'disabled' : '') + '"><a class="page-link" onclick="loadProductsByCategory(undefined, ' + (currentPage - 1) + ')">上一页</a></li>';
+                const startPage = Math.max(1, currentPage - 2);
+                const endPage = Math.min(totalPages, currentPage + 2);
+                for (let i = startPage; i <= endPage; i++) {{
+                    html += '<li class="page-item ' + (i === currentPage ? 'active' : '') + '"><a class="page-link" onclick="loadProductsByCategory(undefined, ' + i + ')">' + i + '</a></li>';
+                }}
+                html += '<li class="page-item ' + (currentPage >= totalPages ? 'disabled' : '') + '"><a class="page-link" onclick="loadProductsByCategory(undefined, ' + (currentPage + 1) + ')">下一页</a></li>';
+                html += '</ul></nav>';
+                html += '<p class="text-center text-muted mt-2">共 ' + totalCount + ' 条商品，当前第 ' + currentPage + '/' + totalPages + ' 页</p>';
+                container.innerHTML = html;
+            }}
+
             function renderProductTable(products) {{
-                allProducts = products || [];
                 const tbody = document.getElementById('productTableBody');
                 if (!products || products.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无商品数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="12" class="text-center text-muted">暂无商品数据</td></tr>';
                     return;
                 }}
                 let html = '';
@@ -2937,10 +2972,14 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     }} else {{
                         imageHtml = '<div style="width:50px;height:50px;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#ccc;">无图</div>';
                     }}
+                    let nameDisplay = escapeHtml(p.name);
+                    if (p.alias2 && p.alias2.trim() !== '') {{
+                        nameDisplay += '(' + escapeHtml(p.alias2.trim()) + ')';
+                    }}
                     let statusBadge = p.status === 1 ? '<span class="badge bg-success">启用</span>' : '<span class="badge bg-secondary">停用</span>';
                     let toggleBtnClass = p.status === 1 ? 'btn-outline-warning' : 'btn-outline-success';
                     let toggleBtnText = p.status === 1 ? '停用' : '启用';
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + escapeHtml(p.name) + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + '</td>';
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + '</td>';
                     html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
@@ -2948,14 +2987,16 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
             function searchProducts() {{
                 currentKeyword = document.getElementById('searchKeyword').value.trim();
-                loadProductsByCategory(currentCategoryId);
+                currentPage = 1;
+                loadProductsByCategory(currentCategoryId, 1);
             }}
 
             function resetSearch() {{
                 document.getElementById('searchKeyword').value = '';
                 currentKeyword = '';
                 currentCategoryId = null;
-                loadProductsByCategory(null);
+                currentPage = 1;
+                loadProductsByCategory(null, 1);
             }}
 
             function calcSellingPrice() {{
@@ -5354,7 +5395,7 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>订单号</th><th>采购单位</th><th>日期</th><th>金额</th><th>下浮后</th><th>状态</th><th>操作</th></tr></thead>
+                <thead><tr><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">采购单位<span id="sortIndicator_unit_name"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('total_amount')" style="cursor:pointer">金额<span id="sortIndicator_total_amount"></span></th><th>下浮后</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
             <div id="pagination" class="mt-3"></div>
@@ -5397,6 +5438,30 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
         </div>
         <script>
             let currentPage = 1;
+            let sortField = '';
+            let sortOrder = 'desc';
+
+            function sortOrders(field) {
+                if (sortField === field) {
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortField = field;
+                    sortOrder = 'asc';
+                }
+                updateSortIndicators();
+                loadData();
+            }
+
+            function updateSortIndicators() {
+                const fields = ['order_no', 'unit_name', 'order_date', 'total_amount', 'status'];
+                fields.forEach(f => {
+                    const el = document.getElementById('sortIndicator_' + f);
+                    if (el) {
+                        el.textContent = (sortField === f) ? (sortOrder === 'asc' ? ' ▲' : ' ▼') : '';
+                    }
+                });
+            }
+
             async function loadPurchasers() {
                 const res = await fetch('/api/purchaser/list');
                 const purchasers = await res.json();
@@ -5411,11 +5476,14 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
             }
             async function loadData(page) {
                 if (page !== undefined) currentPage = page;
-                const url = '/api/query/sales_order?purchaser_id=' + document.getElementById('purchaserId').value + 
-                    '&start_date=' + document.getElementById('startDate').value + 
-                    '&end_date=' + document.getElementById('endDate').value + 
+                let url = '/api/query/sales_order?purchaser_id=' + document.getElementById('purchaserId').value +
+                    '&start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value +
                     '&status=' + document.getElementById('status').value +
                     '&page=' + currentPage + '&page_size=20';
+                if (sortField) {
+                    url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
+                }
                 const res = await fetch(url);
                 const result = await res.json();
                 const data = result.data || [];
@@ -10067,44 +10135,75 @@ async fn api_product_toggle_status(Path(id): Path<i64>) -> impl IntoResponse {
 async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let category_id = params.get("category_id").and_then(|v| v.parse::<i64>().ok());
     let keyword_pattern = parse_keyword_pattern(&params);
-    
-    let rows = if let Some(cid) = category_id {
-        sqlx::query(
-            "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
-             FROM product p LEFT JOIN category c ON p.category_id = c.id
-             WHERE p.category_id IN (
-                 WITH RECURSIVE cat_tree(id) AS (
-                     SELECT id FROM category WHERE id = ?
-                     UNION ALL
-                     SELECT c.id FROM category c 
-                     JOIN cat_tree ct ON c.parent_id = ct.id
-                 )
-                 SELECT id FROM cat_tree
-             )
-             AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)
-             ORDER BY p.id DESC"
-        )
-        .bind(cid)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .fetch_all(pool())
-        .await
-        .unwrap_or_default()
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let offset = (page - 1) * page_size;
+
+    // 构造 WHERE 条件、绑定参数和 COUNT 基础 SQL
+    #[derive(Debug)]
+    struct QueryParts {
+        where_sql: String,
+        binds: Vec<String>,
+        category_bind: Option<i64>,
+    }
+
+    let query_parts = if let Some(cid) = category_id {
+        QueryParts {
+            where_sql: format!(
+                "WHERE p.category_id IN (
+                    WITH RECURSIVE cat_tree(id) AS (
+                        SELECT id FROM category WHERE id = ?
+                        UNION ALL
+                        SELECT c.id FROM category c 
+                        JOIN cat_tree ct ON c.parent_id = ct.id
+                    )
+                    SELECT id FROM cat_tree
+                )
+                AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)"
+            ),
+            binds: vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()],
+            category_bind: Some(cid),
+        }
     } else {
-        sqlx::query(
-            "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
-             FROM product p LEFT JOIN category c ON p.category_id = c.id
-             WHERE p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?
-             ORDER BY p.id DESC"
-        )
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .fetch_all(pool())
-        .await
-        .unwrap_or_default()
+        QueryParts {
+            where_sql: "WHERE p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?".to_string(),
+            binds: vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()],
+            category_bind: None,
+        }
     };
+
+    // 总数查询
+    let count_sql = format!(
+        "SELECT COUNT(*) as count FROM product p LEFT JOIN category c ON p.category_id = c.id {}",
+        query_parts.where_sql
+    );
+    let mut count_q = sqlx::query(AssertSqlSafe(count_sql.as_str()));
+    if let Some(cid) = query_parts.category_bind {
+        count_q = count_q.bind(cid);
+    }
+    for b in &query_parts.binds {
+        count_q = count_q.bind(b);
+    }
+    let total_row = count_q.fetch_one(pool()).await.unwrap();
+    let total: i64 = total_row.get("count");
+
+    // 分页数据查询
+    let data_sql = format!(
+        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
+         FROM product p LEFT JOIN category c ON p.category_id = c.id
+         {}
+         ORDER BY p.id DESC LIMIT ? OFFSET ?",
+        query_parts.where_sql
+    );
+    let mut data_q = sqlx::query(AssertSqlSafe(data_sql.as_str()));
+    if let Some(cid) = query_parts.category_bind {
+        data_q = data_q.bind(cid);
+    }
+    for b in &query_parts.binds {
+        data_q = data_q.bind(b);
+    }
+    data_q = data_q.bind(page_size).bind(offset);
+    let rows = data_q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut products: Vec<serde_json::Value> = Vec::new();
     for row in rows {
@@ -10189,7 +10288,16 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
         }));
     }
     
-    (StatusCode::OK, serde_json::to_string(&products).unwrap())
+    let total_pages = if page_size > 0 { (total + page_size - 1) / page_size } else { 0 };
+    let result = serde_json::json!({
+        "data": products,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
 async fn api_product_create(Json(req): Json<ProductReq>) -> impl IntoResponse {
@@ -12724,12 +12832,26 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
-    
+
+    // 排序处理：支持订单号、采购单位、日期、金额、状态列点击排序
+    let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
+    let sort_order_raw = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
+    // 仅允许 asc/desc，防止任意 SQL 片段注入
+    let sort_order = if sort_order_raw.eq_ignore_ascii_case("asc") { "asc" } else { "desc" };
+    let order_clause = match sort_field {
+        "order_no" => format!("so.order_no {}", sort_order),
+        "unit_name" => format!("p.name {}", sort_order),
+        "order_date" => format!("so.order_date {}", sort_order),
+        "total_amount" => format!("so.total_amount {}", sort_order),
+        "status" => format!("so.status {}", sort_order),
+        _ => format!("so.id {}", sort_order),
+    };
+
     let mut base_sql = String::from(
         " FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1"
     );
     let mut binds: Vec<String> = Vec::new();
-    
+
     if !purchaser_id.is_empty() {
         base_sql.push_str(" AND so.purchaser_id = ?");
         binds.push(purchaser_id.to_string());
@@ -12746,7 +12868,7 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
         base_sql.push_str(" AND so.status = ?");
         binds.push(status.to_string());
     }
-    
+
     let count_query = format!("SELECT COUNT(*){}", base_sql);
     let mut count_q = sqlx::query(AssertSqlSafe(count_query.as_str()));
     for b in &binds {
@@ -12754,10 +12876,10 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
     }
     let total_rows = count_q.fetch_one(pool()).await.unwrap();
     let total: i64 = total_rows.get("COUNT(*)");
-    
+
     let data_sql = format!(
-        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name {} ORDER BY so.id DESC LIMIT ? OFFSET ?",
-        base_sql
+        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name {} ORDER BY {} LIMIT ? OFFSET ?",
+        base_sql, order_clause
     );
     let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str()));
     for b in &binds {
@@ -14341,7 +14463,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 } else {
                     format = format.set_border_left(FormatBorder::Thin).set_border_right(FormatBorder::Thin);
                 }
-                worksheet.set_row_height(current_row, 13)?;
+                worksheet.set_row_height(current_row, 10)?;
                 worksheet.merge_range(current_row, 0, current_row, 12, item, &format)?;
                 current_row += 1;
             }
