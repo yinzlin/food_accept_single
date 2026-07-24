@@ -2737,12 +2737,14 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
     let content = format!(r#"
         <style>
+            .page-content {{ padding-top: 0 !important; }}
             .product-sticky-header {{
                 position: sticky;
                 top: 0;
                 z-index: 30;
                 background: #f5f7fa;
-                padding-bottom: 4px;
+                padding-top: 12px;
+                padding-bottom: 8px;
             }}
             .product-sticky-table thead th {{
                 position: sticky;
@@ -2751,6 +2753,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 background: white;
                 box-shadow: 0 1px 0 rgba(0,0,0,0.1);
             }}
+            .product-list-section {{ padding-top: 6px; }}
         </style>
         <div class="product-sticky-header">
             <div class="card mb-4" style="margin-bottom:0 !important;">
@@ -2800,6 +2803,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             </div>
         </div>
 
+        <div class="product-list-section">
         <table class="table table-bordered product-sticky-table">
             <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th>进价</th><th>多单位</th><th>分类</th><th>状态</th><th style="width:140px">操作</th></tr></thead>
             <tbody id="productTableBody">
@@ -2807,6 +2811,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             </tbody>
         </table>
         <div id="productPagination" class="mt-3"></div>
+        </div>
 
         <!-- 编辑模态框 -->
         <div class="modal fade" id="editProductModal" tabindex="-1">
