@@ -1239,6 +1239,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
     <title>{}</title>
     <link rel="stylesheet" href="/static/bootstrap.min.css">
     <style>
@@ -1281,6 +1282,33 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         .top-header h2 {{ margin: 0; font-size: 20px; color: #333; }}
         .top-header .header-right {{ display: flex; align-items: center; gap: 15px; }}
         .page-content {{ padding: 25px; overflow-y: auto; flex: 1; }}
+        /* 汉堡菜单按钮 - 仅移动端显示 */
+        .sidebar-toggle {{ display: none; background: none; border: none; font-size: 24px; cursor: pointer; padding: 4px 8px; color: #333; line-height: 1; }}
+        .sidebar-backdrop {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); z-index: 99; }}
+        /* 移动端响应式适配 */
+        @media (max-width: 768px) {{
+            .sidebar {{ transform: translateX(-100%); transition: transform 0.3s ease; box-shadow: 2px 0 12px rgba(0,0,0,0.3); }}
+            .sidebar.open {{ transform: translateX(0); }}
+            .sidebar-backdrop.show {{ display: block; }}
+            .main-content {{ margin-left: 0 !important; }}
+            .top-header {{ padding: 10px 12px; }}
+            .top-header h2 {{ font-size: 16px; }}
+            .sidebar-toggle {{ display: inline-block; }}
+            .page-content {{ padding: 12px; }}
+            .card {{ margin-bottom: 12px !important; padding: 12px !important; }}
+            .card.p-4 {{ padding: 12px !important; }}
+            .row > div {{ margin-bottom: 8px; }}
+            .col-md-1, .col-md-2, .col-md-3, .col-md-4, .col-md-5, .col-md-6, .col-md-7, .col-md-8, .col-md-9, .col-md-10, .col-md-11, .col-md-12 {{ flex: 0 0 100%; max-width: 100%; }}
+            .table {{ display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }}
+            .table thead th {{ position: sticky; top: 0; background: #f8f9fa; z-index: 5; }}
+            .modal-dialog {{ margin: 8px; max-width: calc(100vw - 16px); }}
+            .pagination {{ flex-wrap: wrap; justify-content: center; }}
+            .page-link {{ padding: 6px 10px; font-size: 13px; }}
+            .btn-sm {{ padding: 4px 8px; font-size: 12px; }}
+            .form-control {{ font-size: 14px; }}
+            .d-flex.gap-2 {{ flex-wrap: wrap; gap: 6px !important; }}
+            .search-dropdown {{ max-height: 200px; }}
+        }}
         @media print {{
             .sidebar {{ display: none !important; }}
             .main-content {{ margin-left: 0 !important; }}
@@ -1330,10 +1358,14 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
 </head>
 <body>
     <div class="app-container">
+        <div class="sidebar-backdrop" id="sidebarBackdrop" onclick="toggleSidebar()"></div>
         {}
         <div class="main-content">
             <div class="top-header">
-                <h2>{}</h2>
+                <div class="d-flex align-items-center">
+                    <button class="sidebar-toggle" onclick="toggleSidebar()">☰</button>
+                    <h2>{}</h2>
+                </div>
                 <div class="header-right">
                     <span>{}</span>
                     <div class="user-info" id="userInfo" style="display:none;">
@@ -1410,7 +1442,28 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         }}
         
         checkLogin();
-        
+
+        function toggleSidebar() {{
+            const sidebar = document.querySelector('.sidebar');
+            const backdrop = document.getElementById('sidebarBackdrop');
+            if (sidebar && backdrop) {{
+                sidebar.classList.toggle('open');
+                backdrop.classList.toggle('show');
+            }}
+        }}
+        // 点击侧边栏链接后自动关闭（移动端）
+        document.addEventListener('DOMContentLoaded', function() {{
+            const sidebar = document.querySelector('.sidebar');
+            if (sidebar) {{
+                sidebar.addEventListener('click', function(e) {{
+                    if (e.target.closest('a') && window.innerWidth <= 768) {{
+                        sidebar.classList.remove('open');
+                        document.getElementById('sidebarBackdrop').classList.remove('show');
+                    }}
+                }});
+            }}
+        }});
+
         function toggleNode(header) {{
             const node = header.parentElement;
             node.classList.toggle('expanded');
@@ -2683,53 +2736,71 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
     }
 
     let content = format!(r#"
-        <div class="card mb-4">
-            <div class="card-body">
-                <h4>新增商品</h4>
-                <form method="post" onsubmit="createProduct(event)">
-                    <div class="row">
-                        <div class="col-md-2">
-                            <input type="text" name="name" placeholder="商品名称" class="form-control" required>
+        <style>
+            .product-sticky-header {{
+                position: sticky;
+                top: 0;
+                z-index: 30;
+                background: #f5f7fa;
+                padding-bottom: 4px;
+            }}
+            .product-sticky-table thead th {{
+                position: sticky;
+                top: var(--product-thead-top, 0px);
+                z-index: 20;
+                background: white;
+                box-shadow: 0 1px 0 rgba(0,0,0,0.1);
+            }}
+        </style>
+        <div class="product-sticky-header">
+            <div class="card mb-4" style="margin-bottom:0 !important;">
+                <div class="card-body" style="padding:12px;">
+                    <h4 style="margin-bottom:8px;">新增商品</h4>
+                    <form method="post" onsubmit="createProduct(event)">
+                        <div class="row">
+                            <div class="col-md-2">
+                                <input type="text" name="name" placeholder="商品名称" class="form-control" required>
+                            </div>
+                            <div class="col-md-2">
+                                <input type="text" name="spec" placeholder="规格" class="form-control">
+                            </div>
+                            <div class="col-md-1">
+                                <input type="text" name="unit" placeholder="显示单位" class="form-control">
+                            </div>
+                            <div class="col-md-1">
+                                <input type="text" name="base_unit" placeholder="基础单位" class="form-control">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="number" step="0.01" name="base_price" placeholder="基础单价(售价)" class="form-control">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="number" step="0.01" name="purchase_price" placeholder="进价" class="form-control">
+                            </div>
+                            <div class="col-md-2">
+                                <select name="category_id" class="form-control">{0}</select>
+                            </div>
+                            <div class="col-md-2">
+                                <button type="submit" class="btn btn-primary">新增</button>
+                            </div>
                         </div>
-                        <div class="col-md-2">
-                            <input type="text" name="spec" placeholder="规格" class="form-control">
-                        </div>
-                        <div class="col-md-1">
-                            <input type="text" name="unit" placeholder="显示单位" class="form-control">
-                        </div>
-                        <div class="col-md-1">
-                            <input type="text" name="base_unit" placeholder="基础单位" class="form-control">
-                        </div>
-                        <div class="col-md-2">
-                            <input type="number" step="0.01" name="base_price" placeholder="基础单价(售价)" class="form-control">
-                        </div>
-                        <div class="col-md-2">
-                            <input type="number" step="0.01" name="purchase_price" placeholder="进价" class="form-control">
-                        </div>
-                        <div class="col-md-2">
-                            <select name="category_id" class="form-control">{0}</select>
-                        </div>
-                        <div class="col-md-2">
-                            <button type="submit" class="btn btn-primary">新增</button>
-                        </div>
-                    </div>
-                </form>
+                    </form>
+                </div>
+            </div>
+
+            <div class="d-flex justify-content-between align-items-center" style="padding:10px 0;background:#f5f7fa;">
+                <h5 id="productListTitle" style="margin:0;">全部商品</h5>
+                <div class="d-flex gap-2 align-items-center">
+                    <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
+                    <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
+                    <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
+                    <button class="btn btn-sm btn-warning" onclick="importProducts()">导入</button>
+                    <input type="file" id="productFileInput" style="display:none" accept=".xlsx,.csv" onchange="handleProductFile(this)">
+                </div>
             </div>
         </div>
 
-        <div class="d-flex justify-content-between align-items-center mb-3">
-            <h5 id="productListTitle">全部商品</h5>
-            <div class="d-flex gap-2 align-items-center">
-                <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
-                <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
-                <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
-                <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
-                <button class="btn btn-sm btn-warning" onclick="importProducts()">导入</button>
-                <input type="file" id="productFileInput" style="display:none" accept=".xlsx,.csv" onchange="handleProductFile(this)">
-            </div>
-        </div>
-
-        <table class="table table-bordered">
+        <table class="table table-bordered product-sticky-table">
             <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th>进价</th><th>多单位</th><th>分类</th><th>状态</th><th style="width:140px">操作</th></tr></thead>
             <tbody id="productTableBody">
                 <tr><td colspan="12" class="text-center text-muted">加载中...</td></tr>
@@ -2904,6 +2975,19 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             let totalCount = 0;
             let editingProductId = null;
             let pendingProductData = null;
+
+            // 动态计算表头 sticky 偏移量（等于置顶表单+工具栏的高度）
+            function updateStickyHeaderOffset() {{
+                const header = document.querySelector('.product-sticky-header');
+                const table = document.querySelector('.product-sticky-table');
+                if (header && table) {{
+                    const h = header.offsetHeight;
+                    table.style.setProperty('--product-thead-top', h + 'px');
+                }}
+            }}
+            window.addEventListener('load', updateStickyHeaderOffset);
+            window.addEventListener('resize', updateStickyHeaderOffset);
+            document.addEventListener('DOMContentLoaded', updateStickyHeaderOffset);
 
             async function loadProductsByCategory(categoryId, page) {{
                 const categoryChanged = categoryId !== undefined && categoryId !== currentCategoryId;
