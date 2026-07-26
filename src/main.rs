@@ -14522,12 +14522,15 @@ async fn page_supplement() -> Html<String> {
                                     <hr>
                                     <h6>增项操作</h6>
                                     <div class="row mb-2">
-                                        <div class="col-md-6">
+                                        <div class="col-md-12">
                                             <label class="radio-inline mr-4">
                                                 <input type="radio" name="operationType" value="new_item" checked onchange="toggleOperationType()"> 新增商品行
                                             </label>
-                                            <label class="radio-inline">
+                                            <label class="radio-inline mr-4">
                                                 <input type="radio" name="operationType" value="increase_quantity" onchange="toggleOperationType()"> 追加已有商品数量
+                                            </label>
+                                            <label class="radio-inline">
+                                                <input type="radio" name="operationType" value="replace_item" onchange="toggleOperationType()"> 替换明细
                                             </label>
                                         </div>
                                     </div>
@@ -14574,6 +14577,50 @@ async fn page_supplement() -> Html<String> {
                                             <span class="text-muted small" id="increaseTotalHint">合计数量: 0</span>
                                         </div>
                                     </div>
+                                    <div id="replaceSection" style="display: none;">
+                                        <div class="row mb-2">
+                                            <div class="col-md-6">
+                                                <label>被替换的原明细（从真实明细选择）</label>
+                                                <select id="replaceSourceSelect" class="form-control form-control-sm" onchange="onReplaceSourceChange()"></select>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <label>&nbsp;</label><br>
+                                                <span class="text-muted small" id="replaceSourceHint">原明细金额: 0.00</span>
+                                            </div>
+                                        </div>
+                                        <div class="row mb-2 align-items-end">
+                                            <div class="col-md-5">
+                                                <label>替换为商品</label>
+                                                <div class="position-relative">
+                                                    <input type="text" id="replaceProductInput" class="form-control form-control-sm" placeholder="点击选择商品" readonly>
+                                                    <div id="replaceProductDropdown" class="search-dropdown"></div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-2">
+                                                <label>数量</label>
+                                                <input type="number" step="0.01" id="replaceQtyInput" class="form-control form-control-sm" oninput="calcReplaceAmount()">
+                                            </div>
+                                            <div class="col-md-2">
+                                                <label>单价</label>
+                                                <input type="number" step="0.01" id="replacePriceInput" class="form-control form-control-sm" oninput="calcReplaceAmount()">
+                                            </div>
+                                            <div class="col-md-2">
+                                                <label>金额</label>
+                                                <input type="number" step="0.01" id="replaceAmountInput" class="form-control form-control-sm" readonly>
+                                            </div>
+                                            <div class="col-md-1">
+                                                <button class="btn btn-sm btn-outline-primary" onclick="addReplaceLine()">加行</button>
+                                            </div>
+                                        </div>
+                                        <table class="table table-sm table-bordered" id="replaceLineList">
+                                            <thead><tr><th>替换为商品</th><th>数量</th><th>单价</th><th>金额</th><th>操作</th></tr></thead>
+                                            <tbody></tbody>
+                                        </table>
+                                        <div class="mb-2">
+                                            <span class="text-muted small">替换后合计: <span id="replaceLinesTotal">0.00</span> 元</span>
+                                            <span class="ml-3 small" id="replaceDiffHint"></span>
+                                        </div>
+                                    </div>
                                     <div class="row">
                                         <div class="col-md-2">
                                             <label>分摊日期</label>
@@ -14581,7 +14628,7 @@ async fn page_supplement() -> Html<String> {
                                         </div>
                                         <div class="col-md-10">
                                             <label>&nbsp;</label><br>
-                                            <button class="btn btn-sm btn-primary" onclick="addSupplement()">添加到分摊</button>
+                                            <button class="btn btn-sm btn-primary" onclick="dispatchAddOperation()">添加到分摊</button>
                                             <span class="text-danger ml-2" id="balanceWarning"></span>
                                         </div>
                                     </div>
@@ -14609,6 +14656,8 @@ async fn page_supplement() -> Html<String> {
             let targetOrderDetails = [];
             let pendingSupplements = [];
             let allocationSummary = null;
+            let pendingReplaceLines = [];
+            let selectedReplaceProduct = null;
 
             function initPurchaserSearch() {
                 const input = document.getElementById('purchaserInput');
@@ -14826,7 +14875,8 @@ async fn page_supplement() -> Html<String> {
                 html += '<table class="table table-sm table-bordered"><thead><tr><th>目标订单</th><th>商品</th><th>数量</th><th>金额</th><th>操作</th></tr></thead><tbody>';
                 
                 supplements.forEach(supp => {
-                    const opTypeText = supp.operation_type === 'increase_quantity' ? '+追加' : '+新增';
+                    const opMap = { 'increase_quantity': '+追加', 'new_item': '+新增', 'replace_remove': '替换-冲减', 'replace_add': '替换-换入' };
+                    const opTypeText = opMap[supp.operation_type] || '+新增';
                     html += `<tr><td>${supp.target_order_no || '未知'}</td><td>${opTypeText} ${supp.product_name}</td><td>${(supp.quantity || 0).toFixed(2)}</td><td>${(supp.amount || 0).toFixed(2)}</td>`;
                     html += `<td><button class="btn btn-xs btn-danger" onclick="rollbackSupplement(${supp.id})">回滚</button></td></tr>`;
                 });
@@ -15060,6 +15110,11 @@ async fn page_supplement() -> Html<String> {
                         allocRow.style.backgroundColor = '#fff3cd';
                         allocRow.style.color = '#856404';
                         allocRow.innerHTML = `<td><strong>[增项]</strong> ${displayName}</td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else if (item.is_replaced) {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.style.backgroundColor = '#f8d7da';
+                        allocRow.style.color = '#721c24';
+                        allocRow.innerHTML = `<td><del>${displayName}</del> <span class="badge badge-danger">已替换</span></td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
                     } else if (item.is_increase) {
                         realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
                         allocRow.style.backgroundColor = '#d4edda';
@@ -15078,7 +15133,216 @@ async fn page_supplement() -> Html<String> {
                 const opType = document.querySelector('input[name="operationType"]:checked').value;
                 document.getElementById('newItemSection').style.display = opType === 'new_item' ? 'flex' : 'none';
                 document.getElementById('increaseQtySection').style.display = opType === 'increase_quantity' ? 'flex' : 'none';
+                document.getElementById('replaceSection').style.display = opType === 'replace_item' ? 'block' : 'none';
+                if (opType === 'replace_item') {
+                    initReplaceSourceSelect();
+                    initReplaceProductSearch();
+                }
             }
+
+            function initReplaceSourceSelect() {
+                const select = document.getElementById('replaceSourceSelect');
+                select.innerHTML = '';
+                targetOrderDetails.forEach((item, index) => {
+                    const opt = document.createElement('option');
+                    opt.value = index;
+                    opt.textContent = `${item.product_name} (数量${item.quantity.toFixed(2)} × ${item.unit_price.toFixed(2)} = ${item.amount.toFixed(2)}元)`;
+                    select.appendChild(opt);
+                });
+                onReplaceSourceChange();
+            }
+
+            function onReplaceSourceChange() {
+                const idx = parseInt(document.getElementById('replaceSourceSelect').value);
+                if (!isNaN(idx) && targetOrderDetails[idx]) {
+                    document.getElementById('replaceSourceHint').textContent = `原明细金额: ${targetOrderDetails[idx].amount.toFixed(2)} 元`;
+                }
+                updateReplaceDiffHint();
+            }
+
+            function initReplaceProductSearch() {
+                const input = document.getElementById('replaceProductInput');
+                const dropdown = document.getElementById('replaceProductDropdown');
+                if (!input._init) {
+                    input.addEventListener('click', function() { showReplaceProductDropdown(''); });
+                    input.addEventListener('dblclick', function() { this.readOnly = false; this.value = ''; this.focus(); });
+                    input.addEventListener('input', function() { showReplaceProductDropdown(this.value.trim()); });
+                    input.addEventListener('blur', function() { setTimeout(() => { dropdown.style.display = 'none'; }, 200); });
+                    input._init = true;
+                }
+            }
+
+            async function showReplaceProductDropdown(keyword) {
+                const res = await fetch('/api/product/list?keyword=' + encodeURIComponent(keyword || '') + '&page_size=50');
+                const data = await res.json();
+                const products = data.items || data.data || [];
+                const nonConsumable = products.filter(p => !(p.category_name || '').includes('耗材'));
+                const dropdown = document.getElementById('replaceProductDropdown');
+                dropdown.innerHTML = '';
+                nonConsumable.forEach(p => {
+                    const li = document.createElement('li');
+                    li.className = 'search-item';
+                    const alias2 = p.alias2 ? `(${p.alias2})` : '';
+                    const price = p.selling_price || p.base_price || 0;
+                    li.textContent = `${p.name}${alias2} - ${price.toFixed(2)}元/${p.unit || ''}`;
+                    li.onclick = () => selectReplaceProduct(p);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = nonConsumable.length > 0 ? 'block' : 'none';
+            }
+
+            function selectReplaceProduct(p) {
+                selectedReplaceProduct = p;
+                const input = document.getElementById('replaceProductInput');
+                const alias2 = p.alias2 ? `(${p.alias2})` : '';
+                input.value = `${p.name}${alias2}`;
+                input.readOnly = false;
+                document.getElementById('replaceProductDropdown').style.display = 'none';
+                const price = p.selling_price || p.base_price || 0;
+                document.getElementById('replacePriceInput').value = price.toFixed(2);
+                calcReplaceAmount();
+            }
+
+            function calcReplaceAmount() {
+                const qty = parseFloat(document.getElementById('replaceQtyInput').value) || 0;
+                const price = parseFloat(document.getElementById('replacePriceInput').value) || 0;
+                document.getElementById('replaceAmountInput').value = (qty * price).toFixed(2);
+            }
+
+            function addReplaceLine() {
+                if (!selectedReplaceProduct) { alert('请选择替换的商品'); return; }
+                const qty = parseFloat(document.getElementById('replaceQtyInput').value) || 0;
+                const price = parseFloat(document.getElementById('replacePriceInput').value) || 0;
+                const amount = qty * price;
+                if (qty <= 0 || amount <= 0) { alert('请输入有效的数量和单价'); return; }
+                pendingReplaceLines.push({
+                    product_id: selectedReplaceProduct.id,
+                    product_name: selectedReplaceProduct.name,
+                    alias1: selectedReplaceProduct.alias1 || '',
+                    alias2: selectedReplaceProduct.alias2 || '',
+                    spec: selectedReplaceProduct.spec || '',
+                    unit: selectedReplaceProduct.unit || '',
+                    unit_price: price,
+                    quantity: qty,
+                    amount: amount,
+                });
+                selectedReplaceProduct = null;
+                document.getElementById('replaceProductInput').value = '';
+                document.getElementById('replaceQtyInput').value = '';
+                document.getElementById('replacePriceInput').value = '';
+                document.getElementById('replaceAmountInput').value = '';
+                renderReplaceLines();
+            }
+
+            function removeReplaceLine(index) {
+                pendingReplaceLines.splice(index, 1);
+                renderReplaceLines();
+            }
+
+            function renderReplaceLines() {
+                const tbody = document.querySelector('#replaceLineList tbody');
+                tbody.innerHTML = '';
+                let total = 0;
+                pendingReplaceLines.forEach((line, index) => {
+                    total += line.amount;
+                    const alias2 = line.alias2 ? `(${line.alias2})` : '';
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `<td>${line.product_name}${alias2}</td><td>${line.quantity.toFixed(2)}</td><td>${line.unit_price.toFixed(2)}</td><td>${line.amount.toFixed(2)}</td>` +
+                        `<td><button class="btn btn-xs btn-danger" onclick="removeReplaceLine(${index})">删除</button></td>`;
+                    tbody.appendChild(tr);
+                });
+                document.getElementById('replaceLinesTotal').textContent = total.toFixed(2);
+                updateReplaceDiffHint();
+            }
+
+            function updateReplaceDiffHint() {
+                const idx = parseInt(document.getElementById('replaceSourceSelect').value);
+                const hint = document.getElementById('replaceDiffHint');
+                if (isNaN(idx) || !targetOrderDetails[idx]) { hint.textContent = ''; return; }
+                const origAmount = targetOrderDetails[idx].amount;
+                const replaceTotal = pendingReplaceLines.reduce((s, l) => s + l.amount, 0);
+                const diff = replaceTotal - origAmount;
+                if (Math.abs(diff) <= 5.0) {
+                    hint.textContent = `差额 ${diff.toFixed(2)} 元（在±5元内，可提交）`;
+                    hint.className = 'text-success small';
+                } else {
+                    hint.textContent = `差额 ${diff.toFixed(2)} 元（超过±5元限制）`;
+                    hint.className = 'text-danger small';
+                }
+            }
+
+            function addReplacement() {
+                if (!selectedConsumableOrder || !selectedTargetOrder) { alert('请先选择耗材订单和目标订单'); return; }
+                if (!allocationSummary || !allocationSummary.exists) { alert('请先初始化分摊方案'); return; }
+                if (allocationSummary.status === 2) { alert('分摊已完成，不可继续分摊'); return; }
+                if (allocationSummary.status === 3) { alert('分摊已终止'); return; }
+
+                const idx = parseInt(document.getElementById('replaceSourceSelect').value);
+                if (isNaN(idx) || !targetOrderDetails[idx]) { alert('请选择被替换的原明细'); return; }
+                if (pendingReplaceLines.length === 0) { alert('请至少添加一条替换商品'); return; }
+
+                const src = targetOrderDetails[idx];
+                const origAmount = src.amount;
+                const replaceTotal = pendingReplaceLines.reduce((s, l) => s + l.amount, 0);
+                const diff = replaceTotal - origAmount;
+                if (Math.abs(diff) > 5.0) {
+                    alert(`替换总金额 ${replaceTotal.toFixed(2)} 元与原明细 ${origAmount.toFixed(2)} 元差额 ${diff.toFixed(2)} 元，超过±5元限制`);
+                    return;
+                }
+
+                const allocDate = document.getElementById('allocateDateInput').value;
+                const groupTag = 'RPL' + Date.now();
+                const srcRemark = `${selectedConsumableOrder.order_no} 替换[${src.product_name}]`;
+
+                // 冲减原明细：负数记录
+                pendingSupplements.push({
+                    id: null,
+                    source_order_id: selectedConsumableOrder.id,
+                    target_order_id: selectedTargetOrder.id,
+                    source_remark: srcRemark + ' 冲减',
+                    product_id: src.product_id,
+                    product_name: src.product_name,
+                    alias1: src.alias1 || '',
+                    alias2: src.alias2 || '',
+                    spec: src.spec || '',
+                    unit: src.unit || '',
+                    unit_price: src.unit_price,
+                    quantity: -src.quantity,
+                    amount: -origAmount,
+                    allocate_date: allocDate,
+                    operation_type: 'replace_remove',
+                    target_order_item_id: src.id,
+                });
+
+                // 新增替换商品：正数记录
+                pendingReplaceLines.forEach(line => {
+                    pendingSupplements.push({
+                        id: null,
+                        source_order_id: selectedConsumableOrder.id,
+                        target_order_id: selectedTargetOrder.id,
+                        source_remark: srcRemark + ' 换入',
+                        product_id: line.product_id,
+                        product_name: line.product_name,
+                        alias1: line.alias1,
+                        alias2: line.alias2,
+                        spec: line.spec,
+                        unit: line.unit,
+                        unit_price: line.unit_price,
+                        quantity: line.quantity,
+                        amount: line.amount,
+                        allocate_date: allocDate,
+                        operation_type: 'replace_add',
+                        target_order_item_id: src.id,
+                    });
+                });
+
+                pendingReplaceLines = [];
+                renderReplaceLines();
+                renderPendingSupplements();
+                updateBalanceWarning();
+                renderLocalComparePreview();
+            }
+
 
             function initIncreaseProductSelect() {
                 const select = document.getElementById('increaseProductSelect');
@@ -15173,6 +15437,15 @@ async fn page_supplement() -> Html<String> {
                 const qty = parseFloat(document.getElementById('addQtyInput').value) || 0;
                 const price = parseFloat(document.getElementById('addPriceInput').value) || 0;
                 document.getElementById('addAmountInput').value = (qty * price).toFixed(2);
+            }
+
+            function dispatchAddOperation() {
+                const opType = document.querySelector('input[name="operationType"]:checked').value;
+                if (opType === 'replace_item') {
+                    addReplacement();
+                } else {
+                    addSupplement();
+                }
             }
 
             function addSupplement() {
@@ -15298,8 +15571,14 @@ async fn page_supplement() -> Html<String> {
                         it.total_quantity += s.quantity;
                         it.total_amount += s.amount;
                         it.is_increase = true;
-                    } else if (s.operation_type === 'new_item') {
-                        const alias2 = s.alias2 ? `(${s.alias2})` : '';
+                    } else if (s.operation_type === 'replace_remove' && s.target_order_item_id && itemMap[s.target_order_item_id]) {
+                        const it = itemMap[s.target_order_item_id];
+                        it.supplement_quantity += s.quantity;
+                        it.supplement_amount += s.amount;
+                        it.total_quantity += s.quantity;
+                        it.total_amount += s.amount;
+                        it.is_replaced = true;
+                    } else if (s.operation_type === 'new_item' || s.operation_type === 'replace_add') {
                         preview.items.push({
                             id: -Math.random(),
                             product_id: s.product_id,
@@ -15337,6 +15616,11 @@ async fn page_supplement() -> Html<String> {
                         allocRow.style.backgroundColor = '#fff3cd';
                         allocRow.style.color = '#856404';
                         allocRow.innerHTML = `<td><strong>[增项]</strong> ${displayName}</td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else if (item.is_replaced) {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.style.backgroundColor = '#f8d7da';
+                        allocRow.style.color = '#721c24';
+                        allocRow.innerHTML = `<td><del>${displayName}</del> <span class="badge badge-danger">已替换</span></td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
                     } else if (item.is_increase) {
                         realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
                         allocRow.style.backgroundColor = '#d4edda';
@@ -15354,10 +15638,18 @@ async fn page_supplement() -> Html<String> {
             function renderPendingSupplements() {
                 const tbody = document.querySelector('#supplementList tbody');
                 tbody.innerHTML = '';
+                const typeMap = {
+                    'new_item': '新增商品',
+                    'increase_quantity': '追加数量',
+                    'replace_remove': '替换-冲减',
+                    'replace_add': '替换-换入',
+                };
                 pendingSupplements.forEach((item, index) => {
-                    const typeText = item.operation_type === 'new_item' ? '新增商品' : '追加数量';
+                    const typeText = typeMap[item.operation_type] || item.operation_type;
                     const savedBadge = item.id ? '<span class="badge badge-info">已保存</span>' : '';
-                    tbody.innerHTML += `<tr><td>${typeText} ${savedBadge}</td><td>${item.product_name}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td><td>${item.source_order_no || (selectedConsumableOrder?.order_no || '')}</td><td>${!item.id ? '<button class="btn btn-xs btn-danger" onclick="removePendingSupplement(' + index + ')">删除</button>' : ''}</td></tr>`;
+                    const isNeg = item.amount < 0;
+                    const rowStyle = item.operation_type === 'replace_remove' ? ' style="color:#a94442;"' : (item.operation_type === 'replace_add' ? ' style="color:#3c763d;"' : '');
+                    tbody.innerHTML += `<tr${rowStyle}><td>${typeText} ${savedBadge}</td><td>${item.product_name}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td><td>${item.source_order_no || (selectedConsumableOrder?.order_no || '')}</td><td>${!item.id ? '<button class="btn btn-xs btn-danger" onclick="removePendingSupplement(' + index + ')">删除</button>' : ''}</td></tr>`;
                 });
             }
 
@@ -15879,6 +16171,7 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
             "sort_key": sort_key,
             "is_increase": false,
             "is_new": false,
+            "is_replaced": false,
             "supplement_quantity": 0.0,
             "supplement_amount": 0.0,
             "total_quantity": r.get::<f64, _>("quantity"),
@@ -15895,7 +16188,7 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
         let qty = r.get::<f64, _>("quantity");
         let amt = r.get::<f64, _>("amount");
 
-        if op_type == "increase_quantity" {
+        if op_type == "increase_quantity" || op_type == "replace_remove" {
             if let Some(tid) = target_item_id {
                 if let Some(existing) = item_map.get_mut(&tid) {
                     let s_qty = existing["supplement_quantity"].as_f64().unwrap_or(0.0) + qty;
@@ -15906,7 +16199,11 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
                     existing["supplement_amount"] = serde_json::json!(s_amt);
                     existing["total_quantity"] = serde_json::json!(t_qty);
                     existing["total_amount"] = serde_json::json!(t_amt);
-                    existing["is_increase"] = serde_json::json!(true);
+                    if op_type == "replace_remove" {
+                        existing["is_replaced"] = serde_json::json!(true);
+                    } else {
+                        existing["is_increase"] = serde_json::json!(true);
+                    }
                 }
             }
         } else {
@@ -16020,8 +16317,13 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     .unwrap_or_default();
 
     let supplement_rows = sqlx::query(
-        "SELECT id, target_order_id, source_order_id, source_remark, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, amount, allocate_date, operation_type, target_order_item_id
-         FROM order_supplement_item WHERE target_order_id = ?"
+        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+                pc.name as category_name, pc2.name as parent_name
+         FROM order_supplement_item soi
+         LEFT JOIN product p ON soi.product_id = p.id
+         LEFT JOIN category pc ON p.category_id = pc.id
+         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+         WHERE soi.target_order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
@@ -16055,6 +16357,23 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
         let qty = r.get::<f64, _>("quantity");
         let amt = r.get::<f64, _>("amount");
 
+        // 替换-冲减：不导出（原被替换商品也需从导出中扣除）
+        if op_type == "replace_remove" {
+            if let Some(tid) = target_item_id {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.5 + amt;
+                    // 若原明细被完全冲减（数量或金额归零），从导出中移除
+                    if new_qty.abs() < 0.001 || new_amt.abs() < 0.001 {
+                        item_map.remove(&tid);
+                    } else {
+                        *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, entry.6.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
         if op_type == "increase_quantity" {
             if let Some(tid) = target_item_id {
                 if let Some(entry) = item_map.get_mut(&tid) {
@@ -16065,14 +16384,24 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 }
             }
         } else {
+            // new_item 或 replace_add：作为新明细导出，按商品类别归类排序
             let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
             let product_name = r.get::<String, _>("product_name");
             let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
             let unit = r.get::<String, _>("unit");
             let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
-            let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
-            let remark = if spec.is_empty() { format!("[增项] {}", source_remark) } else { format!("{}; [增项] {}", spec, source_remark) };
-            item_map.insert(-r.get::<i64, _>("id"), (9999, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
+            let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
+            let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
+            let sort_key = get_category_sort_key(&category_name, &parent_name);
+            let remark = if op_type == "replace_add" {
+                // 替换换入：按类别正常导出，不额外标记
+                spec
+            } else {
+                // 普通新增增项：保留标记
+                let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
+                if spec.is_empty() { format!("[增项] {}", source_remark) } else { format!("{}; [增项] {}", spec, source_remark) }
+            };
+            item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
         }
     }
 
