@@ -15365,6 +15365,23 @@ async fn page_supplement() -> Html<String> {
                     </div>
                 </div>
 
+                <div class="mt-3">
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <h6 class="mb-0">已进入分摊的订单列表 <span class="badge badge-info" id="allocatedOrdersCount">0</span></h6>
+                        <button class="btn btn-xs btn-outline-secondary" onclick="loadAllocatedOrders()">刷新</button>
+                    </div>
+                    <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
+                        <table class="table table-sm table-bordered mb-0" id="allocatedOrdersTable">
+                            <thead class="thead-light"><tr>
+                                <th>订单号</th><th>采购单位</th><th>订单日期</th>
+                                <th>总金额</th><th>已分摊</th><th>剩余余额</th>
+                                <th>状态</th><th>创建时间</th><th>完成时间</th><th>操作</th>
+                            </tr></thead>
+                            <tbody><tr><td colspan="10" class="text-center text-muted small">暂无</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <div class="row mt-4" id="bottomSection">
                     <div class="col-md-6">
                         <div class="card">
@@ -15859,6 +15876,7 @@ async fn page_supplement() -> Html<String> {
                             renderConsumableOrderDetail();
                             await loadAllocationOrders(selectedConsumableOrder.id);
                             await loadOrdersByPurchaser();
+                            await loadAllocatedOrders();
                         }
                     } else {
                         const text = await res.text();
@@ -15890,11 +15908,59 @@ async fn page_supplement() -> Html<String> {
                     renderConsumableOrderDetail();
                     await loadAllocationOrders(selectedConsumableOrder.id);
                     await loadOrdersByPurchaser();
+                    await loadAllocatedOrders();
                     alert('取消成功，已回到未分摊状态');
                 } else {
                     const text = await res.text();
                     alert('取消失败: ' + text);
                 }
+            }
+
+            async function loadAllocatedOrders() {
+                const res = await fetch('/api/allocation/allocated_orders');
+                const list = await res.json();
+                window._allocatedOrdersMap = {};
+                list.forEach(o => { window._allocatedOrdersMap[o.source_order_id] = o; });
+                const tbody = document.querySelector('#allocatedOrdersTable tbody');
+                document.getElementById('allocatedOrdersCount').textContent = list.length;
+                tbody.innerHTML = '';
+                if (!list.length) {
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted small">暂无</td></tr>';
+                    return;
+                }
+                const statusMap = { 0: ['未分摊', 'secondary'], 1: ['分摊中', 'info'], 2: ['已完成', 'success'], 3: ['已终止', 'warning'] };
+                list.forEach(o => {
+                    const tr = document.createElement('tr');
+                    const st = statusMap[o.status] || ['未知', 'light'];
+                    tr.innerHTML =
+                        '<td><a href="javascript:void(0)" onclick="selectAllocatedOrder(' + o.source_order_id + ')">' + (o.order_no || '') + '</a></td>' +
+                        '<td>' + (o.purchaser_name || '') + '</td>' +
+                        '<td>' + (o.order_date || '') + '</td>' +
+                        '<td class="text-right">' + (o.total_amount || 0).toFixed(2) + '</td>' +
+                        '<td class="text-right text-success">' + (o.allocated_amount || 0).toFixed(2) + '</td>' +
+                        '<td class="text-right text-danger">' + (o.remaining_balance || 0).toFixed(2) + '</td>' +
+                        '<td><span class="badge badge-' + st[1] + '">' + st[0] + '</span></td>' +
+                        '<td>' + (o.created_at || '') + '</td>' +
+                        '<td>' + (o.completed_at || '') + '</td>' +
+                        '<td><button class="btn btn-xs btn-outline-primary" onclick="selectAllocatedOrder(' + o.source_order_id + ')">查看</button></td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            async function selectAllocatedOrder(sourceOrderId) {
+                const o = window._allocatedOrdersMap && window._allocatedOrdersMap[sourceOrderId];
+                if (!o) return;
+                // 自动定位到该订单对应的采购单位并加载其订单列表
+                if (o.purchaser_id && currentPurchaserId !== o.purchaser_id) {
+                    currentPurchaserId = o.purchaser_id;
+                    currentPurchaserName = o.purchaser_name || '';
+                    document.getElementById('purchaserInput').value = currentPurchaserName;
+                    await loadOrdersByPurchaser();
+                }
+                const order = consumableOrders.find(x => x.id === sourceOrderId) || {
+                    id: sourceOrderId, order_no: o.order_no, order_date: o.order_date, total_amount: o.total_amount
+                };
+                await selectConsumableOrder(order);
             }
 
             function updateAllocationUI() {
@@ -15963,6 +16029,7 @@ async fn page_supplement() -> Html<String> {
                     renderConsumableOrderDetail();
                     await loadAllocationOrders(selectedConsumableOrder.id);
                     await loadOrdersByPurchaser();
+                    await loadAllocatedOrders();
                     alert('分摊方案创建成功');
                 } else {
                     const text = await res.text();
@@ -15985,6 +16052,7 @@ async fn page_supplement() -> Html<String> {
                 if (res.ok) {
                     await loadAllocationSummary(selectedConsumableOrder.id);
                     await loadOrdersByPurchaser();
+                    await loadAllocatedOrders();
                     alert('终止成功');
                 } else {
                     const text = await res.text();
@@ -16049,6 +16117,7 @@ async fn page_supplement() -> Html<String> {
                         alert(msg);
                         await loadAllocationSummary(selectedConsumableOrder.id);
                         await loadOrdersByPurchaser();
+                        await loadAllocatedOrders();
                     } else {
                         alert(text);
                     }
@@ -16729,6 +16798,7 @@ async fn page_supplement() -> Html<String> {
             if (allocateDateInput) {
                 allocateDateInput.value = new Date().toISOString().split('T')[0];
             }
+            loadAllocatedOrders();
         </script>
     "#;
     Html(layout_html("耗材分摊管理", "supplement", content))
@@ -16881,6 +16951,43 @@ async fn api_allocation_summary(Path(source_order_id): Path<i64>) -> impl IntoRe
     });
 
     (StatusCode::OK, serde_json::to_string(&summary).unwrap())
+}
+
+async fn api_allocation_allocated_orders() -> impl IntoResponse {
+    // 列出所有已进入分摊（存在 consumable_allocation 记录）的源订单
+    let rows = sqlx::query(
+        "SELECT ca.id as alloc_id, ca.source_order_id, ca.total_amount, ca.allocated_amount, ca.remaining_balance,
+                ca.status, ca.remark, ca.created_at, ca.completed_at,
+                so.order_no, so.order_date, so.purchaser_id,
+                p.name as purchaser_name
+         FROM consumable_allocation ca
+         LEFT JOIN sales_order so ON ca.source_order_id = so.id
+         LEFT JOIN purchaser p ON so.purchaser_id = p.id
+         ORDER BY ca.created_at DESC, ca.id DESC"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        serde_json::json!({
+            "alloc_id": row.get::<i64, _>("alloc_id"),
+            "source_order_id": row.get::<i64, _>("source_order_id"),
+            "order_no": row.get::<Option<String>, _>("order_no").unwrap_or_default(),
+            "order_date": row.get::<Option<String>, _>("order_date").unwrap_or_default(),
+            "purchaser_id": row.get::<Option<i64>, _>("purchaser_id").unwrap_or(0),
+            "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "total_amount": row.get::<f64, _>("total_amount"),
+            "allocated_amount": row.get::<f64, _>("allocated_amount"),
+            "remaining_balance": row.get::<f64, _>("remaining_balance"),
+            "status": row.get::<i64, _>("status"),
+            "remark": row.get::<Option<String>, _>("remark").unwrap_or_default(),
+            "created_at": row.get::<Option<String>, _>("created_at").unwrap_or_default(),
+            "completed_at": row.get::<Option<String>, _>("completed_at").unwrap_or_default(),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
 async fn api_allocation_terminate(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
@@ -19629,6 +19736,7 @@ fn build_router() -> Router {
         .route("/api/supplement/compare/{order_id}", get(api_supplement_compare))
         .route("/api/allocation/create", post(api_allocation_create))
         .route("/api/allocation/summary/{source_order_id}", get(api_allocation_summary))
+        .route("/api/allocation/allocated_orders", get(api_allocation_allocated_orders))
         .route("/api/allocation/terminate", post(api_allocation_terminate))
         .route("/api/allocation/cancel", post(api_allocation_cancel))
         .route("/api/allocation/complete", post(api_allocation_complete))
