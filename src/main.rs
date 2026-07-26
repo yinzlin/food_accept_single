@@ -89,7 +89,7 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/purchase" | "/api/purchase_order/create" | "/api/purchase_order/update" | "/api/purchase_order/delete" => Some("supplier"),
         "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" => Some("purchaser"),
         "/query/purchase_order" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
-        "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" => Some("purchaser"),
+        "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" => Some("purchaser"),
         "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
@@ -555,6 +555,7 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             remark TEXT,
             created_at TEXT NOT NULL,
             completed_at TEXT,
+            source_item_ids TEXT,
             FOREIGN KEY(source_order_id) REFERENCES sales_order(id)
         )
         "#,
@@ -883,6 +884,12 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     
     let _ = sqlx::query("ALTER TABLE order_supplement_item ADD COLUMN operation_type TEXT NOT NULL DEFAULT 'new_item'").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE order_supplement_item ADD COLUMN target_order_item_id INTEGER").execute(pool).await;
+    // 分摊细化到明细：新增 source_item_ids 列（存储勾选的来源明细 id，逗号分隔）。
+    // 首次迁移（列新增成功）时清空旧的整单级分摊数据，按新模型重建。
+    if sqlx::query("ALTER TABLE consumable_allocation ADD COLUMN source_item_ids TEXT").execute(pool).await.is_ok() {
+        let _ = sqlx::query("DELETE FROM order_supplement_item").execute(pool).await;
+        let _ = sqlx::query("DELETE FROM consumable_allocation").execute(pool).await;
+    }
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_supplier_id ON purchase_order(supplier_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_order_no ON purchase_order(order_no)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_item_order_id ON purchase_order_item(order_id)").execute(pool).await;
@@ -1220,6 +1227,12 @@ fn sidebar_html() -> String {
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/product_rank">
                                     <a href="/query/product_rank"><span class="node-icon">🏆</span><span class="node-label">畅销滞销商品</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/reimburse_summary">
+                                    <a href="/query/reimburse_summary"><span class="node-icon">🧾</span><span class="node-label">报销口径汇总</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/allocation_source">
+                                    <a href="/query/allocation_source"><span class="node-icon">🔀</span><span class="node-label">分摊来源统计</span></a>
                                 </li>
                             </ul>
                         </li>
@@ -6327,6 +6340,139 @@ async fn page_query_product_rank(headers: axum::http::HeaderMap) -> Html<String>
         </script>
     "#;
     Html(layout_html("畅销滞销商品查询", "/query/product_rank", &content))
+}
+
+async fn page_query_reimburse_summary(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/reimburse_summary").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>报销口径汇总</h3>
+            <p class="text-muted small">口径说明：仅统计分摊后的目标单（真实明细 + 分摊增项净影响），耗材来源单已作为分摊来源单独统计、不计入此处，确保金额不重计。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+            </div>
+            <button onclick="searchReimburse()" class="btn btn-primary">查询</button>
+        </div>
+        <div class="card p-4 mt-4">
+            <h4>按采购单位汇总（报销口径）</h4>
+            <table class="table table-bordered">
+                <thead><tr><th>采购单位</th><th>真实金额</th><th>分摊增项净额</th><th>报销金额</th></tr></thead>
+                <tbody id="purchaserSummary"></tbody>
+            </table>
+        </div>
+        <div class="card p-4 mt-4">
+            <h4>按商品汇总（报销口径）</h4>
+            <table class="table table-bordered">
+                <thead><tr><th>商品名称</th><th>规格</th><th>数量</th><th>报销金额</th></tr></thead>
+                <tbody id="productSummary"></tbody>
+            </table>
+        </div>
+        <script>
+            async function searchReimburse() {
+                const url = '/api/query/reimburse_summary?start_date=' + document.getElementById('startDate').value + '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+
+                let ph = '';
+                if (data.by_purchaser.length === 0) {
+                    ph = '<tr><td colspan="4" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let tReal = 0, tSupp = 0, tReim = 0;
+                    data.by_purchaser.forEach(item => {
+                        tReal += item.real_amount;
+                        tSupp += item.supplement_amount;
+                        tReim += item.reimburse_amount;
+                        ph += '<tr><td>' + item.name + '</td><td>¥' + item.real_amount.toFixed(2) + '</td><td>¥' + item.supplement_amount.toFixed(2) + '</td><td><strong>¥' + item.reimburse_amount.toFixed(2) + '</strong></td></tr>';
+                    });
+                    ph += '<tr class="table-active fw-bold"><td>合计</td><td>¥' + tReal.toFixed(2) + '</td><td>¥' + tSupp.toFixed(2) + '</td><td>¥' + tReim.toFixed(2) + '</td></tr>';
+                }
+                document.getElementById('purchaserSummary').innerHTML = ph;
+
+                let pd = '';
+                if (data.by_product.length === 0) {
+                    pd = '<tr><td colspan="4" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let tQty = 0, tAmt = 0;
+                    data.by_product.forEach(item => {
+                        tQty += item.quantity;
+                        tAmt += item.reimburse_amount;
+                        pd += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '-') + '</td><td>' + item.quantity.toFixed(2) + '</td><td>¥' + item.reimburse_amount.toFixed(2) + '</td></tr>';
+                    });
+                    pd += '<tr class="table-active fw-bold"><td colspan="2">合计</td><td>' + tQty.toFixed(2) + '</td><td>¥' + tAmt.toFixed(2) + '</td></tr>';
+                }
+                document.getElementById('productSummary').innerHTML = pd;
+            }
+            searchReimburse();
+        </script>
+    "#;
+    Html(layout_html("报销口径汇总", "/query/reimburse_summary", &content))
+}
+
+async fn page_query_allocation_source(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/allocation_source").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>分摊来源统计</h3>
+            <p class="text-muted small">统计所有作为分摊来源的订单（如耗材单），显示其金额、已分摊金额、剩余、状态及分摊去向，供来源侧单独核账。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+            </div>
+            <button onclick="searchAllocationSource()" class="btn btn-primary">查询</button>
+        </div>
+        <div class="card p-4 mt-4">
+            <h4>分摊来源单汇总</h4>
+            <table class="table table-bordered">
+                <thead><tr><th>来源订单</th><th>日期</th><th>来源金额</th><th>已分摊</th><th>剩余</th><th>状态</th><th>分摊去向</th></tr></thead>
+                <tbody id="sourceTable"></tbody>
+            </table>
+        </div>
+        <script>
+            const statusMap = { 0: '未分摊', 1: '分摊中', 2: '已完成', 3: '已终止' };
+            async function searchAllocationSource() {
+                const url = '/api/query/allocation_source?start_date=' + document.getElementById('startDate').value + '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('sourceTable');
+                if (data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">暂无数据</td></tr>';
+                    return;
+                }
+                let html = '';
+                let tTotal = 0, tAlloc = 0, tRemain = 0;
+                data.forEach(item => {
+                    tTotal += item.total_amount;
+                    tAlloc += item.allocated_amount;
+                    tRemain += item.remaining_balance;
+                    const targets = (item.targets || []).map(t => t.order_no + '(¥' + t.amount.toFixed(2) + ')').join('、') || '-';
+                    html += '<tr><td>' + item.order_no + '</td><td>' + item.order_date + '</td><td>¥' + item.total_amount.toFixed(2) + '</td><td>¥' + item.allocated_amount.toFixed(2) + '</td><td>¥' + item.remaining_balance.toFixed(2) + '</td><td>' + (statusMap[item.status] || '未知') + '</td><td class="small">' + targets + '</td></tr>';
+                });
+                html += '<tr class="table-active fw-bold"><td colspan="2">合计</td><td>¥' + tTotal.toFixed(2) + '</td><td>¥' + tAlloc.toFixed(2) + '</td><td>¥' + tRemain.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                tbody.innerHTML = html;
+            }
+            searchAllocationSource();
+        </script>
+    "#;
+    Html(layout_html("分摊来源统计", "/query/allocation_source", &content))
 }
 
 async fn page_query_stock_flow() -> Html<String> {
@@ -13322,6 +13468,211 @@ async fn api_query_sales_summary(axum::extract::Query(params): axum::extract::Qu
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
+// 报销口径汇总：目标单真实明细 + 分摊增项净额，排除耗材分摊来源单本身，避免重计
+async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    // 作为分摊来源的订单 id（排除，不计入报销口径）
+    let source_ids: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT source_order_id FROM consumable_allocation"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    let source_set: std::collections::HashSet<i64> = source_ids.into_iter().collect();
+
+    let mut date_cond = String::from("");
+    let mut binds: Vec<String> = Vec::new();
+    if !start_date.is_empty() {
+        date_cond.push_str(" AND so.order_date >= ?");
+        binds.push(start_date.to_string());
+    }
+    if !end_date.is_empty() {
+        date_cond.push_str(" AND so.order_date <= ?");
+        binds.push(end_date.to_string());
+    }
+
+    // 1) 真实明细：按采购单位 & 商品聚合
+    let real_purchaser_sql = format!(
+        "SELECT so.purchaser_id, p.name, so.id as order_id, SUM(soi.amount) as amount, SUM(soi.quantity) as qty
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         JOIN purchaser p ON so.purchaser_id = p.id
+         WHERE 1=1 {}
+         GROUP BY so.id", date_cond
+    );
+    let mut q = sqlx::query(AssertSqlSafe(real_purchaser_sql.as_str()));
+    for b in &binds { q = q.bind(b); }
+    let real_rows = q.fetch_all(pool()).await.unwrap_or_default();
+
+    use std::collections::HashMap;
+    // 按采购单位累加：real_amount
+    let mut purchaser_map: HashMap<i64, (String, f64, f64)> = HashMap::new(); // id -> (name, real, supp)
+    for r in &real_rows {
+        let order_id = r.get::<i64, _>("order_id");
+        if source_set.contains(&order_id) { continue; } // 排除来源耗材单
+        let pid = r.get::<i64, _>("purchaser_id");
+        let name = r.get::<String, _>("name");
+        let amount = r.get::<f64, _>("amount");
+        let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
+        entry.1 += amount;
+    }
+
+    // 2) 分摊增项净额：按目标订单归属的采购单位聚合（含 replace_remove 负数抵消）
+    let supp_sql = format!(
+        "SELECT so.purchaser_id, p.name, SUM(osi.amount) as supp_amount
+         FROM order_supplement_item osi
+         JOIN sales_order so ON osi.target_order_id = so.id
+         JOIN purchaser p ON so.purchaser_id = p.id
+         WHERE 1=1 {}
+         GROUP BY so.purchaser_id", date_cond
+    );
+    let mut q2 = sqlx::query(AssertSqlSafe(supp_sql.as_str()));
+    for b in &binds { q2 = q2.bind(b); }
+    let supp_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    for r in &supp_rows {
+        let pid = r.get::<i64, _>("purchaser_id");
+        let name = r.get::<String, _>("name");
+        let supp_amount = r.get::<f64, _>("supp_amount");
+        let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
+        entry.2 += supp_amount;
+    }
+
+    let mut by_purchaser: Vec<serde_json::Value> = purchaser_map.values().map(|(name, real, supp)| {
+        serde_json::json!({
+            "name": name,
+            "real_amount": real,
+            "supplement_amount": supp,
+            "reimburse_amount": real + supp,
+        })
+    }).collect();
+    by_purchaser.sort_by(|a, b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 3) 按商品汇总（报销口径）：真实明细（排除来源单）+ 分摊增项
+    let mut product_map: HashMap<(String, String), (f64, f64)> = HashMap::new(); // (name,spec) -> (qty, amount)
+    let prod_real_sql = format!(
+        "SELECT soi.product_name, COALESCE(soi.spec,'') as spec, soi.order_id, soi.quantity, soi.amount
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         WHERE 1=1 {}", date_cond
+    );
+    let mut q3 = sqlx::query(AssertSqlSafe(prod_real_sql.as_str()));
+    for b in &binds { q3 = q3.bind(b); }
+    let prod_real_rows = q3.fetch_all(pool()).await.unwrap_or_default();
+    for r in &prod_real_rows {
+        let order_id = r.get::<i64, _>("order_id");
+        if source_set.contains(&order_id) { continue; }
+        let name = r.get::<String, _>("product_name");
+        let spec = r.get::<String, _>("spec");
+        let qty = r.get::<f64, _>("quantity");
+        let amount = r.get::<f64, _>("amount");
+        let entry = product_map.entry((name, spec)).or_insert((0.0, 0.0));
+        entry.0 += qty;
+        entry.1 += amount;
+    }
+    let prod_supp_sql = format!(
+        "SELECT osi.product_name, COALESCE(osi.spec,'') as spec, osi.quantity, osi.amount
+         FROM order_supplement_item osi
+         JOIN sales_order so ON osi.target_order_id = so.id
+         WHERE 1=1 {}", date_cond
+    );
+    let mut q4 = sqlx::query(AssertSqlSafe(prod_supp_sql.as_str()));
+    for b in &binds { q4 = q4.bind(b); }
+    let prod_supp_rows = q4.fetch_all(pool()).await.unwrap_or_default();
+    for r in &prod_supp_rows {
+        let name = r.get::<String, _>("product_name");
+        let spec = r.get::<String, _>("spec");
+        let qty = r.get::<f64, _>("quantity");
+        let amount = r.get::<f64, _>("amount");
+        let entry = product_map.entry((name, spec)).or_insert((0.0, 0.0));
+        entry.0 += qty;
+        entry.1 += amount;
+    }
+    let mut by_product: Vec<serde_json::Value> = product_map.iter().map(|((name, spec), (qty, amount))| {
+        serde_json::json!({
+            "product_name": name,
+            "spec": spec,
+            "quantity": qty,
+            "reimburse_amount": amount,
+        })
+    }).collect();
+    by_product.sort_by(|a, b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+
+    let result = serde_json::json!({
+        "by_purchaser": by_purchaser,
+        "by_product": by_product,
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+// 分摊来源统计：列出所有作为分摊来源的订单及其分摊去向
+async fn api_query_allocation_source(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    let mut sql = String::from(
+        "SELECT ca.source_order_id, ca.total_amount, ca.allocated_amount, ca.remaining_balance, ca.status,
+                so.order_no, so.order_date
+         FROM consumable_allocation ca
+         JOIN sales_order so ON ca.source_order_id = so.id
+         WHERE 1=1"
+    );
+    let mut binds: Vec<String> = Vec::new();
+    if !start_date.is_empty() {
+        sql.push_str(" AND so.order_date >= ?");
+        binds.push(start_date.to_string());
+    }
+    if !end_date.is_empty() {
+        sql.push_str(" AND so.order_date <= ?");
+        binds.push(end_date.to_string());
+    }
+    sql.push_str(" ORDER BY so.order_date DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds { q = q.bind(b); }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
+
+    let mut result: Vec<serde_json::Value> = Vec::new();
+    for r in &rows {
+        let source_order_id = r.get::<i64, _>("source_order_id");
+        // 查询该来源单分摊到的各目标单及金额
+        let targets = sqlx::query(
+            "SELECT so.order_no, SUM(osi.amount) as amount
+             FROM order_supplement_item osi
+             JOIN sales_order so ON osi.target_order_id = so.id
+             WHERE osi.source_order_id = ?
+             GROUP BY osi.target_order_id
+             HAVING SUM(osi.amount) <> 0
+             ORDER BY amount DESC"
+        )
+        .bind(source_order_id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+        let target_list: Vec<serde_json::Value> = targets.iter().map(|t| {
+            serde_json::json!({
+                "order_no": t.get::<String, _>("order_no"),
+                "amount": t.get::<f64, _>("amount"),
+            })
+        }).collect();
+
+        result.push(serde_json::json!({
+            "source_order_id": source_order_id,
+            "order_no": r.get::<String, _>("order_no"),
+            "order_date": r.get::<String, _>("order_date"),
+            "total_amount": r.get::<f64, _>("total_amount"),
+            "allocated_amount": r.get::<f64, _>("allocated_amount"),
+            "remaining_balance": r.get::<f64, _>("remaining_balance"),
+            "status": r.get::<i64, _>("status"),
+            "targets": target_list,
+        }));
+    }
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
 async fn api_query_purchaser_balance() -> impl IntoResponse {
     let rows = sqlx::query(
         "SELECT p.id, p.name, 
@@ -14834,21 +15185,42 @@ async fn page_supplement() -> Html<String> {
                 const res = await fetch('/api/sales_order/detail/' + order.id);
                 const data = await res.json();
                 consumableOrderDetails = data.items || [];
-                renderConsumableOrderDetail();
                 await loadAllocationSummary(order.id);
+                renderConsumableOrderDetail();
                 await loadAllocationOrders(order.id);
             }
 
             function renderConsumableOrderDetail() {
                 const detailDiv = document.getElementById('consumableOrderDetail');
+                const hasScheme = allocationSummary && allocationSummary.exists;
+                const schemeItemIds = (hasScheme && allocationSummary.source_item_ids) ? allocationSummary.source_item_ids : [];
                 let html = `<h6>${selectedConsumableOrder.order_no} 明细</h6>`;
-                html += `<table class="table table-sm table-bordered"><thead><tr><th>商品</th><th>规格</th><th>单位</th><th>数量</th><th>金额</th><th>类别</th></tr></thead><tbody>`;
+                html += `<table class="table table-sm table-bordered"><thead><tr><th style="width:36px;">选</th><th>商品</th><th>规格</th><th>单位</th><th>数量</th><th>金额</th><th>类别</th></tr></thead><tbody>`;
                 consumableOrderDetails.forEach(item => {
-                    html += `<tr><td>${item.product_name || ''}</td><td>${item.spec || '-'}</td><td>${item.unit || ''}</td><td>${(item.quantity || 0).toFixed(2)}</td><td>${(item.amount || 0).toFixed(2)}</td><td>${item.category_name || ''}</td></tr>`;
+                    // 已有方案：仅勾选并高亮已纳入的明细行，复选框禁用；无方案：默认全选可编辑
+                    const inScheme = hasScheme ? schemeItemIds.includes(item.id) : true;
+                    const disabled = hasScheme ? 'disabled' : '';
+                    const rowStyle = (hasScheme && inScheme) ? ' style="background-color:#e8f4ff;"' : '';
+                    const checked = inScheme ? 'checked' : '';
+                    html += `<tr${rowStyle}><td class="text-center"><input type="checkbox" class="src-item-check" data-id="${item.id}" data-amount="${item.amount || 0}" ${checked} ${disabled} onchange="updateSelectedSourceTotal()"></td><td>${item.product_name || ''}</td><td>${item.spec || '-'}</td><td>${item.unit || ''}</td><td>${(item.quantity || 0).toFixed(2)}</td><td>${(item.amount || 0).toFixed(2)}</td><td>${item.category_name || ''}</td></tr>`;
                 });
                 html += '</tbody></table>';
+                if (!hasScheme) {
+                    html += '<div class="mb-2"><span class="text-muted small">已选明细合计: <span id="selectedSourceTotal">0.00</span> 元（全选=整单分摊）</span></div>';
+                }
                 html += '<div id="allocationOrdersSection"></div>';
                 detailDiv.innerHTML = html;
+                if (!hasScheme) updateSelectedSourceTotal();
+            }
+
+            function updateSelectedSourceTotal() {
+                const el = document.getElementById('selectedSourceTotal');
+                if (!el) return;
+                let total = 0;
+                document.querySelectorAll('.src-item-check:checked').forEach(cb => {
+                    total += parseFloat(cb.getAttribute('data-amount')) || 0;
+                });
+                el.textContent = total.toFixed(2);
             }
 
             async function loadAllocationSummary(orderId) {
@@ -14948,22 +15320,33 @@ async fn page_supplement() -> Html<String> {
 
             async function createAllocation() {
                 if (!selectedConsumableOrder) return;
+                const ids = [];
+                document.querySelectorAll('.src-item-check:checked').forEach(cb => {
+                    ids.push(parseInt(cb.getAttribute('data-id')));
+                });
+                if (ids.length === 0) {
+                    alert('请至少勾选一条要分摊的明细');
+                    return;
+                }
                 const remark = prompt('请输入分摊方案备注（选填）');
                 const res = await fetch('/api/allocation/create', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         source_order_id: selectedConsumableOrder.id,
-                        total_amount: selectedConsumableOrder.total_amount,
+                        source_item_ids: ids,
                         remark: remark || ''
                     })
                 });
                 if (res.ok) {
                     await loadAllocationSummary(selectedConsumableOrder.id);
+                    renderConsumableOrderDetail();
+                    await loadAllocationOrders(selectedConsumableOrder.id);
                     await loadOrdersByPurchaser();
                     alert('分摊方案创建成功');
                 } else {
-                    alert('创建失败');
+                    const text = await res.text();
+                    alert('创建失败: ' + text);
                 }
             }
 
@@ -15787,8 +16170,17 @@ async fn api_sales_order_by_purchaser(Path(purchaser_id): Path<i64>) -> impl Int
 
 async fn api_allocation_create(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
     let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let total_amount = req.get("total_amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let remark = req.get("remark").and_then(|v| v.as_str()).unwrap_or("");
+
+    // 勾选的来源明细 id 列表
+    let item_ids: Vec<i64> = req.get("source_item_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+
+    if item_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "请至少勾选一条明细").into_response();
+    }
 
     // 检查是否已存在分摊方案，防止重复创建
     let exists: bool = sqlx::query_scalar(
@@ -15803,18 +16195,37 @@ async fn api_allocation_create(Json(req): Json<serde_json::Value>) -> impl IntoR
         return (StatusCode::BAD_REQUEST, "该订单已有分摊方案").into_response();
     }
 
+    // 服务端按勾选明细重算分摊总额，确保金额可信
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT COALESCE(SUM(amount), 0) FROM sales_order_item WHERE order_id = ? AND id IN ({})",
+        placeholders
+    );
+    let mut q = sqlx::query_scalar::<_, f64>(AssertSqlSafe(sql.as_str())).bind(source_order_id);
+    for iid in &item_ids {
+        q = q.bind(*iid);
+    }
+    let total_amount: f64 = q.fetch_one(pool()).await.unwrap_or(0.0);
+
+    if total_amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, "勾选明细的金额合计为 0，无法初始化").into_response();
+    }
+
+    let item_ids_str = item_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+
     let result = sqlx::query(
-        "INSERT INTO consumable_allocation(source_order_id, total_amount, allocated_amount, remaining_balance, status, remark, created_at) VALUES (?, ?, 0, ?, 0, ?, datetime('now'))"
+        "INSERT INTO consumable_allocation(source_order_id, total_amount, allocated_amount, remaining_balance, status, remark, created_at, source_item_ids) VALUES (?, ?, 0, ?, 0, ?, datetime('now'), ?)"
     )
     .bind(source_order_id)
     .bind(total_amount)
     .bind(total_amount)
     .bind(remark)
+    .bind(&item_ids_str)
     .execute(pool())
     .await;
 
     match result {
-        Ok(res) => (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "id": res.last_insert_rowid() })).unwrap()).into_response(),
+        Ok(res) => (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "id": res.last_insert_rowid(), "total_amount": total_amount })).unwrap()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("创建分摊方案失败: {}", e)).into_response(),
     }
 }
@@ -15833,6 +16244,8 @@ async fn api_allocation_summary(Path(source_order_id): Path<i64>) -> impl IntoRe
     }
 
     let r = row.unwrap();
+    let item_ids_str = r.get::<Option<String>, _>("source_item_ids").unwrap_or_default();
+    let source_item_ids: Vec<i64> = item_ids_str.split(',').filter_map(|s| s.trim().parse::<i64>().ok()).collect();
     let summary = serde_json::json!({
         "exists": true,
         "id": r.get::<i64, _>("id"),
@@ -15844,6 +16257,7 @@ async fn api_allocation_summary(Path(source_order_id): Path<i64>) -> impl IntoRe
         "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
         "created_at": r.get::<String, _>("created_at"),
         "completed_at": r.get::<Option<String>, _>("completed_at").unwrap_or_default(),
+        "source_item_ids": source_item_ids,
     });
 
     (StatusCode::OK, serde_json::to_string(&summary).unwrap())
@@ -18398,6 +18812,8 @@ fn build_router() -> Router {
         .route("/query/sales_price", get(page_query_sales_price))
         .route("/query/purchaser_balance", get(page_query_purchaser_balance))
         .route("/query/product_rank", get(page_query_product_rank))
+        .route("/query/reimburse_summary", get(page_query_reimburse_summary))
+        .route("/query/allocation_source", get(page_query_allocation_source))
         .route("/query/stock_balance", get(page_query_stock_balance))
         .route("/query/stock_flow", get(page_query_stock_flow))
         .route("/query/stock_warning", get(page_query_stock_warning))
@@ -18527,6 +18943,8 @@ fn build_router() -> Router {
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
         .route("/api/query/purchaser_balance/export", get(api_query_purchaser_balance_export))
         .route("/api/query/product_rank", get(api_query_product_rank))
+        .route("/api/query/reimburse_summary", get(api_query_reimburse_summary))
+        .route("/api/query/allocation_source", get(api_query_allocation_source))
         .route("/api/query/stock_balance", get(api_query_stock_balance))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
