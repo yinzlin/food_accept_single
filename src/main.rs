@@ -6496,6 +6496,22 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                 </div>
             </div>
+            <div class="mt-3">
+                <div class="d-flex justify-content-between align-items-center mb-1">
+                    <h6 class="mb-0">有变更的订单列表 <span class="badge badge-info" id="adjustedOrdersCount">0</span></h6>
+                    <button class="btn btn-xs btn-outline-secondary" onclick="loadAdjustedOrders()">刷新</button>
+                </div>
+                <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
+                    <table class="table table-sm table-bordered mb-0" id="adjustedOrdersTable">
+                        <thead class="thead-light"><tr>
+                            <th>订单号</th><th>采购单位</th><th>订单日期</th>
+                            <th>真实金额</th><th>调整金额</th><th>调整后金额</th>
+                            <th>调整条数</th><th>最近调整日</th><th>操作</th>
+                        </tr></thead>
+                        <tbody><tr><td colspan="9" class="text-center text-muted small">暂无</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <div id="adjustArea" style="display:none;">
@@ -6940,6 +6956,7 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                     renderAdjReplaceLines();
                     await loadCompare();
                     await loadAdjRecords();
+                    await loadAdjustedOrders();
                     alert('替换已保存');
                     return;
                 }
@@ -6985,6 +7002,7 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                     document.getElementById('adjIncQty').value = '';
                     await loadCompare();
                     await loadAdjRecords();
+                    await loadAdjustedOrders();
                     alert('调整已保存');
                 } else {
                     alert('保存失败: ' + await res.text());
@@ -6997,11 +7015,51 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                 if (res.ok) {
                     await loadCompare();
                     await loadAdjRecords();
+                    await loadAdjustedOrders();
                     alert('回滚成功');
                 } else {
                     alert('回滚失败: ' + await res.text());
                 }
             }
+
+            async function loadAdjustedOrders() {
+                const res = await fetch('/api/supplement/adjusted_orders');
+                const list = await res.json();
+                window._adjustedOrdersMap = {};
+                list.forEach(o => { window._adjustedOrdersMap[o.id] = o; });
+                const tbody = document.querySelector('#adjustedOrdersTable tbody');
+                document.getElementById('adjustedOrdersCount').textContent = list.length;
+                tbody.innerHTML = '';
+                if (!list.length) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted small">暂无</td></tr>';
+                    return;
+                }
+                list.forEach(o => {
+                    const tr = document.createElement('tr');
+                    tr.style.cursor = 'pointer';
+                    const diff = (o.adjust_amount || 0);
+                    const diffColor = diff > 0 ? 'text-success' : (diff < 0 ? 'text-danger' : 'text-muted');
+                    tr.innerHTML =
+                        '<td><a href="javascript:void(0)" onclick="selectAdjOrderById(' + o.id + ')">' + o.order_no + '</a></td>' +
+                        '<td>' + (o.purchaser_name || '') + '</td>' +
+                        '<td>' + (o.order_date || '') + '</td>' +
+                        '<td class="text-right">' + (o.total_amount || 0).toFixed(2) + '</td>' +
+                        '<td class="text-right ' + diffColor + '">' + (diff >= 0 ? '+' : '') + diff.toFixed(2) + '</td>' +
+                        '<td class="text-right"><strong>' + (o.adjusted_total || 0).toFixed(2) + '</strong></td>' +
+                        '<td class="text-center">' + (o.adjust_count || 0) + '</td>' +
+                        '<td>' + (o.last_adjust_date || '') + '</td>' +
+                        '<td><button class="btn btn-xs btn-outline-primary" onclick="selectAdjOrderById(' + o.id + ')">查看</button></td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            function selectAdjOrderById(id) {
+                const o = window._adjustedOrdersMap && window._adjustedOrdersMap[id];
+                if (o) selectAdjOrder(o);
+            }
+
+            // 页面初始载入变更订单列表
+            loadAdjustedOrders();
         </script>
     "####;
     Html(layout_html("订单调整与同屏比对", "/query/order_adjust", &content))
@@ -15350,6 +15408,7 @@ async fn page_supplement() -> Html<String> {
                                 <div id="allocationManageActions" class="mt-2" style="display: none;">
                                     <button class="btn btn-sm btn-success" onclick="confirmCompleteAllocation()">确认完成分摊</button>
                                     <button class="btn btn-sm btn-warning" onclick="terminateAllocation()">终止分摊</button>
+                                    <button class="btn btn-sm btn-secondary" onclick="cancelAllocation()" title="仅在未产生分摊记录时可用；取消后回到未分摊状态">取消分摊方案</button>
                                 </div>
                             </div>
                         </div>
@@ -15796,8 +15855,9 @@ async fn page_supplement() -> Html<String> {
                     if (res.ok) {
                         alert('回滚成功');
                         if (selectedConsumableOrder) {
-                            await loadAllocationOrders(selectedConsumableOrder.id);
                             await loadAllocationSummary(selectedConsumableOrder.id);
+                            renderConsumableOrderDetail();
+                            await loadAllocationOrders(selectedConsumableOrder.id);
                             await loadOrdersByPurchaser();
                         }
                     } else {
@@ -15806,6 +15866,34 @@ async fn page_supplement() -> Html<String> {
                     }
                 } catch (e) {
                     alert('回滚失败: ' + e.message);
+                }
+            }
+
+            async function cancelAllocation() {
+                if (!selectedConsumableOrder) return;
+                if (!allocationSummary || !allocationSummary.exists) {
+                    alert('当前订单未初始化分摊方案');
+                    return;
+                }
+                if ((allocationSummary.allocated_amount || 0) > 0.0001) {
+                    alert('已存在分摊记录，请先回滚全部分摊后再取消');
+                    return;
+                }
+                if (!confirm('确定取消该分摊方案？取消后订单将回到未分摊状态，可重新选择明细。')) return;
+                const res = await fetch('/api/allocation/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source_order_id: selectedConsumableOrder.id })
+                });
+                if (res.ok) {
+                    await loadAllocationSummary(selectedConsumableOrder.id);
+                    renderConsumableOrderDetail();
+                    await loadAllocationOrders(selectedConsumableOrder.id);
+                    await loadOrdersByPurchaser();
+                    alert('取消成功，已回到未分摊状态');
+                } else {
+                    const text = await res.text();
+                    alert('取消失败: ' + text);
                 }
             }
 
@@ -16819,6 +16907,49 @@ async fn api_allocation_terminate(Json(req): Json<serde_json::Value>) -> impl In
     }
 }
 
+async fn api_allocation_cancel(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let row = match sqlx::query(
+        "SELECT id, allocated_amount, status FROM consumable_allocation WHERE source_order_id = ?"
+    )
+    .bind(source_order_id)
+    .fetch_optional(pool())
+    .await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "分摊方案不存在").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败: {}", e)).into_response(),
+    };
+
+    let allocated: f64 = row.get("allocated_amount");
+    let status: i64 = row.get("status");
+
+    if status == 2 {
+        return (StatusCode::BAD_REQUEST, "分摊方案已完成，无法取消").into_response();
+    }
+    if allocated > 0.0001 {
+        return (StatusCode::BAD_REQUEST, format!("尚有已分摊金额 {:.2} 元，请先回滚全部分摊记录后再取消", allocated)).into_response();
+    }
+
+    let result = sqlx::query(
+        "DELETE FROM consumable_allocation WHERE source_order_id = ? AND allocated_amount <= 0.0001 AND status != 2"
+    )
+    .bind(source_order_id)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(res) => {
+            if res.rows_affected() > 0 {
+                (StatusCode::OK, "取消成功").into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "无法取消分摊方案").into_response()
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("取消失败: {}", e)).into_response(),
+    }
+}
+
 async fn api_allocation_complete(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
     let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let target_order_id = req.get("target_order_id").and_then(|v| v.as_i64());
@@ -16978,6 +17109,43 @@ async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoRe
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
+async fn api_adjusted_orders() -> impl IntoResponse {
+    // 列出所有存在自调整记录（target_order_id == source_order_id）的订单
+    let rows = sqlx::query(
+        "SELECT so.id, so.order_no, so.order_date, so.total_amount,
+                p.name as purchaser_name,
+                COALESCE(SUM(osi.amount), 0) as adjust_amount,
+                COUNT(osi.id) as adjust_count,
+                MAX(osi.allocate_date) as last_adjust_date
+         FROM sales_order so
+         INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id AND osi.source_order_id = so.id
+         LEFT JOIN purchaser p ON so.purchaser_id = p.id
+         GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name
+         ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let total: f64 = row.get::<f64, _>("total_amount");
+        let adjust: f64 = row.get::<f64, _>("adjust_amount");
+        serde_json::json!({
+            "id": row.get::<i64, _>("id"),
+            "order_no": row.get::<String, _>("order_no"),
+            "order_date": row.get::<String, _>("order_date"),
+            "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "total_amount": total,
+            "adjust_amount": adjust,
+            "adjusted_total": total + adjust,
+            "adjust_count": row.get::<i64, _>("adjust_count"),
+            "last_adjust_date": row.get::<Option<String>, _>("last_adjust_date").unwrap_or_default(),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
 async fn api_supplement_list_by_source(Path(order_id): Path<i64>) -> impl IntoResponse {
     let rows = sqlx::query(
         "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, so.order_no as target_order_no
@@ -17053,6 +17221,15 @@ async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
 
                     let _ = sqlx::query(
                         "UPDATE consumable_allocation SET completed_at = NULL WHERE source_order_id = ? AND status = 2 AND completed_at IS NOT NULL"
+                    )
+                    .bind(source_order_id)
+                    .execute(pool())
+                    .await;
+
+                    // 若已分摊金额已归零，则删除该分摊方案，回到"未分摊"初始态，
+                    // 允许重新勾选明细并再次初始化分摊
+                    let _ = sqlx::query(
+                        "DELETE FROM consumable_allocation WHERE source_order_id = ? AND status != 3 AND allocated_amount <= 0.0001"
                     )
                     .bind(source_order_id)
                     .execute(pool())
@@ -19446,12 +19623,14 @@ fn build_router() -> Router {
         .route("/api/sales_order/accept_excel/{id}", get(api_sales_order_accept_excel))
         .route("/api/supplement/create", post(api_supplement_create))
         .route("/api/supplement/list_by_target/{order_id}", get(api_supplement_list_by_target))
+        .route("/api/supplement/adjusted_orders", get(api_adjusted_orders))
         .route("/api/supplement/list_by_source/{order_id}", get(api_supplement_list_by_source))
         .route("/api/supplement/delete/{id}", delete(api_supplement_delete))
         .route("/api/supplement/compare/{order_id}", get(api_supplement_compare))
         .route("/api/allocation/create", post(api_allocation_create))
         .route("/api/allocation/summary/{source_order_id}", get(api_allocation_summary))
         .route("/api/allocation/terminate", post(api_allocation_terminate))
+        .route("/api/allocation/cancel", post(api_allocation_cancel))
         .route("/api/allocation/complete", post(api_allocation_complete))
         .route("/api/sales_order/sort_items", get(api_sales_order_sort_items))
         .route("/api/sales_order/sort_items_excel", get(api_sales_order_sort_items_excel))
