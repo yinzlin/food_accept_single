@@ -7136,6 +7136,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                 </div>
                 <div class="col-md-6 d-flex align-items-end">
                     <button onclick="searchStockSummary()" class="btn btn-primary">查询</button>
+                    <button onclick="exportStockSummary()" class="btn btn-success ml-2">导出Excel</button>
                     <button onclick="resetDate('today')" class="btn btn-outline-secondary ml-2">今日</button>
                     <button onclick="resetDate('7d')" class="btn btn-outline-secondary ml-2">近7天</button>
                     <button onclick="resetDate('30d')" class="btn btn-outline-secondary ml-2">近30天</button>
@@ -7175,6 +7176,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                 <thead class="thead-light">
                     <tr>
                         <th>日期</th>
+                        <th>仓库</th>
                         <th class="text-right">入库金额</th>
                         <th class="text-center">入库单数</th>
                         <th class="text-center">入库条数</th>
@@ -7208,13 +7210,20 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                 const data = await res.json();
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
-                if (!data.items || data.items.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">暂无数据</td></tr>';
+                if (!data.rows || data.rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无数据</td></tr>';
                 } else {
-                    data.items.forEach(it => {
+                    let prevDay = null;
+                    data.rows.forEach(it => {
                         const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
-                        tbody.innerHTML += '<tr>' +
-                            '<td>' + it.day + '</td>' +
+                        // 汇总行加粗背景
+                        const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
+                        // 如果日期变化，加一个可视分隔
+                        const dayDisplay = it.day !== prevDay ? it.day : '';
+                        prevDay = it.day;
+                        tbody.innerHTML += '<tr style="' + rowStyle + '">' +
+                            '<td>' + dayDisplay + '</td>' +
+                            '<td>' + it.warehouse_name + '</td>' +
                             '<td class="text-right text-success">' + (it.in_amount || 0).toFixed(2) + '</td>' +
                             '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
@@ -7231,6 +7240,12 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                 const netEl = document.getElementById('totalNet');
                 netEl.textContent = net.toFixed(2);
                 netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+            }
+
+            function exportStockSummary() {
+                const url = '/api/query/stock_summary/export?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                window.location.href = url;
             }
 
             resetDate('30d');
@@ -15038,11 +15053,22 @@ async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
-async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+struct StockSummaryRow {
+    day: String,
+    warehouse_id: i64,
+    warehouse_name: String,
+    is_summary: bool,
+    in_amount: f64,
+    in_item_count: i64,
+    in_order_count: i64,
+    out_amount: f64,
+    out_item_count: i64,
+    out_order_count: i64,
+    net_amount: f64,
+}
 
-    // 采购入库按日汇总（金额、条数、订单数）
+async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64) {
+    // 采购入库按日+仓库汇总
     let mut purchase_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
         purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date));
@@ -15052,13 +15078,15 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
     }
     let purchase_sql = format!(
         "SELECT po.order_date as day,
-                COALESCE(SUM(poi.amount), 0) as amount,
-                COUNT(poi.id) as item_count,
-                COUNT(DISTINCT po.id) as order_count
+                COALESCE(po.warehouse_id, 0) as warehouse_id,
+                COALESCE(po.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(poi.amount), 0) as in_amount,
+                COUNT(poi.id) as in_item_count,
+                COUNT(DISTINCT po.id) as in_order_count
          FROM purchase_order po
          JOIN purchase_order_item poi ON poi.order_id = po.id
          {}
-         GROUP BY po.order_date",
+         GROUP BY po.order_date, po.warehouse_id, po.warehouse_name",
         purchase_where
     );
     let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
@@ -15066,7 +15094,7 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
         .await
         .unwrap_or_default();
 
-    // 销售出库按日汇总
+    // 销售出库按日+仓库汇总
     let mut sales_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
         sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date));
@@ -15076,13 +15104,15 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
     }
     let sales_sql = format!(
         "SELECT so.order_date as day,
-                COALESCE(SUM(soi.amount), 0) as amount,
-                COUNT(soi.id) as item_count,
-                COUNT(DISTINCT so.id) as order_count
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(soi.amount), 0) as out_amount,
+                COUNT(soi.id) as out_item_count,
+                COUNT(DISTINCT so.id) as out_order_count
          FROM sales_order so
          JOIN sales_order_item soi ON soi.order_id = so.id
          {}
-         GROUP BY so.order_date",
+         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
         sales_where
     );
     let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
@@ -15090,58 +15120,249 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
         .await
         .unwrap_or_default();
 
-    use std::collections::BTreeMap;
-    let mut day_map: BTreeMap<String, (f64, i64, i64, f64, i64, i64)> = BTreeMap::new();
-    // (in_amount, in_items, in_orders, out_amount, out_items, out_orders)
+    use std::collections::{BTreeMap, HashMap};
+
+    // Key: (day, warehouse_id) -> (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name)
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String)>> = HashMap::new();
+
+    // 先收集所有仓库名称用于排序
+    let mut warehouse_names: BTreeMap<i64, String> = BTreeMap::new();
 
     for row in &purchase_rows {
         let day: String = row.get("day");
-        let amount: f64 = row.get::<f64, _>("amount");
-        let items: i64 = row.get::<i64, _>("item_count");
-        let orders: i64 = row.get::<i64, _>("order_count");
-        let e = day_map.entry(day).or_insert((0.0, 0, 0, 0.0, 0, 0));
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("in_amount");
+        let items: i64 = row.get::<i64, _>("in_item_count");
+        let orders: i64 = row.get::<i64, _>("in_order_count");
+
+        warehouse_names.insert(wh_id, wh_name.clone());
+
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
         e.0 += amount;
         e.1 += items;
         e.2 += orders;
     }
+
     for row in &sales_rows {
         let day: String = row.get("day");
-        let amount: f64 = row.get::<f64, _>("amount");
-        let items: i64 = row.get::<i64, _>("item_count");
-        let orders: i64 = row.get::<i64, _>("order_count");
-        let e = day_map.entry(day).or_insert((0.0, 0, 0, 0.0, 0, 0));
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let items: i64 = row.get::<i64, _>("out_item_count");
+        let orders: i64 = row.get::<i64, _>("out_order_count");
+
+        warehouse_names.insert(wh_id, wh_name.clone());
+
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
         e.3 += amount;
         e.4 += items;
         e.5 += orders;
     }
 
-    let mut items: Vec<serde_json::Value> = Vec::new();
+    // 按日期倒序，每天输出仓库明细行 + 汇总行
+    let mut days: Vec<String> = day_wh_map.keys().cloned().collect();
+    days.sort_by(|a, b| b.cmp(a)); // 倒序
+
+    let mut rows: Vec<StockSummaryRow> = Vec::new();
     let mut total_in = 0.0;
     let mut total_out = 0.0;
-    // 按日期倒序输出
-    for (day, v) in day_map.iter().rev() {
-        total_in += v.0;
-        total_out += v.3;
-        items.push(serde_json::json!({
-            "day": day,
-            "in_amount": v.0,
-            "in_item_count": v.1,
-            "in_order_count": v.2,
-            "out_amount": v.3,
-            "out_item_count": v.4,
-            "out_order_count": v.5,
-            "net_amount": v.0 - v.3,
-        }));
+
+    for day in &days {
+        if let Some(wh_map) = day_wh_map.get(day) {
+            let mut day_in = 0.0;
+            let mut day_out = 0.0;
+            let mut day_in_items = 0;
+            let mut day_out_items = 0;
+            let mut day_in_orders = 0;
+            let mut day_out_orders = 0;
+
+            // 输出每个仓库行
+            for (wh_id, v) in wh_map {
+                day_in += v.0;
+                day_out += v.3;
+                day_in_items += v.1;
+                day_out_items += v.4;
+                day_in_orders += v.2;
+                day_out_orders += v.5;
+
+                rows.push(StockSummaryRow {
+                    day: day.clone(),
+                    warehouse_id: *wh_id,
+                    warehouse_name: v.6.clone(),
+                    is_summary: false,
+                    in_amount: v.0,
+                    in_item_count: v.1,
+                    in_order_count: v.2,
+                    out_amount: v.3,
+                    out_item_count: v.4,
+                    out_order_count: v.5,
+                    net_amount: v.0 - v.3,
+                });
+            }
+
+            // 输出当天汇总行
+            rows.push(StockSummaryRow {
+                day: day.clone(),
+                warehouse_id: -1,
+                warehouse_name: "当日汇总".to_string(),
+                is_summary: true,
+                in_amount: day_in,
+                in_item_count: day_in_items,
+                in_order_count: day_in_orders,
+                out_amount: day_out,
+                out_item_count: day_out_items,
+                out_order_count: day_out_orders,
+                net_amount: day_in - day_out,
+            });
+
+            total_in += day_in;
+            total_out += day_out;
+        }
     }
 
+    (rows, total_in, total_out)
+}
+
+async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+
+    // 收集所有仓库列表（保持原有兼容性，虽然导出不再需要）
+    use std::collections::BTreeMap;
+    let mut warehouse_names: BTreeMap<i64, String> = BTreeMap::new();
+    for r in &rows {
+        if r.warehouse_id >= 0 {
+            warehouse_names.insert(r.warehouse_id, r.warehouse_name.clone());
+        }
+    }
+    let warehouse_list: Vec<serde_json::Value> = warehouse_names
+        .iter()
+        .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+        .collect();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "day": r.day,
+            "warehouse_id": r.warehouse_id,
+            "warehouse_name": r.warehouse_name,
+            "is_summary": r.is_summary,
+            "in_amount": r.in_amount,
+            "in_item_count": r.in_item_count,
+            "in_order_count": r.in_order_count,
+            "out_amount": r.out_amount,
+            "out_item_count": r.out_item_count,
+            "out_order_count": r.out_order_count,
+            "net_amount": r.net_amount,
+        })
+    }).collect();
+
     let result = serde_json::json!({
-        "items": items,
+        "rows": items,
+        "warehouses": warehouse_list,
         "total_in_amount": total_in,
         "total_out_amount": total_out,
         "total_net_amount": total_in - total_out,
     });
 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("出入库统计").unwrap();
+
+    let header_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0x2E75B6))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+
+    let summary_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+
+    let num_format = rust_xlsxwriter::Format::new()
+        .set_num_format("#,##0.00")
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+
+    let num_format_sum = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_num_format("#,##0.00")
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "出库单数", "出库条数", "净额"];
+    for (col, header) in headers.iter().enumerate() {
+        worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
+    }
+
+    // 设置列宽
+    worksheet.set_column_width(0, 14).unwrap(); // 日期
+    worksheet.set_column_width(1, 16).unwrap(); // 仓库
+    worksheet.set_column_width_pixels(2, 90).unwrap(); // 金额列统一
+    worksheet.set_column_width_pixels(3, 70).unwrap();
+    worksheet.set_column_width_pixels(4, 70).unwrap();
+    worksheet.set_column_width_pixels(5, 90).unwrap();
+    worksheet.set_column_width_pixels(6, 70).unwrap();
+    worksheet.set_column_width_pixels(7, 70).unwrap();
+    worksheet.set_column_width_pixels(8, 90).unwrap();
+
+    let mut prev_day = String::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let sheet_row = (row_idx + 1) as u32;
+        // 日期只在第一次出现时填写
+        let day_display = if row.day != prev_day { row.day.as_str() } else { "" };
+        prev_day = row.day.clone();
+
+        if row.is_summary {
+            worksheet.write_with_format(sheet_row, 0, day_display, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 1, &row.warehouse_name, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format_sum).unwrap();
+        } else {
+            worksheet.write(sheet_row, 0, day_display).unwrap();
+            worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
+            worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 6, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 7, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format).unwrap();
+        }
+    }
+
+    // 最后附加一个总计行
+    let total_row = (rows.len() + 2) as u32;
+    worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
+    worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 8, total_in - total_out, &num_format_sum).unwrap();
+
+    let buf = workbook.save_to_buffer().unwrap();
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"stock_summary.xlsx\""),
+        ],
+        buf,
+    ).into_response()
 }
 
 async fn api_query_stock_warning() -> impl IntoResponse {
@@ -20009,6 +20230,7 @@ fn build_router() -> Router {
         .route("/api/query/stock_balance", get(api_query_stock_balance))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
         .route("/api/query/stock_summary", get(api_query_stock_summary))
+        .route("/api/query/stock_summary/export", get(api_query_stock_summary_export))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
         .route("/api/query/slow_stock", get(api_query_slow_stock))
         .route("/api/query/income_expense", get(api_query_income_expense))
