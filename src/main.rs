@@ -87,8 +87,8 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/warehouse" | "/api/warehouse/create" | "/api/warehouse/update" | "/api/warehouse/delete" => Some("admin"),
         "/inventory" => Some("admin"),
         "/purchase" | "/api/purchase_order/create" | "/api/purchase_order/update" | "/api/purchase_order/delete" => Some("supplier"),
-        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" => Some("purchaser"),
-        "/query/purchase_order" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
+        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
+        "/query/purchase_order" | "/query/purchase_document" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
         "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
         "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
@@ -114,6 +114,8 @@ fn check_api_route_permission(path: &str) -> Option<&str> {
     } else if path.starts_with("/api/warehouse/") {
         Some("admin")
     } else if path.starts_with("/api/purchase_order/") {
+        Some("supplier")
+    } else if path.starts_with("/api/purchase_document/") {
         Some("supplier")
     } else if path.starts_with("/api/sales_order/") {
         Some("purchaser")
@@ -302,6 +304,8 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             base_unit TEXT DEFAULT '个',
             base_price REAL DEFAULT 0,
             purchase_price REAL DEFAULT 0,
+            max_purchase_price REAL DEFAULT 0,
+            min_purchase_price REAL DEFAULT 0,
             category_id INTEGER REFERENCES category(id),
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(name, spec)
@@ -336,6 +340,15 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE product ADD COLUMN status INTEGER DEFAULT 1")
+        .execute(pool)
+        .await;
+
+    // 最高进价、最低进价（purchase_price 作为当前进价）
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN max_purchase_price REAL DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN min_purchase_price REAL DEFAULT 0")
         .execute(pool)
         .await;
 
@@ -511,6 +524,8 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             total_amount REAL NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'pending',
             remark TEXT,
+            customer_order_image TEXT,
+            signed_order_image TEXT,
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(purchaser_id) REFERENCES purchaser(id)
         )
@@ -591,6 +606,23 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     .execute(pool)
     .await?;
 
+    // 采购单据表：按供应商+日期采集多张单据图片
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS purchase_document (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id INTEGER NOT NULL,
+            supplier_name TEXT NOT NULL,
+            document_date TEXT NOT NULL,
+            image_url TEXT NOT NULL,
+            remark TEXT,
+            create_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN discount_rate REAL DEFAULT 0")
         .execute(pool)
         .await;
@@ -620,6 +652,15 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN warehouse_name TEXT")
+        .execute(pool)
+        .await;
+
+    // 销售订单图片：客户订单图片，已验收签字图片
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN customer_order_image TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN signed_order_image TEXT")
         .execute(pool)
         .await;
 
@@ -1194,6 +1235,9 @@ fn sidebar_html() -> String {
                             <ul class="tree-children">
                                 <li class="tree-node leaf" data-path="/query/purchase_order">
                                     <a href="/query/purchase_order"><span class="node-icon">📋</span><span class="node-label">采购订单查询</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/purchase_document">
+                                    <a href="/query/purchase_document"><span class="node-icon">🧾</span><span class="node-label">采购单据列表</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/purchase_price">
                                     <a href="/query/purchase_price"><span class="node-icon">💰</span><span class="node-label">采购价格查询</span></a>
@@ -2897,12 +2941,22 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <input type="number" step="0.01" name="base_price" class="form-control">
                                 </div>
                                 <div class="col-md-4">
-                                    <label class="form-label">进价（每基础单位）</label>
+                                    <label class="form-label">当前进价（每基础单位，最近采购价）</label>
                                     <input type="number" step="0.01" name="purchase_price" class="form-control">
                                 </div>
+                            </div>
+                            <div class="row mt-3">
                                 <div class="col-md-4">
                                     <label class="form-label">分类</label>
                                     <select name="category_id" class="form-control">{0}</select>
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">历史最高进价（自动）</label>
+                                    <input type="number" step="0.01" name="max_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">历史最低进价（自动）</label>
+                                    <input type="number" step="0.01" name="min_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
                             </div>
 
@@ -2943,7 +2997,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 </div>
                             </div>
                         </form>
-                        
+
                         <div class="mt-4">
                             <div class="d-flex justify-content-between align-items-center">
                                 <h6>商品图片</h6>
@@ -2954,12 +3008,12 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                         <span>暂无图片</span>
                                     </div>
                                     <div id="imageActions" style="display:none;">
-                                        <button class="btn btn-sm btn-danger" onclick="deleteProductImage()">🗑️ 删除图片</button>
+                                        <button type="button" class="btn btn-sm btn-danger" onclick="deleteProductImage()">🗑️ 删除图片</button>
                                     </div>
                                 </div>
                                 <div>
                                     <input type="file" id="productImageInput" accept="image/*" style="display:none" onchange="uploadProductImage()">
-                                    <button class="btn btn-sm btn-outline-primary" onclick="document.getElementById('productImageInput').click()">📷 上传图片</button>
+                                    <button type="button" class="btn btn-sm btn-outline-primary" onclick="document.getElementById('productImageInput').click()">📷 上传图片</button>
                                     <span class="text-muted small ml-2">支持 JPG、PNG、GIF、WebP 格式，最大5MB</span>
                                 </div>
                             </div>
@@ -3177,6 +3231,8 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 form.base_unit.value = p.base_unit || '';
                 form.base_price.value = p.base_price || 0;
                 form.purchase_price.value = p.purchase_price || 0;
+                form.max_purchase_price.value = p.max_purchase_price || 0;
+                form.min_purchase_price.value = p.min_purchase_price || 0;
                 form.category_id.value = p.category_id || '';
                 
                 form.gov_price.value = '';
@@ -4550,8 +4606,24 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                 </div>
 
-                <button onclick="saveOrder()" class="btn btn-success mt-3" id="saveBtn">保存销售订单</button>
-                <button onclick="resetForm()" class="btn btn-secondary mt-3 ml-2">新建订单</button>
+                <div class="mt-3 d-flex align-items-center flex-wrap" style="gap:8px;">
+                    <button onclick="saveOrder()" class="btn btn-success" id="saveBtn">保存销售订单</button>
+                    <button onclick="resetForm()" class="btn btn-secondary">新建订单</button>
+
+                    <input type="file" id="customerOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('customer')">
+                    <button type="button" class="btn btn-outline-primary" onclick="document.getElementById('customerOrderImageInput').click()">📷 上传客户订单</button>
+                    <a id="customerOrderImageLink" href="javascript:void(0)" target="_blank" style="display:none;">
+                        <img id="customerOrderImageThumb" src="" style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid #ddd;">
+                    </a>
+                    <button type="button" class="btn btn-sm btn-outline-danger" id="customerOrderImageDeleteBtn" onclick="deleteSalesOrderImage('customer')" style="display:none">删除</button>
+
+                    <input type="file" id="signedOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('signed')">
+                    <button type="button" class="btn btn-outline-primary" onclick="document.getElementById('signedOrderImageInput').click()">📷 上传已验收签字订单</button>
+                    <a id="signedOrderImageLink" href="javascript:void(0)" target="_blank" style="display:none;">
+                        <img id="signedOrderImageThumb" src="" style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid #ddd;">
+                    </a>
+                    <button type="button" class="btn btn-sm btn-outline-danger" id="signedOrderImageDeleteBtn" onclick="deleteSalesOrderImage('signed')" style="display:none">删除</button>
+                </div>
             </div>
         </div>
 
@@ -5069,6 +5141,60 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
+            async function uploadSalesOrderImage(imageType) {{
+                if (!currentOrderId) {{
+                    alert('请先保存销售订单后再上传图片');
+                    return;
+                }}
+                const inputId = imageType === 'customer' ? 'customerOrderImageInput' : 'signedOrderImageInput';
+                const input = document.getElementById(inputId);
+                if (!input.files || input.files.length === 0) return;
+                const formData = new FormData();
+                formData.append('file', input.files[0]);
+                const res = await fetch('/api/sales_order/upload_image?order_id=' + currentOrderId + '&type=' + imageType, {{
+                    method: 'POST',
+                    body: formData
+                }});
+                if (res.ok) {{
+                    const result = await res.json();
+                    setSalesOrderImage(imageType, result.url);
+                }} else {{
+                    const text = await res.text();
+                    alert('图片上传失败：' + text);
+                }}
+                input.value = '';
+            }}
+
+            async function deleteSalesOrderImage(imageType) {{
+                if (!currentOrderId) return;
+                if (!confirm('确定删除该图片？')) return;
+                const res = await fetch('/api/sales_order/delete_image?order_id=' + currentOrderId + '&type=' + imageType, {{
+                    method: 'POST'
+                }});
+                if (res.ok) {{
+                    setSalesOrderImage(imageType, null);
+                }} else {{
+                    alert('删除失败');
+                }}
+            }}
+
+            function setSalesOrderImage(imageType, url) {{
+                const prefix = imageType === 'customer' ? 'customerOrderImage' : 'signedOrderImage';
+                const link = document.getElementById(prefix + 'Link');
+                const thumb = document.getElementById(prefix + 'Thumb');
+                const delBtn = document.getElementById(prefix + 'DeleteBtn');
+                if (url) {{
+                    link.href = url;
+                    thumb.src = url;
+                    link.style.display = 'inline-block';
+                    delBtn.style.display = 'inline-block';
+                }} else {{
+                    link.href = '#';
+                    thumb.src = '';
+                    link.style.display = 'none';
+                    delBtn.style.display = 'none';
+                }}
+            }}
             let currentPage = 1;
             let currentKeyword = '';
 
@@ -5186,6 +5312,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('remarkInput').value = order.remark || '';
                 document.getElementById('discountRateInput').value = order.discount_rate || 0;
                 document.getElementById('amountReductionInput').value = order.amount_reduction || 0;
+                setSalesOrderImage('customer', order.customer_order_image || null);
+                setSalesOrderImage('signed', order.signed_order_image || null);
                 
                 items = [];
                 for (const item of order.items) {{
@@ -5314,6 +5442,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderDateInput').value = '';
                 document.getElementById('remarkInput').value = '';
                 document.getElementById('discountRateInput').value = '20';
+                setSalesOrderImage('customer', null);
+                setSalesOrderImage('signed', null);
                 items = [];
                 renderItems();
                 generateOrderNo('sales');
@@ -5516,6 +5646,165 @@ async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<Strin
         </script>
     "#;
     Html(layout_html("采购订单查询", "/query/purchase_order", &content))
+}
+
+async fn page_query_purchase_document(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/purchase_document").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let content = format!(r#"
+        <div class="card p-4">
+            <h3>采购单据列表</h3>
+            <p class="text-muted small">按供应商、日期采集采购单据图片。支持手机连续拍照/多选上传，图片按供应商+日期分组归档。</p>
+            <div class="row">
+                <div class="col-md-4">
+                    <label class="form-label">供应商</label>
+                    <select id="docSupplier" class="form-control">
+                        <option value="">请选择供应商</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">单据日期</label>
+                    <input type="date" id="docDate" class="form-control" value="{today}">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">备注（可选）</label>
+                    <input type="text" id="docRemark" class="form-control" placeholder="如：验收单/送货单">
+                </div>
+                <div class="col-md-2 d-flex align-items-end">
+                    <button class="btn btn-primary" onclick="loadDocuments()">查询</button>
+                </div>
+            </div>
+            <div class="mt-3">
+                <input type="file" id="docFileInput" accept="image/*" capture="environment" multiple style="display:none" onchange="uploadDocuments()">
+                <button type="button" class="btn btn-success" onclick="startCapture()">📷 连续采集单据（拍照/多选）</button>
+                <span id="uploadStatus" class="text-muted small ml-2"></span>
+            </div>
+        </div>
+
+        <div class="card p-3 mt-3">
+            <div id="docGroups"></div>
+        </div>
+
+        <div class="modal fade" id="docImageModal" tabindex="-1">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-body text-center p-0">
+                        <img id="docModalImage" src="" style="max-width:100%;max-height:85vh;">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            async function loadSuppliersForDoc() {{
+                const res = await fetch('/api/supplier/list');
+                const suppliers = await res.json();
+                const sel = document.getElementById('docSupplier');
+                suppliers.forEach(s => {{
+                    sel.innerHTML += '<option value="' + s.id + '">' + s.name + '</option>';
+                }});
+            }}
+
+            function startCapture() {{
+                const sid = document.getElementById('docSupplier').value;
+                const date = document.getElementById('docDate').value;
+                if (!sid) {{ alert('请先选择供应商'); return; }}
+                if (!date) {{ alert('请先选择单据日期'); return; }}
+                document.getElementById('docFileInput').click();
+            }}
+
+            async function uploadDocuments() {{
+                const input = document.getElementById('docFileInput');
+                if (!input.files || input.files.length === 0) return;
+                const sel = document.getElementById('docSupplier');
+                const sid = sel.value;
+                const sname = sel.options[sel.selectedIndex].text;
+                const date = document.getElementById('docDate').value;
+                const remark = document.getElementById('docRemark').value || '';
+                const statusEl = document.getElementById('uploadStatus');
+
+                const files = Array.from(input.files);
+                let done = 0;
+                for (const file of files) {{
+                    statusEl.textContent = '正在上传 ' + (done + 1) + '/' + files.length + ' ...';
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('supplier_id', sid);
+                    formData.append('supplier_name', sname);
+                    formData.append('document_date', date);
+                    formData.append('remark', remark);
+                    try {{
+                        const res = await fetch('/api/purchase_document/upload', {{ method: 'POST', body: formData }});
+                        if (res.ok) done++;
+                    }} catch (e) {{}}
+                }}
+                statusEl.textContent = '本次上传完成：' + done + '/' + files.length + ' 张';
+                input.value = '';
+                loadDocuments();
+            }}
+
+            async function loadDocuments() {{
+                const sid = document.getElementById('docSupplier').value;
+                const date = document.getElementById('docDate').value;
+                let url = '/api/purchase_document/list?';
+                if (sid) url += 'supplier_id=' + sid + '&';
+                if (date) url += 'document_date=' + date;
+                const res = await fetch(url);
+                const docs = await res.json();
+                const container = document.getElementById('docGroups');
+                if (!docs || docs.length === 0) {{
+                    container.innerHTML = '<p class="text-center text-muted">暂无单据</p>';
+                    return;
+                }}
+                // 按 供应商+日期 分组
+                const groups = {{}};
+                docs.forEach(d => {{
+                    const key = d.supplier_name + ' | ' + d.document_date;
+                    if (!groups[key]) groups[key] = [];
+                    groups[key].push(d);
+                }});
+                let html = '';
+                Object.keys(groups).forEach(key => {{
+                    const items = groups[key];
+                    html += '<div class="mb-4">';
+                    html += '<h6 class="border-bottom pb-1">' + key + ' <span class="badge badge-info">' + items.length + ' 张</span></h6>';
+                    html += '<div class="d-flex flex-wrap" style="gap:10px;">';
+                    items.forEach(d => {{
+                        html += '<div style="position:relative;width:120px;">';
+                        html += '<img src="' + d.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:6px;border:1px solid #ddd;cursor:pointer;" onclick="showDocImage(\'' + d.image_url + '\')">';
+                        html += '<button type="button" class="btn btn-sm btn-danger" style="position:absolute;top:2px;right:2px;padding:0 6px;" onclick="deleteDocument(' + d.id + ')">×</button>';
+                        if (d.remark) html += '<div class="small text-muted text-truncate">' + d.remark + '</div>';
+                        html += '</div>';
+                    }});
+                    html += '</div></div>';
+                }});
+                container.innerHTML = html;
+            }}
+
+            function showDocImage(url) {{
+                document.getElementById('docModalImage').src = url;
+                const modal = new bootstrap.Modal(document.getElementById('docImageModal'));
+                modal.show();
+            }}
+
+            async function deleteDocument(id) {{
+                if (!confirm('确定删除该单据图片？')) return;
+                const res = await fetch('/api/purchase_document/delete/' + id, {{ method: 'DELETE' }});
+                if (res.ok) {{
+                    loadDocuments();
+                }} else {{
+                    alert('删除失败');
+                }}
+            }}
+
+            loadSuppliersForDoc();
+            loadDocuments();
+        </script>
+    "#, today = today);
+    Html(layout_html("采购单据列表", "/query/purchase_document", &content))
 }
 
 async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> {
@@ -11209,7 +11498,7 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
 
     // 分页数据查询
     let data_sql = format!(
-        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
+        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
          FROM product p LEFT JOIN category c ON p.category_id = c.id
          {}
          ORDER BY p.id DESC LIMIT ? OFFSET ?",
@@ -11298,6 +11587,8 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
             "base_unit": row.get::<String, _>("base_unit"),
             "base_price": row.get::<f64, _>("base_price"),
             "purchase_price": row.get::<f64, _>("purchase_price"),
+            "max_purchase_price": row.get::<f64, _>("max_purchase_price"),
+            "min_purchase_price": row.get::<f64, _>("min_purchase_price"),
             "image_url": row.get::<Option<String>, _>("image_url"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "status": row.get::<i64, _>("status"),
@@ -11571,6 +11862,37 @@ async fn api_product_delete(headers: axum::http::HeaderMap, Json(req): Json<serd
     }
 }
 
+// 清理文件名前缀中的非法字符（保留中文、字母、数字、-、_）
+fn sanitize_filename_prefix(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.chars().take(60).collect()
+    }
+}
+
+// 将图片URL转换为服务器文件路径（兼容旧格式 /api/product/image/ 与新格式 /api/uploads/...）
+fn image_url_to_path(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("/api/uploads/") {
+        Some(format!("uploads/{}", rest))
+    } else if let Some(rest) = url.strip_prefix("/api/product/image/") {
+        Some(format!("uploads/{}", rest))
+    } else {
+        None
+    }
+}
+
 async fn api_product_upload_image(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     mut multipart: Multipart,
@@ -11581,7 +11903,17 @@ async fn api_product_upload_image(
     }
     let product_id = product_id.unwrap();
 
-    tokio::fs::create_dir_all("uploads").await.ok();
+    // 获取商品名称作为文件名前缀
+    let product_name: String = sqlx::query_scalar("SELECT name FROM product WHERE id = ?")
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "product".to_string());
+    let name_prefix = sanitize_filename_prefix(&product_name);
+
+    tokio::fs::create_dir_all("uploads/products").await.ok();
 
     let mut file_path = String::new();
     let mut has_file = false;
@@ -11606,8 +11938,8 @@ async fn api_product_upload_image(
 
         let timestamp = chrono::Utc::now().timestamp_millis();
         let random: u32 = rand::random();
-        let new_filename = format!("{}_{}.{}", timestamp, random, ext);
-        let path = format!("uploads/{}", new_filename);
+        let new_filename = format!("{}_{}_{}.{}", name_prefix, timestamp, random, ext);
+        let path = format!("uploads/products/{}", new_filename);
 
         let bytes = field.bytes().await.unwrap_or_default();
         if bytes.len() > 5 * 1024 * 1024 {
@@ -11618,7 +11950,7 @@ async fn api_product_upload_image(
             return (StatusCode::INTERNAL_SERVER_ERROR, "保存图片失败".to_string());
         }
 
-        file_path = format!("/api/product/image/{}", new_filename);
+        file_path = format!("/api/uploads/products/{}", new_filename);
     }
 
     if !has_file {
@@ -11652,9 +11984,7 @@ async fn api_product_delete_image(
     if let Some(row) = row {
         let image_url: Option<String> = row.get("image_url");
         if let Some(url) = image_url {
-            if url.starts_with("/api/product/image/") {
-                let filename = url.replace("/api/product/image/", "");
-                let path = format!("uploads/{}", filename);
+            if let Some(path) = image_url_to_path(&url) {
                 let _ = tokio::fs::remove_file(&path).await;
             }
         }
@@ -11666,6 +11996,298 @@ async fn api_product_delete_image(
         .await;
 
     (StatusCode::OK, "删除成功".to_string())
+}
+
+// 销售订单图片上传：type = customer(客户订单) / signed(已验收签字订单)
+async fn api_sales_order_upload_image(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
+    if order_id.is_none() {
+        return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
+    }
+    let order_id = order_id.unwrap();
+
+    let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
+    let (folder, prefix, column) = match image_type {
+        "customer" => ("customer_orders", "客户订单", "customer_order_image"),
+        "signed" => ("signed_orders", "签字验收单", "signed_order_image"),
+        _ => return (StatusCode::BAD_REQUEST, "无效的图片类型".to_string()),
+    };
+
+    // 获取销售单位（采购方）名称和订单日期作为前缀
+    let row = sqlx::query(
+        "SELECT p.name, so.order_date FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
+    )
+    .bind(order_id)
+    .fetch_optional(pool())
+    .await
+    .unwrap_or(None);
+
+    let (purchaser_name, order_date) = if let Some(r) = row {
+        let name: Option<String> = r.get("name");
+        let date: Option<String> = r.get("order_date");
+        (name.unwrap_or_else(|| "purchaser".to_string()), date.unwrap_or_else(|| "nodate".to_string()))
+    } else {
+        ("purchaser".to_string(), "nodate".to_string())
+    };
+
+    let name_prefix = format!("{}_{}_{}", sanitize_filename_prefix(&purchaser_name), order_date, prefix);
+    let full_folder = format!("uploads/{}", folder);
+    tokio::fs::create_dir_all(full_folder).await.ok();
+
+    let mut file_path = String::new();
+    let mut has_file = false;
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        if field.name() != Some("file") {
+            continue;
+        }
+        has_file = true;
+
+        let filename = field.file_name().unwrap_or_else(|| "unknown.jpg");
+        let ext = std::path::Path::new(filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase();
+
+        if !["jpg", "jpeg", "png", "gif", "webp"].contains(&ext.as_str()) {
+            return (StatusCode::BAD_REQUEST, "不支持的图片格式".to_string());
+        }
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let random: u32 = rand::random();
+        let new_filename = format!("{}_{}_{}.{}", name_prefix, timestamp, random, ext);
+        let path = format!("uploads/{}/{}", folder, new_filename);
+
+        let bytes = field.bytes().await.unwrap_or_default();
+        if bytes.len() > 5 * 1024 * 1024 {
+            return (StatusCode::BAD_REQUEST, "图片大小不能超过5MB".to_string());
+        }
+
+        if tokio::fs::write(&path, bytes).await.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "保存图片失败".to_string());
+        }
+
+        file_path = format!("/api/uploads/{}/{}", folder, new_filename);
+    }
+
+    if !has_file {
+        return (StatusCode::BAD_REQUEST, "请选择要上传的图片".to_string());
+    }
+
+    let update_sql = format!("UPDATE sales_order SET {} = ? WHERE id = ?", column);
+    let _ = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+        .bind(&file_path)
+        .bind(order_id)
+        .execute(pool())
+        .await;
+
+    (StatusCode::OK, serde_json::json!({ "url": file_path }).to_string())
+}
+
+async fn api_sales_order_delete_image(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, String) {
+    let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
+    if order_id.is_none() {
+        return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
+    }
+    let order_id = order_id.unwrap();
+
+    let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
+    let column = match image_type {
+        "customer" => "customer_order_image",
+        "signed" => "signed_order_image",
+        _ => return (StatusCode::BAD_REQUEST, "无效的图片类型".to_string()),
+    };
+
+    let select_sql = format!("SELECT {} as img FROM sales_order WHERE id = ?", column);
+    let row = sqlx::query(AssertSqlSafe(select_sql.as_str()))
+        .bind(order_id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+    if let Some(row) = row {
+        let image_url: Option<String> = row.get("img");
+        if let Some(url) = image_url {
+            if let Some(path) = image_url_to_path(&url) {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+
+    let update_sql = format!("UPDATE sales_order SET {} = NULL WHERE id = ?", column);
+    let _ = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+        .bind(order_id)
+        .execute(pool())
+        .await;
+
+    (StatusCode::OK, "删除成功".to_string())
+}
+
+// 采购单据列表：按供应商+日期查询
+async fn api_purchase_document_list(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let supplier_id = params.get("supplier_id").and_then(|s| s.parse::<i64>().ok());
+    let document_date = params.get("document_date").map(|s| s.as_str()).unwrap_or("");
+
+    let mut sql = "SELECT id, supplier_id, supplier_name, document_date, image_url, remark, create_at FROM purchase_document WHERE 1=1".to_string();
+    let rows = match (supplier_id, document_date.is_empty()) {
+        (Some(sid), false) => {
+            sql.push_str(" AND supplier_id = ? AND document_date = ?");
+            sql.push_str(" ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(sid)
+                .bind(document_date)
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+        (Some(sid), true) => {
+            sql.push_str(" AND supplier_id = ? ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(sid)
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+        (None, false) => {
+            sql.push_str(" AND document_date = ? ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(document_date)
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+        (None, true) => {
+            sql.push_str(" ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+    };
+
+    let result: Vec<serde_json::Value> = rows.iter().map(|row| serde_json::json!({
+        "id": row.get::<i64, _>("id"),
+        "supplier_id": row.get::<i64, _>("supplier_id"),
+        "supplier_name": row.get::<String, _>("supplier_name"),
+        "document_date": row.get::<String, _>("document_date"),
+        "image_url": row.get::<String, _>("image_url"),
+        "remark": row.get::<Option<String>, _>("remark"),
+        "create_at": row.get::<String, _>("create_at"),
+    })).collect();
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResponse {
+    let mut supplier_id: Option<i64> = None;
+    let mut supplier_name: Option<String> = None;
+    let mut document_date: Option<String> = None;
+    let mut remark: Option<String> = None;
+    // 先缓存文件字节与扩展名，待所有字段解析完再按 供应商+日期 前缀写盘
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_ext: String = "jpg".to_string();
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            let filename = field.file_name().unwrap_or_else(|| "unknown.jpg");
+            let ext = std::path::Path::new(filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("jpg")
+                .to_lowercase();
+            if !["jpg", "jpeg", "png", "gif", "webp"].contains(&ext.as_str()) {
+                continue;
+            }
+            let bytes = field.bytes().await.unwrap_or_default();
+            if bytes.len() > 10 * 1024 * 1024 {
+                continue;
+            }
+            file_ext = ext;
+            file_bytes = Some(bytes.to_vec());
+        } else if name == "supplier_id" {
+            if let Ok(v) = field.text().await {
+                supplier_id = v.parse::<i64>().ok();
+            }
+        } else if name == "supplier_name" {
+            supplier_name = field.text().await.ok();
+        } else if name == "document_date" {
+            document_date = field.text().await.ok();
+        } else if name == "remark" {
+            remark = field.text().await.ok();
+        }
+    }
+
+    if supplier_id.is_none() || supplier_name.is_none() || document_date.is_none() || file_bytes.is_none() {
+        return (StatusCode::BAD_REQUEST, "缺少必填参数".to_string());
+    }
+
+    let sname = supplier_name.unwrap();
+    let ddate = document_date.unwrap();
+    let name_prefix = format!("{}_{}", sanitize_filename_prefix(&sname), ddate);
+
+    tokio::fs::create_dir_all("uploads/purchase_documents").await.ok();
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let random: u32 = rand::random();
+    let new_filename = format!("{}_{}_{}.{}", name_prefix, timestamp, random, file_ext);
+    let path = format!("uploads/purchase_documents/{}", new_filename);
+
+    if tokio::fs::write(&path, file_bytes.unwrap()).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "保存图片失败".to_string());
+    }
+    let saved_url = format!("/api/uploads/purchase_documents/{}", new_filename);
+
+    let result = sqlx::query(
+        "INSERT INTO purchase_document(supplier_id, supplier_name, document_date, image_url, remark) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(supplier_id.unwrap())
+    .bind(&sname)
+    .bind(&ddate)
+    .bind(&saved_url)
+    .bind(remark)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(r) => {
+            let id = r.last_insert_rowid();
+            (StatusCode::OK, serde_json::json!({ "id": id, "url": saved_url }).to_string())
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "保存失败".to_string()),
+    }
+}
+
+async fn api_purchase_document_delete(Path(id): Path<i64>) -> impl IntoResponse {
+    let row = sqlx::query("SELECT image_url FROM purchase_document WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+    if let Some(row) = row {
+        let url: String = row.get("image_url");
+        if let Some(path) = image_url_to_path(&url) {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+
+    let result = sqlx::query("DELETE FROM purchase_document WHERE id = ?")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
+    }
 }
 
 async fn api_product_get_image(
@@ -11690,6 +12312,50 @@ async fn api_product_get_image(
                 _ => "image/jpeg",
             };
 
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime_type)],
+                content,
+            )
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "图片不存在".as_bytes().to_vec(),
+        ),
+    }
+}
+
+// 服务分类子目录下的图片：/api/uploads/{folder}/{filename}
+async fn api_get_uploaded_image(
+    Path((folder, filename)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // 仅允许已知子目录，防止路径穿越
+    let allowed = ["products", "customer_orders", "signed_orders", "purchase_documents"];
+    if !allowed.contains(&folder.as_str()) || filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "图片不存在".as_bytes().to_vec(),
+        );
+    }
+    let path = format!("uploads/{}/{}", folder, filename);
+    let file = tokio::fs::read(&path).await;
+
+    match file {
+        Ok(content) => {
+            let ext = std::path::Path::new(&filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("jpg")
+                .to_lowercase();
+            let mime_type = match ext.as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => "image/jpeg",
+            };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, mime_type)],
@@ -12439,6 +13105,60 @@ async fn api_order_generate_no(axum::extract::Query(params): axum::extract::Quer
     (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "order_no": order_no })).unwrap())
 }
 
+// 采购入库后，按商品ID更新当前进价/历史最高进价/历史最低进价
+// unit_price 为该采购明细单位单价，需换算回基础单位单价：base_unit_price = unit_price / ratio
+// 这里 base_quantity/quantity 可近似换算比例，但为稳妥直接用 unit_price 与商品当前记录比较（明细已按下单单位存储）。
+// 规则：当前进价 = 最近一次采购价；最高进价 = 历史最高；最低进价 = 历史最低（新品或价格为0时初始化）。
+async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
+    for item in items {
+        if item.product_id == 0 {
+            continue;
+        }
+        // 换算为基础单位单价
+        let base_unit_price = if let Some(bq) = item.base_quantity {
+            if bq > 0.0 && item.quantity > 0.0 {
+                // amount / base_quantity 得到基础单位单价
+                if item.amount > 0.0 { item.amount / bq } else { item.unit_price }
+            } else {
+                item.unit_price
+            }
+        } else {
+            item.unit_price
+        };
+        if base_unit_price <= 0.0 {
+            continue;
+        }
+
+        // 读取商品当前的最高/最低进价
+        let row = sqlx::query(
+            "SELECT purchase_price, max_purchase_price, min_purchase_price FROM product WHERE id = ?"
+        )
+        .bind(item.product_id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+        if let Some(r) = row {
+            let old_max: f64 = r.get::<f64, _>("max_purchase_price");
+            let old_min: f64 = r.get::<f64, _>("min_purchase_price");
+
+            // 若历史最高/最低为0（新品或首次采购），则以本次价格初始化
+            let new_max = if old_max <= 0.0 { base_unit_price } else { old_max.max(base_unit_price) };
+            let new_min = if old_min <= 0.0 { base_unit_price } else { old_min.min(base_unit_price) };
+
+            let _ = sqlx::query(
+                "UPDATE product SET purchase_price = ?, max_purchase_price = ?, min_purchase_price = ? WHERE id = ?"
+            )
+            .bind(base_unit_price)
+            .bind(new_max)
+            .bind(new_min)
+            .bind(item.product_id)
+            .execute(pool())
+            .await;
+        }
+    }
+}
+
 async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
     let result = sqlx::query(
         "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -12469,7 +13189,7 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                 );
                 
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for item in &req.items {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -12485,6 +13205,8 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
+                // 采购入库后更新商品进价（当前/最高/最低）
+                update_product_purchase_prices(&req.items).await;
             }
             StatusCode::OK
         }
@@ -12696,7 +13418,7 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                 
                 let order_id = req.id;
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for item in &req.items {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -12712,6 +13434,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
+                // 采购单更新后同步商品进价（当前/最高/最低）
+                update_product_purchase_prices(&req.items).await;
             }
             (StatusCode::OK, "更新成功".to_string())
         }
@@ -13017,7 +13741,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     }
 
     let order_row = sqlx::query(
-        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, COALESCE(p.name, '') as purchaser_name
+        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.customer_order_image, so.signed_order_image, COALESCE(p.name, '') as purchaser_name
          FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
     )
     .bind(id)
@@ -13079,6 +13803,8 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
         "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
         "status": row.get::<String, _>("status"),
         "remark": row.get::<Option<String>, _>("remark"),
+        "customer_order_image": row.get::<Option<String>, _>("customer_order_image"),
+        "signed_order_image": row.get::<Option<String>, _>("signed_order_image"),
         "purchaser_name": row.get::<String, _>("purchaser_name"),
         "items": items,
     });
@@ -20081,6 +20807,7 @@ fn build_router() -> Router {
         .route("/sales", get(page_sales))
         .route("/supplement", get(page_supplement))
         .route("/query/purchase_order", get(page_query_purchase_order))
+        .route("/query/purchase_document", get(page_query_purchase_document))
         .route("/query/purchase_price", get(page_query_purchase_price))
         .route("/query/purchase_summary", get(page_query_purchase_summary))
         .route("/query/supplier_balance", get(page_query_supplier_balance))
@@ -20145,6 +20872,7 @@ fn build_router() -> Router {
         .route("/api/product/upload_image", post(api_product_upload_image))
         .route("/api/product/delete_image", get(api_product_delete_image))
         .route("/api/product/image/{filename}", get(api_product_get_image))
+        .route("/api/uploads/{folder}/{filename}", get(api_get_uploaded_image))
         .route("/api/product/unit/create", post(api_product_unit_create))
         .route("/api/product/unit/update", post(api_product_unit_update))
         .route("/api/product/unit/delete", post(api_product_unit_delete))
@@ -20177,6 +20905,8 @@ fn build_router() -> Router {
         .route("/api/sales_order/by_purchaser/{purchaser_id}", get(api_sales_order_by_purchaser))
         .route("/api/sales_order/detail/{id}", get(api_sales_order_detail))
         .route("/api/sales_order/update", post(api_sales_order_update))
+        .route("/api/sales_order/upload_image", post(api_sales_order_upload_image))
+        .route("/api/sales_order/delete_image", post(api_sales_order_delete_image))
         .route("/api/sales_order/delete/{id}", delete(api_sales_order_delete))
         .route("/api/sales_order/export", get(api_sales_order_export))
         .route("/api/sales_order/import", post(api_sales_order_import))
@@ -20213,6 +20943,9 @@ fn build_router() -> Router {
         .route("/api/sales_order/sort_comprehensive", get(api_sales_order_sort_comprehensive))
         .route("/api/sales_order/sort_comprehensive_excel", get(api_sales_order_sort_comprehensive_excel))
         .route("/api/query/purchase_order", get(api_query_purchase_order))
+        .route("/api/purchase_document/list", get(api_purchase_document_list))
+        .route("/api/purchase_document/upload", post(api_purchase_document_upload))
+        .route("/api/purchase_document/delete/{id}", delete(api_purchase_document_delete))
         .route("/api/query/purchase_order/export", get(api_query_purchase_order_export))
         .route("/api/query/purchase_price", get(api_query_purchase_price))
         .route("/api/query/purchase_summary", get(api_query_purchase_summary))
