@@ -17254,18 +17254,22 @@ async fn page_supplement() -> Html<String> {
                 }
 
                 const remaining = allocationSummary.remaining_balance;
-                const threshold = Math.max(allocationSummary.total_amount * 0.05, 5.0);
+                const threshold = 5.0;
 
                 let targetId = null;
                 let autoTail = false;
 
                 if (remaining > threshold) {
-                    alert(`剩余 ${remaining.toFixed(2)} 元未分摊，超过尾差限额（${threshold.toFixed(2)} 元），请继续分摊完成后确认。`);
+                    alert(`剩余 ${remaining.toFixed(2)} 元未分摊，超过尾差限额（±${threshold.toFixed(2)} 元），请继续分摊完成后确认。`);
+                    return;
+                }
+                if (remaining < -threshold) {
+                    alert(`已超额分摊 ${Math.abs(remaining).toFixed(2)} 元，超过尾差限额（±${threshold.toFixed(2)} 元），请回滚部分分摊后再确认。`);
                     return;
                 }
 
-                if (remaining > 0.01) {
-                    const msg = `剩余 ${remaining.toFixed(2)} 元未分摊（限额 ${threshold.toFixed(2)} 元），
+                if (Math.abs(remaining) > 0.01) {
+                    const msg = `尾差 ${remaining.toFixed(2)} 元（限额 ±${threshold.toFixed(2)} 元），
 系统将自动在已选目标订单中创建一笔"分摊尾差"冲销项。是否继续？`;
                     if (!confirm(msg)) return;
                     autoTail = true;
@@ -18264,13 +18268,16 @@ async fn api_allocation_complete(Json(req): Json<serde_json::Value>) -> impl Int
         return (StatusCode::BAD_REQUEST, "分摊方案已终止").into_response();
     }
 
-    let threshold = (total_amount * 0.05).max(5.0);
+    let threshold = 5.0;
 
     if remaining_balance > threshold && !auto_tail {
-        return (StatusCode::BAD_REQUEST, format!("剩余 {:.2} 元未分摊，超过尾差限额（{:.2} 元），请继续分摊或终止方案", remaining_balance, threshold)).into_response();
+        return (StatusCode::BAD_REQUEST, format!("剩余 {:.2} 元未分摊，超过尾差限额（±{:.2} 元），请继续分摊或终止方案", remaining_balance, threshold)).into_response();
+    }
+    if remaining_balance < -threshold && !auto_tail {
+        return (StatusCode::BAD_REQUEST, format!("已超额分摊 {:.2} 元，超过尾差限额（±{:.2} 元），请回滚部分分摊后再确认", remaining_balance.abs(), threshold)).into_response();
     }
 
-    if auto_tail && remaining_balance > 0.0 {
+    if auto_tail && remaining_balance.abs() > 0.0 {
         if let Some(tid) = target_order_id {
             let target_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
                 .bind(tid)
