@@ -87,10 +87,10 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/warehouse" | "/api/warehouse/create" | "/api/warehouse/update" | "/api/warehouse/delete" => Some("admin"),
         "/inventory" => Some("admin"),
         "/purchase" | "/api/purchase_order/create" | "/api/purchase_order/update" | "/api/purchase_order/delete" => Some("supplier"),
-        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" => Some("purchaser"),
-        "/query/purchase_order" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
-        "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" => Some("purchaser"),
-        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" => Some("admin"),
+        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
+        "/query/purchase_order" | "/query/purchase_document" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
+        "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
+        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
         "/system" | "/api/system/config" => Some("super_admin"),
@@ -114,6 +114,8 @@ fn check_api_route_permission(path: &str) -> Option<&str> {
     } else if path.starts_with("/api/warehouse/") {
         Some("admin")
     } else if path.starts_with("/api/purchase_order/") {
+        Some("supplier")
+    } else if path.starts_with("/api/purchase_document/") {
         Some("supplier")
     } else if path.starts_with("/api/sales_order/") {
         Some("purchaser")
@@ -218,9 +220,9 @@ async fn init_pool() {
     
     init_tables(&pool).await.expect("初始化数据表失败");
     
-    // 清理所有孤儿数据
-    let _ = sqlx::query("DELETE FROM sales_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0").execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0").execute(&pool).await;
+    // 清理所有孤儿数据（有商品名称的记录保留，用于客户开单备注场景）
+    let _ = sqlx::query("DELETE FROM sales_order_item WHERE (unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0) AND (product_name IS NULL OR product_name = '')").execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE (unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0) AND (product_name IS NULL OR product_name = '')").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM sales_order_item WHERE order_id NOT IN (SELECT id FROM sales_order)").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM purchase_order_item WHERE order_id NOT IN (SELECT id FROM purchase_order)").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM sales_order_item WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
@@ -302,6 +304,8 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             base_unit TEXT DEFAULT '个',
             base_price REAL DEFAULT 0,
             purchase_price REAL DEFAULT 0,
+            max_purchase_price REAL DEFAULT 0,
+            min_purchase_price REAL DEFAULT 0,
             category_id INTEGER REFERENCES category(id),
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(name, spec)
@@ -336,6 +340,15 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE product ADD COLUMN status INTEGER DEFAULT 1")
+        .execute(pool)
+        .await;
+
+    // 最高进价、最低进价（purchase_price 作为当前进价）
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN max_purchase_price REAL DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN min_purchase_price REAL DEFAULT 0")
         .execute(pool)
         .await;
 
@@ -511,6 +524,8 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             total_amount REAL NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'pending',
             remark TEXT,
+            customer_order_image TEXT,
+            signed_order_image TEXT,
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(purchaser_id) REFERENCES purchaser(id)
         )
@@ -537,6 +552,71 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             remark TEXT,
             FOREIGN KEY(order_id) REFERENCES sales_order(id),
             FOREIGN KEY(product_id) REFERENCES product(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS consumable_allocation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_order_id INTEGER NOT NULL,
+            total_amount REAL NOT NULL,
+            allocated_amount REAL NOT NULL DEFAULT 0,
+            remaining_balance REAL NOT NULL,
+            status INTEGER NOT NULL DEFAULT 0,
+            remark TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            source_item_ids TEXT,
+            FOREIGN KEY(source_order_id) REFERENCES sales_order(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS order_supplement_item (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_order_id INTEGER NOT NULL,
+            source_order_id INTEGER NOT NULL,
+            source_remark TEXT,
+            product_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            alias1 TEXT,
+            alias2 TEXT,
+            spec TEXT,
+            unit TEXT NOT NULL,
+            unit_price REAL NOT NULL,
+            quantity REAL NOT NULL DEFAULT 0,
+            amount REAL NOT NULL DEFAULT 0,
+            allocate_date TEXT NOT NULL,
+            operation_type TEXT NOT NULL DEFAULT 'new_item',
+            target_order_item_id INTEGER,
+            FOREIGN KEY(target_order_id) REFERENCES sales_order(id),
+            FOREIGN KEY(source_order_id) REFERENCES sales_order(id),
+            FOREIGN KEY(product_id) REFERENCES product(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // 采购单据表：按供应商+日期采集多张单据图片
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS purchase_document (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id INTEGER NOT NULL,
+            supplier_name TEXT NOT NULL,
+            document_date TEXT NOT NULL,
+            image_url TEXT NOT NULL,
+            remark TEXT,
+            create_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         "#,
     )
@@ -572,6 +652,15 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN warehouse_name TEXT")
+        .execute(pool)
+        .await;
+
+    // 销售订单图片：客户订单图片，已验收签字图片
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN customer_order_image TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN signed_order_image TEXT")
         .execute(pool)
         .await;
 
@@ -830,6 +919,18 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_order_date ON sales_order(order_date)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_item_order_id ON sales_order_item(order_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_item_product_id ON sales_order_item(product_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_supplement_target_order_id ON order_supplement_item(target_order_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_supplement_source_order_id ON order_supplement_item(source_order_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_consumable_allocation_source ON consumable_allocation(source_order_id)").execute(pool).await;
+    
+    let _ = sqlx::query("ALTER TABLE order_supplement_item ADD COLUMN operation_type TEXT NOT NULL DEFAULT 'new_item'").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE order_supplement_item ADD COLUMN target_order_item_id INTEGER").execute(pool).await;
+    // 分摊细化到明细：新增 source_item_ids 列（存储勾选的来源明细 id，逗号分隔）。
+    // 首次迁移（列新增成功）时清空旧的整单级分摊数据，按新模型重建。
+    if sqlx::query("ALTER TABLE consumable_allocation ADD COLUMN source_item_ids TEXT").execute(pool).await.is_ok() {
+        let _ = sqlx::query("DELETE FROM order_supplement_item").execute(pool).await;
+        let _ = sqlx::query("DELETE FROM consumable_allocation").execute(pool).await;
+    }
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_supplier_id ON purchase_order(supplier_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_order_no ON purchase_order(order_no)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchase_order_item_order_id ON purchase_order_item(order_id)").execute(pool).await;
@@ -992,6 +1093,25 @@ struct SalesOrderItemReq {
 }
 
 #[derive(Deserialize, Serialize)]
+struct OrderSupplementItemReq {
+    target_order_id: i64,
+    source_order_id: i64,
+    source_remark: Option<String>,
+    product_id: i64,
+    product_name: String,
+    alias1: Option<String>,
+    alias2: Option<String>,
+    spec: Option<String>,
+    unit: String,
+    unit_price: f64,
+    quantity: f64,
+    amount: f64,
+    allocate_date: String,
+    operation_type: String,
+    target_order_item_id: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize)]
 struct AcceptReq {
     supplier_id: i64,
     purchaser_id: i64,
@@ -1024,7 +1144,7 @@ fn sidebar_html() -> String {
         <div class="sidebar">
             <div class="sidebar-header">
                 <div class="logo"><span class="logo-icon">🍽️</span></div>
-                <div class="logo-text">进销存管理系统</div>
+                <div class="logo-text">颍上食材配送管理系统</div>
             </div>
             <div class="sidebar-search">
                 <input type="text" id="treeSearch" placeholder="🔍 搜索菜单..." oninput="filterTree()">
@@ -1094,6 +1214,9 @@ fn sidebar_html() -> String {
                         <li class="tree-node leaf" data-path="/sales" data-role="purchaser">
                             <a href="/sales"><span class="node-icon">💰</span><span class="node-label">销售订单</span></a>
                         </li>
+                        <li class="tree-node leaf" data-path="/supplement" data-role="admin">
+                            <a href="/supplement"><span class="node-icon">🔄</span><span class="node-label">耗材分摊管理</span></a>
+                        </li>
                     </ul>
                 </li>
                 <li class="tree-node folder" data-path="query" data-role="query">
@@ -1112,6 +1235,9 @@ fn sidebar_html() -> String {
                             <ul class="tree-children">
                                 <li class="tree-node leaf" data-path="/query/purchase_order">
                                     <a href="/query/purchase_order"><span class="node-icon">📋</span><span class="node-label">采购订单查询</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/purchase_document">
+                                    <a href="/query/purchase_document"><span class="node-icon">🧾</span><span class="node-label">采购单据列表</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/purchase_price">
                                     <a href="/query/purchase_price"><span class="node-icon">💰</span><span class="node-label">采购价格查询</span></a>
@@ -1146,6 +1272,15 @@ fn sidebar_html() -> String {
                                 <li class="tree-node leaf" data-path="/query/product_rank">
                                     <a href="/query/product_rank"><span class="node-icon">🏆</span><span class="node-label">畅销滞销商品</span></a>
                                 </li>
+                                <li class="tree-node leaf" data-path="/query/reimburse_summary">
+                                    <a href="/query/reimburse_summary"><span class="node-icon">🧾</span><span class="node-label">报销口径汇总</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/allocation_source">
+                                    <a href="/query/allocation_source"><span class="node-icon">🔀</span><span class="node-label">分摊来源统计</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/order_adjust">
+                                    <a href="/query/order_adjust"><span class="node-icon">✏️</span><span class="node-label">订单调整与同屏比对</span></a>
+                                </li>
                             </ul>
                         </li>
                         <li class="tree-node folder" data-path="query-stock" data-role="admin">
@@ -1160,6 +1295,9 @@ fn sidebar_html() -> String {
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_flow">
                                     <a href="/query/stock_flow"><span class="node-icon">📋</span><span class="node-label">库存明细台账</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/stock_summary">
+                                    <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">出入库统计</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_warning">
                                     <a href="/query/stock_warning"><span class="node-icon">⚠️</span><span class="node-label">库存上下限预警</span></a>
@@ -1324,6 +1462,8 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         .search-results li .text-muted {{
             color: #999;
         }}
+        .text-right {{ text-align: right !important; }}
+        .form-control-sm.text-right {{ text-align: right; }}
     </style>
 </head>
 <body>
@@ -2681,58 +2821,82 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
     }
 
     let content = format!(r#"
-        <div class="card mb-4">
-            <div class="card-body">
-                <h4>新增商品</h4>
-                <form method="post" onsubmit="createProduct(event)">
-                    <div class="row">
-                        <div class="col-md-2">
-                            <input type="text" name="name" placeholder="商品名称" class="form-control" required>
+        <style>
+            .page-content {{ padding-top: 0 !important; }}
+            .product-sticky-header {{
+                position: sticky;
+                top: 0;
+                z-index: 30;
+                background: #f5f7fa;
+                padding-top: 12px;
+                padding-bottom: 8px;
+            }}
+            .product-sticky-table thead th {{
+                position: sticky;
+                top: var(--product-thead-top, 0px);
+                z-index: 20;
+                background: white;
+                box-shadow: 0 1px 0 rgba(0,0,0,0.1);
+            }}
+            .product-list-section {{ padding-top: 6px; }}
+        </style>
+        <div class="product-sticky-header">
+            <div class="card mb-4" style="margin-bottom:0 !important;">
+                <div class="card-body" style="padding:12px;">
+                    <h4 style="margin-bottom:8px;">新增商品</h4>
+                    <form method="post" onsubmit="createProduct(event)">
+                        <div class="row">
+                            <div class="col-md-2">
+                                <input type="text" name="name" placeholder="商品名称" class="form-control" required>
+                            </div>
+                            <div class="col-md-2">
+                                <input type="text" name="spec" placeholder="规格" class="form-control">
+                            </div>
+                            <div class="col-md-1">
+                                <input type="text" name="unit" placeholder="显示单位" class="form-control">
+                            </div>
+                            <div class="col-md-1">
+                                <input type="text" name="base_unit" placeholder="基础单位" class="form-control">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="number" step="0.01" name="base_price" placeholder="基础单价(售价)" class="form-control">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="number" step="0.01" name="purchase_price" placeholder="进价" class="form-control">
+                            </div>
+                            <div class="col-md-2">
+                                <select name="category_id" class="form-control">{0}</select>
+                            </div>
+                            <div class="col-md-2">
+                                <button type="submit" class="btn btn-primary">新增</button>
+                            </div>
                         </div>
-                        <div class="col-md-2">
-                            <input type="text" name="spec" placeholder="规格" class="form-control">
-                        </div>
-                        <div class="col-md-1">
-                            <input type="text" name="unit" placeholder="显示单位" class="form-control">
-                        </div>
-                        <div class="col-md-1">
-                            <input type="text" name="base_unit" placeholder="基础单位" class="form-control">
-                        </div>
-                        <div class="col-md-2">
-                            <input type="number" step="0.01" name="base_price" placeholder="基础单价(售价)" class="form-control">
-                        </div>
-                        <div class="col-md-2">
-                            <input type="number" step="0.01" name="purchase_price" placeholder="进价" class="form-control">
-                        </div>
-                        <div class="col-md-2">
-                            <select name="category_id" class="form-control">{0}</select>
-                        </div>
-                        <div class="col-md-2">
-                            <button type="submit" class="btn btn-primary">新增</button>
-                        </div>
-                    </div>
-                </form>
+                    </form>
+                </div>
+            </div>
+
+            <div class="d-flex justify-content-between align-items-center" style="padding:10px 0;background:#f5f7fa;">
+                <h5 id="productListTitle" style="margin:0;">全部商品</h5>
+                <div class="d-flex gap-2 align-items-center">
+                    <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
+                    <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
+                    <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
+                    <button class="btn btn-sm btn-warning" onclick="importProducts()">导入</button>
+                    <input type="file" id="productFileInput" style="display:none" accept=".xlsx,.csv" onchange="handleProductFile(this)">
+                </div>
             </div>
         </div>
 
-        <div class="d-flex justify-content-between align-items-center mb-3">
-            <h5 id="productListTitle">全部商品</h5>
-            <div class="d-flex gap-2 align-items-center">
-                <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
-                <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
-                <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
-                <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
-                <button class="btn btn-sm btn-warning" onclick="importProducts()">导入</button>
-                <input type="file" id="productFileInput" style="display:none" accept=".xlsx,.csv" onchange="handleProductFile(this)">
-            </div>
-        </div>
-
-        <table class="table table-bordered">
+        <div class="product-list-section">
+        <table class="table table-bordered product-sticky-table">
             <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th>进价</th><th>多单位</th><th>分类</th><th>状态</th><th style="width:140px">操作</th></tr></thead>
             <tbody id="productTableBody">
                 <tr><td colspan="12" class="text-center text-muted">加载中...</td></tr>
             </tbody>
         </table>
+        <div id="productPagination" class="mt-3"></div>
+        </div>
 
         <!-- 编辑模态框 -->
         <div class="modal fade" id="editProductModal" tabindex="-1">
@@ -2777,12 +2941,22 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <input type="number" step="0.01" name="base_price" class="form-control">
                                 </div>
                                 <div class="col-md-4">
-                                    <label class="form-label">进价（每基础单位）</label>
+                                    <label class="form-label">当前进价（每基础单位，最近采购价）</label>
                                     <input type="number" step="0.01" name="purchase_price" class="form-control">
                                 </div>
+                            </div>
+                            <div class="row mt-3">
                                 <div class="col-md-4">
                                     <label class="form-label">分类</label>
                                     <select name="category_id" class="form-control">{0}</select>
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">历史最高进价（自动）</label>
+                                    <input type="number" step="0.01" name="max_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">历史最低进价（自动）</label>
+                                    <input type="number" step="0.01" name="min_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
                             </div>
 
@@ -2823,7 +2997,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 </div>
                             </div>
                         </form>
-                        
+
                         <div class="mt-4">
                             <div class="d-flex justify-content-between align-items-center">
                                 <h6>商品图片</h6>
@@ -2834,12 +3008,12 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                         <span>暂无图片</span>
                                     </div>
                                     <div id="imageActions" style="display:none;">
-                                        <button class="btn btn-sm btn-danger" onclick="deleteProductImage()">🗑️ 删除图片</button>
+                                        <button type="button" class="btn btn-sm btn-danger" onclick="deleteProductImage()">🗑️ 删除图片</button>
                                     </div>
                                 </div>
                                 <div>
                                     <input type="file" id="productImageInput" accept="image/*" style="display:none" onchange="uploadProductImage()">
-                                    <button class="btn btn-sm btn-outline-primary" onclick="document.getElementById('productImageInput').click()">📷 上传图片</button>
+                                    <button type="button" class="btn btn-sm btn-outline-primary" onclick="document.getElementById('productImageInput').click()">📷 上传图片</button>
                                     <span class="text-muted small ml-2">支持 JPG、PNG、GIF、WebP 格式，最大5MB</span>
                                 </div>
                             </div>
@@ -2895,32 +3069,79 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             let currentCategoryName = '全部商品';
             let currentKeyword = '';
             let allProducts = [];
+            let currentPage = 1;
+            let pageSize = 20;
+            let totalPages = 1;
+            let totalCount = 0;
             let editingProductId = null;
             let pendingProductData = null;
 
-            async function loadProductsByCategory(categoryId) {{
-                currentCategoryId = categoryId;
+            // 动态计算表头 sticky 偏移量（等于置顶表单+工具栏的高度）
+            function updateStickyHeaderOffset() {{
+                const header = document.querySelector('.product-sticky-header');
+                const table = document.querySelector('.product-sticky-table');
+                if (header && table) {{
+                    const h = header.offsetHeight;
+                    table.style.setProperty('--product-thead-top', h + 'px');
+                }}
+            }}
+            window.addEventListener('load', updateStickyHeaderOffset);
+            window.addEventListener('resize', updateStickyHeaderOffset);
+            document.addEventListener('DOMContentLoaded', updateStickyHeaderOffset);
+
+            async function loadProductsByCategory(categoryId, page) {{
+                const categoryChanged = categoryId !== undefined && categoryId !== currentCategoryId;
+                if (categoryChanged) currentCategoryId = categoryId;
+                if (page !== undefined) {{
+                    currentPage = page;
+                }} else if (categoryChanged || (categoryId === null && currentCategoryId !== null)) {{
+                    currentPage = 1;
+                }}
+                if (categoryId === null) currentCategoryId = null;
                 let params = [];
-                if (categoryId) {{ params.push('category_id=' + categoryId); }}
+                if (currentCategoryId) {{ params.push('category_id=' + currentCategoryId); }}
                 if (currentKeyword) {{ params.push('keyword=' + encodeURIComponent(currentKeyword)); }}
-                let url = '/api/product/list';
-                if (params.length > 0) {{ url += '?' + params.join('&'); }}
+                params.push('page=' + currentPage);
+                params.push('page_size=' + pageSize);
+                let url = '/api/product/list?' + params.join('&');
                 try {{
                     const res = await fetch(url);
-                    const products = await res.json();
+                    const result = await res.json();
+                    const products = result.data || result || [];
+                    allProducts = products;
+                    totalCount = result.total || products.length;
+                    totalPages = result.total_pages || 1;
+                    if (result.page) currentPage = result.page;
                     renderProductTable(products);
-                    updateCategoryTitle(categoryId);
-                    setFormCategory(categoryId);
+                    renderProductPagination();
+                    updateCategoryTitle(currentCategoryId);
+                    setFormCategory(currentCategoryId);
                 }} catch(e) {{
                     console.error('加载商品失败:', e);
                 }}
             }}
 
+            function renderProductPagination() {{
+                const container = document.getElementById('productPagination');
+                if (!container) return;
+                if (totalPages <= 1) {{ container.innerHTML = '<p class="text-center text-muted">共 ' + totalCount + ' 条商品</p>'; return; }}
+                let html = '<nav><ul class="pagination justify-content-center">';
+                html += '<li class="page-item ' + (currentPage <= 1 ? 'disabled' : '') + '"><a class="page-link" onclick="loadProductsByCategory(undefined, ' + (currentPage - 1) + ')">上一页</a></li>';
+                const startPage = Math.max(1, currentPage - 2);
+                const endPage = Math.min(totalPages, currentPage + 2);
+                for (let i = startPage; i <= endPage; i++) {{
+                    html += '<li class="page-item ' + (i === currentPage ? 'active' : '') + '"><a class="page-link" onclick="loadProductsByCategory(undefined, ' + i + ')">' + i + '</a></li>';
+                }}
+                html += '<li class="page-item ' + (currentPage >= totalPages ? 'disabled' : '') + '"><a class="page-link" onclick="loadProductsByCategory(undefined, ' + (currentPage + 1) + ')">下一页</a></li>';
+                html += '</ul></nav>';
+                html += '<p class="text-center text-muted mt-2">共 ' + totalCount + ' 条商品，当前第 ' + currentPage + '/' + totalPages + ' 页</p>';
+                container.innerHTML = html;
+            }}
+
             function renderProductTable(products) {{
-                allProducts = products || [];
                 const tbody = document.getElementById('productTableBody');
                 if (!products || products.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无商品数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="12" class="text-center text-muted">暂无商品数据</td></tr>';
                     return;
                 }}
                 let html = '';
@@ -2935,10 +3156,14 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     }} else {{
                         imageHtml = '<div style="width:50px;height:50px;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#ccc;">无图</div>';
                     }}
+                    let nameDisplay = escapeHtml(p.name);
+                    if (p.alias2 && p.alias2.trim() !== '') {{
+                        nameDisplay += '(' + escapeHtml(p.alias2.trim()) + ')';
+                    }}
                     let statusBadge = p.status === 1 ? '<span class="badge bg-success">启用</span>' : '<span class="badge bg-secondary">停用</span>';
                     let toggleBtnClass = p.status === 1 ? 'btn-outline-warning' : 'btn-outline-success';
                     let toggleBtnText = p.status === 1 ? '停用' : '启用';
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + escapeHtml(p.name) + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + '</td>';
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + '</td>';
                     html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
@@ -2946,14 +3171,16 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
             function searchProducts() {{
                 currentKeyword = document.getElementById('searchKeyword').value.trim();
-                loadProductsByCategory(currentCategoryId);
+                currentPage = 1;
+                loadProductsByCategory(currentCategoryId, 1);
             }}
 
             function resetSearch() {{
                 document.getElementById('searchKeyword').value = '';
                 currentKeyword = '';
                 currentCategoryId = null;
-                loadProductsByCategory(null);
+                currentPage = 1;
+                loadProductsByCategory(null, 1);
             }}
 
             function calcSellingPrice() {{
@@ -3004,6 +3231,8 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 form.base_unit.value = p.base_unit || '';
                 form.base_price.value = p.base_price || 0;
                 form.purchase_price.value = p.purchase_price || 0;
+                form.max_purchase_price.value = p.max_purchase_price || 0;
+                form.min_purchase_price.value = p.min_purchase_price || 0;
                 form.category_id.value = p.category_id || '';
                 
                 form.gov_price.value = '';
@@ -3676,7 +3905,12 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
         <h4>采购订单列表</h4>
         <div class="mb-3">
-            <input type="text" id="searchInput" class="form-control" placeholder="搜索订单号、供应商、日期..." oninput="searchOrders()" style="width: 300px; display: inline-block;">
+            <input type="text" id="searchInput" class="form-control" placeholder="搜索订单号、供应商、日期..." oninput="searchOrders()" style="width: 250px; display: inline-block;">
+            <div class="position-relative" style="display: inline-block; width: 200px; vertical-align: top;">
+                <select id="supplierSelect" class="form-control" onchange="searchOrders()">
+                    <option value="">全部供应商</option>
+                </select>
+            </div>
             <button onclick="searchOrders()" class="btn btn-primary ml-2">搜索</button>
             <button onclick="resetSearch()" class="btn btn-secondary ml-2">重置</button>
             <button onclick="cancelOrder()" class="btn btn-warning ml-2">取消</button>
@@ -3721,6 +3955,12 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             async function loadSuppliers() {{
                 const res = await fetch('/api/supplier/list');
                 suppliers = await res.json();
+                const select = document.getElementById('supplierSelect');
+                if (select && suppliers.length > 0) {{
+                    suppliers.forEach(s => {{
+                        select.innerHTML += '<option value="' + s.id + '">' + s.name + '</option>';
+                    }});
+                }}
             }}
             loadSuppliers();
 
@@ -3860,6 +4100,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
             function resetSearch() {{
                 document.getElementById('searchInput').value = '';
+                document.getElementById('supplierSelect').value = '';
                 currentKeyword = '';
                 currentPage = 1;
                 loadOrders();
@@ -3876,6 +4117,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 let url = '/api/purchase_order/list?page=' + currentPage + '&page_size=20';
                 if (currentKeyword) {{
                     url += '&keyword=' + encodeURIComponent(currentKeyword);
+                }}
+                const supplierId = document.getElementById('supplierSelect').value;
+                if (supplierId) {{
+                    url += '&supplier_id=' + supplierId;
                 }}
                 if (sortField) {{
                     url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
@@ -3970,8 +4215,8 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="number" step="0.01" value="${{(item.quantity || 0).toFixed(2)}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
-                            <td><input type="number" step="0.01" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td>${{item.amount.toFixed(2)}}</td>
                             <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
                             <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
@@ -4144,6 +4389,11 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     alert('请选择供应商');
                     return;
                 }}
+                const validItems = items.filter(item => item.product_id > 0 && item.product_name.trim() !== '');
+                if (validItems.length === 0) {{
+                    alert('请添加商品明细');
+                    return;
+                }}
                 const data = {{
                     id: currentOrderId,
                     supplier_id: parseInt(supplierId),
@@ -4155,7 +4405,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
-                    items: items,
+                    items: validItems,
                     remark: document.getElementById('remarkInput').value || null
                 }};
                 const url = currentOrderId ? '/api/purchase_order/update' : '/api/purchase_order/create';
@@ -4356,14 +4606,35 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                 </div>
 
-                <button onclick="saveOrder()" class="btn btn-success mt-3" id="saveBtn">保存销售订单</button>
-                <button onclick="resetForm()" class="btn btn-secondary mt-3 ml-2">新建订单</button>
+                <div class="mt-3 d-flex align-items-center flex-wrap" style="gap:8px;">
+                    <button onclick="saveOrder()" class="btn btn-success" id="saveBtn">保存销售订单</button>
+                    <button onclick="resetForm()" class="btn btn-secondary">新建订单</button>
+
+                    <input type="file" id="customerOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('customer')">
+                    <button type="button" class="btn btn-outline-primary" onclick="document.getElementById('customerOrderImageInput').click()">📷 上传客户订单</button>
+                    <a id="customerOrderImageLink" href="javascript:void(0)" target="_blank" style="display:none;">
+                        <img id="customerOrderImageThumb" src="" style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid #ddd;">
+                    </a>
+                    <button type="button" class="btn btn-sm btn-outline-danger" id="customerOrderImageDeleteBtn" onclick="deleteSalesOrderImage('customer')" style="display:none">删除</button>
+
+                    <input type="file" id="signedOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('signed')">
+                    <button type="button" class="btn btn-outline-primary" onclick="document.getElementById('signedOrderImageInput').click()">📷 上传已验收签字订单</button>
+                    <a id="signedOrderImageLink" href="javascript:void(0)" target="_blank" style="display:none;">
+                        <img id="signedOrderImageThumb" src="" style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid #ddd;">
+                    </a>
+                    <button type="button" class="btn btn-sm btn-outline-danger" id="signedOrderImageDeleteBtn" onclick="deleteSalesOrderImage('signed')" style="display:none">删除</button>
+                </div>
             </div>
         </div>
 
         <h4>销售订单列表</h4>
         <div class="mb-3">
-            <input type="text" id="searchInput" class="form-control" placeholder="搜索订单号、采购单位、日期..." oninput="searchOrders()" style="width: 300px; display: inline-block;">
+            <input type="text" id="searchInput" class="form-control" placeholder="搜索订单号、采购单位、日期..." oninput="searchOrders()" style="width: 250px; display: inline-block;">
+            <div class="position-relative" style="display: inline-block; width: 200px; vertical-align: top;">
+                <select id="purchaserSelect" class="form-control" onchange="searchOrders()">
+                    <option value="">全部采购单位</option>
+                </select>
+            </div>
             <button onclick="searchOrders()" class="btn btn-primary ml-2">搜索</button>
             <button onclick="resetSearch()" class="btn btn-secondary ml-2">重置</button>
             <button onclick="cancelOrder()" class="btn btn-warning ml-2">取消</button>
@@ -4523,8 +4794,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="number" step="0.01" value="${{(item.quantity || 0).toFixed(2)}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm" enterkeyhint="next"></td>
-                            <td><input type="number" step="0.01" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td>${{item.amount.toFixed(2)}}</td>
                             <td>
                                 <div class="position-relative">
@@ -4831,7 +5102,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     alert('请选择采购单位');
                     return;
                 }}
-                if (items.length === 0) {{
+                const validItems = items.filter(item => item.product_id > 0 && item.product_name.trim() !== '');
+                if (validItems.length === 0) {{
                     alert('请添加商品明细');
                     return;
                 }}
@@ -4846,7 +5118,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
-                    items: items,
+                    items: validItems,
                     remark: document.getElementById('remarkInput').value || null
                 }};
                 const isNew = !currentOrderId;
@@ -4869,11 +5141,66 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
+            async function uploadSalesOrderImage(imageType) {{
+                if (!currentOrderId) {{
+                    alert('请先保存销售订单后再上传图片');
+                    return;
+                }}
+                const inputId = imageType === 'customer' ? 'customerOrderImageInput' : 'signedOrderImageInput';
+                const input = document.getElementById(inputId);
+                if (!input.files || input.files.length === 0) return;
+                const formData = new FormData();
+                formData.append('file', input.files[0]);
+                const res = await fetch('/api/sales_order/upload_image?order_id=' + currentOrderId + '&type=' + imageType, {{
+                    method: 'POST',
+                    body: formData
+                }});
+                if (res.ok) {{
+                    const result = await res.json();
+                    setSalesOrderImage(imageType, result.url);
+                }} else {{
+                    const text = await res.text();
+                    alert('图片上传失败：' + text);
+                }}
+                input.value = '';
+            }}
+
+            async function deleteSalesOrderImage(imageType) {{
+                if (!currentOrderId) return;
+                if (!confirm('确定删除该图片？')) return;
+                const res = await fetch('/api/sales_order/delete_image?order_id=' + currentOrderId + '&type=' + imageType, {{
+                    method: 'POST'
+                }});
+                if (res.ok) {{
+                    setSalesOrderImage(imageType, null);
+                }} else {{
+                    alert('删除失败');
+                }}
+            }}
+
+            function setSalesOrderImage(imageType, url) {{
+                const prefix = imageType === 'customer' ? 'customerOrderImage' : 'signedOrderImage';
+                const link = document.getElementById(prefix + 'Link');
+                const thumb = document.getElementById(prefix + 'Thumb');
+                const delBtn = document.getElementById(prefix + 'DeleteBtn');
+                if (url) {{
+                    link.href = url;
+                    thumb.src = url;
+                    link.style.display = 'inline-block';
+                    delBtn.style.display = 'inline-block';
+                }} else {{
+                    link.href = '#';
+                    thumb.src = '';
+                    link.style.display = 'none';
+                    delBtn.style.display = 'none';
+                }}
+            }}
             let currentPage = 1;
             let currentKeyword = '';
 
             function resetSearch() {{
                 document.getElementById('searchInput').value = '';
+                document.getElementById('purchaserSelect').value = '';
                 currentKeyword = '';
                 currentPage = 1;
                 loadOrders();
@@ -4890,6 +5217,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 let url = '/api/sales_order/list?page=' + currentPage + '&page_size=20';
                 if (currentKeyword) {{
                     url += '&keyword=' + encodeURIComponent(currentKeyword);
+                }}
+                const purchaserId = document.getElementById('purchaserSelect').value;
+                if (purchaserId) {{
+                    url += '&purchaser_id=' + purchaserId;
                 }}
                 if (sortField) {{
                     url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
@@ -4981,6 +5312,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('remarkInput').value = order.remark || '';
                 document.getElementById('discountRateInput').value = order.discount_rate || 0;
                 document.getElementById('amountReductionInput').value = order.amount_reduction || 0;
+                setSalesOrderImage('customer', order.customer_order_image || null);
+                setSalesOrderImage('signed', order.signed_order_image || null);
                 
                 items = [];
                 for (const item of order.items) {{
@@ -5109,6 +5442,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderDateInput').value = '';
                 document.getElementById('remarkInput').value = '';
                 document.getElementById('discountRateInput').value = '20';
+                setSalesOrderImage('customer', null);
+                setSalesOrderImage('signed', null);
                 items = [];
                 renderItems();
                 generateOrderNo('sales');
@@ -5121,6 +5456,12 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             async function loadPurchasers() {{
                 const res = await fetch('/api/purchaser/list');
                 purchasers = await res.json();
+                const select = document.getElementById('purchaserSelect');
+                if (select && purchasers.length > 0) {{
+                    purchasers.forEach(p => {{
+                        select.innerHTML += '<option value="' + p.id + '">' + p.name + '</option>';
+                    }});
+                }}
             }}
         </script>
     "#, now);
@@ -5307,6 +5648,165 @@ async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<Strin
     Html(layout_html("采购订单查询", "/query/purchase_order", &content))
 }
 
+async fn page_query_purchase_document(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/purchase_document").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let content = format!(r#"
+        <div class="card p-4">
+            <h3>采购单据列表</h3>
+            <p class="text-muted small">按供应商、日期采集采购单据图片。支持手机连续拍照/多选上传，图片按供应商+日期分组归档。</p>
+            <div class="row">
+                <div class="col-md-4">
+                    <label class="form-label">供应商</label>
+                    <select id="docSupplier" class="form-control">
+                        <option value="">请选择供应商</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">单据日期</label>
+                    <input type="date" id="docDate" class="form-control" value="{today}">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">备注（可选）</label>
+                    <input type="text" id="docRemark" class="form-control" placeholder="如：验收单/送货单">
+                </div>
+                <div class="col-md-2 d-flex align-items-end">
+                    <button class="btn btn-primary" onclick="loadDocuments()">查询</button>
+                </div>
+            </div>
+            <div class="mt-3">
+                <input type="file" id="docFileInput" accept="image/*" capture="environment" multiple style="display:none" onchange="uploadDocuments()">
+                <button type="button" class="btn btn-success" onclick="startCapture()">📷 连续采集单据（拍照/多选）</button>
+                <span id="uploadStatus" class="text-muted small ml-2"></span>
+            </div>
+        </div>
+
+        <div class="card p-3 mt-3">
+            <div id="docGroups"></div>
+        </div>
+
+        <div class="modal fade" id="docImageModal" tabindex="-1">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-body text-center p-0">
+                        <img id="docModalImage" src="" style="max-width:100%;max-height:85vh;">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            async function loadSuppliersForDoc() {{
+                const res = await fetch('/api/supplier/list');
+                const suppliers = await res.json();
+                const sel = document.getElementById('docSupplier');
+                suppliers.forEach(s => {{
+                    sel.innerHTML += '<option value="' + s.id + '">' + s.name + '</option>';
+                }});
+            }}
+
+            function startCapture() {{
+                const sid = document.getElementById('docSupplier').value;
+                const date = document.getElementById('docDate').value;
+                if (!sid) {{ alert('请先选择供应商'); return; }}
+                if (!date) {{ alert('请先选择单据日期'); return; }}
+                document.getElementById('docFileInput').click();
+            }}
+
+            async function uploadDocuments() {{
+                const input = document.getElementById('docFileInput');
+                if (!input.files || input.files.length === 0) return;
+                const sel = document.getElementById('docSupplier');
+                const sid = sel.value;
+                const sname = sel.options[sel.selectedIndex].text;
+                const date = document.getElementById('docDate').value;
+                const remark = document.getElementById('docRemark').value || '';
+                const statusEl = document.getElementById('uploadStatus');
+
+                const files = Array.from(input.files);
+                let done = 0;
+                for (const file of files) {{
+                    statusEl.textContent = '正在上传 ' + (done + 1) + '/' + files.length + ' ...';
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('supplier_id', sid);
+                    formData.append('supplier_name', sname);
+                    formData.append('document_date', date);
+                    formData.append('remark', remark);
+                    try {{
+                        const res = await fetch('/api/purchase_document/upload', {{ method: 'POST', body: formData }});
+                        if (res.ok) done++;
+                    }} catch (e) {{}}
+                }}
+                statusEl.textContent = '本次上传完成：' + done + '/' + files.length + ' 张';
+                input.value = '';
+                loadDocuments();
+            }}
+
+            async function loadDocuments() {{
+                const sid = document.getElementById('docSupplier').value;
+                const date = document.getElementById('docDate').value;
+                let url = '/api/purchase_document/list?';
+                if (sid) url += 'supplier_id=' + sid + '&';
+                if (date) url += 'document_date=' + date;
+                const res = await fetch(url);
+                const docs = await res.json();
+                const container = document.getElementById('docGroups');
+                if (!docs || docs.length === 0) {{
+                    container.innerHTML = '<p class="text-center text-muted">暂无单据</p>';
+                    return;
+                }}
+                // 按 供应商+日期 分组
+                const groups = {{}};
+                docs.forEach(d => {{
+                    const key = d.supplier_name + ' | ' + d.document_date;
+                    if (!groups[key]) groups[key] = [];
+                    groups[key].push(d);
+                }});
+                let html = '';
+                Object.keys(groups).forEach(key => {{
+                    const items = groups[key];
+                    html += '<div class="mb-4">';
+                    html += '<h6 class="border-bottom pb-1">' + key + ' <span class="badge badge-info">' + items.length + ' 张</span></h6>';
+                    html += '<div class="d-flex flex-wrap" style="gap:10px;">';
+                    items.forEach(d => {{
+                        html += '<div style="position:relative;width:120px;">';
+                        html += '<img src="' + d.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:6px;border:1px solid #ddd;cursor:pointer;" onclick="showDocImage(\'' + d.image_url + '\')">';
+                        html += '<button type="button" class="btn btn-sm btn-danger" style="position:absolute;top:2px;right:2px;padding:0 6px;" onclick="deleteDocument(' + d.id + ')">×</button>';
+                        if (d.remark) html += '<div class="small text-muted text-truncate">' + d.remark + '</div>';
+                        html += '</div>';
+                    }});
+                    html += '</div></div>';
+                }});
+                container.innerHTML = html;
+            }}
+
+            function showDocImage(url) {{
+                document.getElementById('docModalImage').src = url;
+                const modal = new bootstrap.Modal(document.getElementById('docImageModal'));
+                modal.show();
+            }}
+
+            async function deleteDocument(id) {{
+                if (!confirm('确定删除该单据图片？')) return;
+                const res = await fetch('/api/purchase_document/delete/' + id, {{ method: 'DELETE' }});
+                if (res.ok) {{
+                    loadDocuments();
+                }} else {{
+                    alert('删除失败');
+                }}
+            }}
+
+            loadSuppliersForDoc();
+            loadDocuments();
+        </script>
+    "#, today = today);
+    Html(layout_html("采购单据列表", "/query/purchase_document", &content))
+}
+
 async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> {
     match check_page_permission(&headers, "/query/sales_order").await {
         Err(e) => return e,
@@ -5346,7 +5846,7 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>订单号</th><th>采购单位</th><th>日期</th><th>金额</th><th>下浮后</th><th>状态</th><th>操作</th></tr></thead>
+                <thead><tr><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">采购单位<span id="sortIndicator_unit_name"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('total_amount')" style="cursor:pointer">金额<span id="sortIndicator_total_amount"></span></th><th>下浮后</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
             <div id="pagination" class="mt-3"></div>
@@ -5389,6 +5889,30 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
         </div>
         <script>
             let currentPage = 1;
+            let sortField = '';
+            let sortOrder = 'desc';
+
+            function sortOrders(field) {
+                if (sortField === field) {
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortField = field;
+                    sortOrder = 'asc';
+                }
+                updateSortIndicators();
+                loadData();
+            }
+
+            function updateSortIndicators() {
+                const fields = ['order_no', 'unit_name', 'order_date', 'total_amount', 'status'];
+                fields.forEach(f => {
+                    const el = document.getElementById('sortIndicator_' + f);
+                    if (el) {
+                        el.textContent = (sortField === f) ? (sortOrder === 'asc' ? ' ▲' : ' ▼') : '';
+                    }
+                });
+            }
+
             async function loadPurchasers() {
                 const res = await fetch('/api/purchaser/list');
                 const purchasers = await res.json();
@@ -5403,11 +5927,14 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
             }
             async function loadData(page) {
                 if (page !== undefined) currentPage = page;
-                const url = '/api/query/sales_order?purchaser_id=' + document.getElementById('purchaserId').value + 
-                    '&start_date=' + document.getElementById('startDate').value + 
-                    '&end_date=' + document.getElementById('endDate').value + 
+                let url = '/api/query/sales_order?purchaser_id=' + document.getElementById('purchaserId').value +
+                    '&start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value +
                     '&status=' + document.getElementById('status').value +
                     '&page=' + currentPage + '&page_size=20';
+                if (sortField) {
+                    url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
+                }
                 const res = await fetch(url);
                 const result = await res.json();
                 const data = result.data || [];
@@ -6110,6 +6637,726 @@ async fn page_query_product_rank(headers: axum::http::HeaderMap) -> Html<String>
     Html(layout_html("畅销滞销商品查询", "/query/product_rank", &content))
 }
 
+async fn page_query_reimburse_summary(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/reimburse_summary").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>报销口径汇总</h3>
+            <p class="text-muted small">口径说明：仅统计分摊后的目标单（真实明细 + 分摊增项净影响），耗材来源单已作为分摊来源单独统计、不计入此处，确保金额不重计。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+            </div>
+            <button onclick="searchReimburse()" class="btn btn-primary">查询</button>
+        </div>
+        <div class="card p-4 mt-4">
+            <h4>按采购单位汇总（报销口径）</h4>
+            <table class="table table-bordered">
+                <thead><tr><th>采购单位</th><th>真实金额</th><th>分摊增项净额</th><th>报销金额</th></tr></thead>
+                <tbody id="purchaserSummary"></tbody>
+            </table>
+        </div>
+        <div class="card p-4 mt-4">
+            <h4>按商品汇总（报销口径）</h4>
+            <table class="table table-bordered">
+                <thead><tr><th>商品名称</th><th>规格</th><th>数量</th><th>报销金额</th></tr></thead>
+                <tbody id="productSummary"></tbody>
+            </table>
+        </div>
+        <script>
+            async function searchReimburse() {
+                const url = '/api/query/reimburse_summary?start_date=' + document.getElementById('startDate').value + '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+
+                let ph = '';
+                if (data.by_purchaser.length === 0) {
+                    ph = '<tr><td colspan="4" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let tReal = 0, tSupp = 0, tReim = 0;
+                    data.by_purchaser.forEach(item => {
+                        tReal += item.real_amount;
+                        tSupp += item.supplement_amount;
+                        tReim += item.reimburse_amount;
+                        ph += '<tr><td>' + item.name + '</td><td>¥' + item.real_amount.toFixed(2) + '</td><td>¥' + item.supplement_amount.toFixed(2) + '</td><td><strong>¥' + item.reimburse_amount.toFixed(2) + '</strong></td></tr>';
+                    });
+                    ph += '<tr class="table-active fw-bold"><td>合计</td><td>¥' + tReal.toFixed(2) + '</td><td>¥' + tSupp.toFixed(2) + '</td><td>¥' + tReim.toFixed(2) + '</td></tr>';
+                }
+                document.getElementById('purchaserSummary').innerHTML = ph;
+
+                let pd = '';
+                if (data.by_product.length === 0) {
+                    pd = '<tr><td colspan="4" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let tQty = 0, tAmt = 0;
+                    data.by_product.forEach(item => {
+                        tQty += item.quantity;
+                        tAmt += item.reimburse_amount;
+                        pd += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '-') + '</td><td>' + item.quantity.toFixed(2) + '</td><td>¥' + item.reimburse_amount.toFixed(2) + '</td></tr>';
+                    });
+                    pd += '<tr class="table-active fw-bold"><td colspan="2">合计</td><td>' + tQty.toFixed(2) + '</td><td>¥' + tAmt.toFixed(2) + '</td></tr>';
+                }
+                document.getElementById('productSummary').innerHTML = pd;
+            }
+            searchReimburse();
+        </script>
+    "#;
+    Html(layout_html("报销口径汇总", "/query/reimburse_summary", &content))
+}
+
+async fn page_query_allocation_source(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/allocation_source").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>分摊来源统计</h3>
+            <p class="text-muted small">统计所有作为分摊来源的订单（如耗材单），显示其金额、已分摊金额、剩余、状态及分摊去向，供来源侧单独核账。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+            </div>
+            <button onclick="searchAllocationSource()" class="btn btn-primary">查询</button>
+        </div>
+        <div class="card p-4 mt-4">
+            <h4>分摊来源单汇总</h4>
+            <table class="table table-bordered">
+                <thead><tr><th>来源订单</th><th>日期</th><th>来源金额</th><th>已分摊</th><th>剩余</th><th>状态</th><th>分摊去向</th></tr></thead>
+                <tbody id="sourceTable"></tbody>
+            </table>
+        </div>
+        <script>
+            const statusMap = { 0: '未分摊', 1: '分摊中', 2: '已完成', 3: '已终止' };
+            async function searchAllocationSource() {
+                const url = '/api/query/allocation_source?start_date=' + document.getElementById('startDate').value + '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('sourceTable');
+                if (data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">暂无数据</td></tr>';
+                    return;
+                }
+                let html = '';
+                let tTotal = 0, tAlloc = 0, tRemain = 0;
+                data.forEach(item => {
+                    tTotal += item.total_amount;
+                    tAlloc += item.allocated_amount;
+                    tRemain += item.remaining_balance;
+                    const targets = (item.targets || []).map(t => t.order_no + '(¥' + t.amount.toFixed(2) + ')').join('、') || '-';
+                    html += '<tr><td>' + item.order_no + '</td><td>' + item.order_date + '</td><td>¥' + item.total_amount.toFixed(2) + '</td><td>¥' + item.allocated_amount.toFixed(2) + '</td><td>¥' + item.remaining_balance.toFixed(2) + '</td><td>' + (statusMap[item.status] || '未知') + '</td><td class="small">' + targets + '</td></tr>';
+                });
+                html += '<tr class="table-active fw-bold"><td colspan="2">合计</td><td>¥' + tTotal.toFixed(2) + '</td><td>¥' + tAlloc.toFixed(2) + '</td><td>¥' + tRemain.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                tbody.innerHTML = html;
+            }
+            searchAllocationSource();
+        </script>
+    "#;
+    Html(layout_html("分摊来源统计", "/query/allocation_source", &content))
+}
+
+async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/order_adjust").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r####"
+        <div class="card p-4">
+            <h3>订单调整与同屏比对</h3>
+            <p class="text-muted small">在真实订单基础上虚增商品明细或变更数量，调整内容独立记录、可回滚。真实订单始终保留做底根，同屏比对差异。报销口径统一采用调整后订单。</p>
+            <div class="row mb-2">
+                <div class="col-md-4">
+                    <label>订单号搜索：</label>
+                    <div class="position-relative">
+                        <input type="text" id="orderInput" class="form-control" placeholder="输入订单号搜索" autocomplete="off">
+                        <div id="orderDropdown" class="search-dropdown" style="display:none;position:absolute;z-index:1000;background:#fff;border:1px solid #ddd;width:100%;max-height:260px;overflow-y:auto;"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="mt-3">
+                <div class="d-flex justify-content-between align-items-center mb-1">
+                    <h6 class="mb-0">有变更的订单列表 <span class="badge badge-info" id="adjustedOrdersCount">0</span></h6>
+                    <button class="btn btn-xs btn-outline-secondary" onclick="loadAdjustedOrders()">刷新</button>
+                </div>
+                <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
+                    <table class="table table-sm table-bordered mb-0" id="adjustedOrdersTable">
+                        <thead class="thead-light"><tr>
+                            <th>订单号</th><th>采购单位</th><th>订单日期</th>
+                            <th>真实金额</th><th>调整金额</th><th>调整后金额</th>
+                            <th>调整条数</th><th>最近调整日</th><th>操作</th>
+                        </tr></thead>
+                        <tbody><tr><td colspan="9" class="text-center text-muted small">暂无</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="adjustArea" style="display:none;">
+            <div class="card p-3 mt-3">
+                <h5 id="adjustOrderTitle"></h5>
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="card border-secondary">
+                            <div class="card-header bg-secondary text-white py-1"><small><strong>真实订单（底根）</strong> - ¥<span id="realTotalLabel">0.00</span></small></div>
+                            <div class="card-body p-1" style="max-height:340px;overflow-y:auto;">
+                                <table class="table table-sm table-bordered mb-0" id="realTable">
+                                    <thead class="thead-light"><tr><th>商品</th><th>数量</th><th>金额</th></tr></thead>
+                                    <tbody></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card border-success">
+                            <div class="card-header bg-success text-white py-1"><small><strong>调整后订单（报销口径）</strong> - ¥<span id="adjTotalLabel">0.00</span> <span class="badge badge-warning ml-1">差异 <span id="diffLabel">0.00</span></span></small></div>
+                            <div class="card-body p-1" style="max-height:340px;overflow-y:auto;">
+                                <table class="table table-sm table-bordered mb-0" id="adjTable">
+                                    <thead class="thead-light"><tr><th>商品</th><th>数量</th><th>金额</th></tr></thead>
+                                    <tbody></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card p-3 mt-3">
+                <h6>调整操作</h6>
+                <div class="row mb-2">
+                    <div class="col-md-12">
+                        <label class="radio-inline mr-4"><input type="radio" name="adjType" value="new_item" checked onchange="toggleAdjType()"> 虚增商品明细</label>
+                        <label class="radio-inline mr-4"><input type="radio" name="adjType" value="increase_quantity" onchange="toggleAdjType()"> 变更已有商品数量</label>
+                        <label class="radio-inline"><input type="radio" name="adjType" value="replace" onchange="toggleAdjType()"> 替换明细</label>
+                    </div>
+                </div>
+                <div class="row mb-2 align-items-end" id="adjNewSection">
+                    <div class="col-md-4">
+                        <label>选择商品</label>
+                        <div class="position-relative">
+                            <input type="text" id="adjProductInput" class="form-control form-control-sm" placeholder="点击选择商品" readonly>
+                            <div id="adjProductDropdown" class="search-dropdown" style="display:none;position:absolute;z-index:1000;background:#fff;border:1px solid #ddd;width:100%;max-height:220px;overflow-y:auto;"></div>
+                        </div>
+                    </div>
+                    <div class="col-md-2"><label>数量</label><input type="number" step="0.01" id="adjNewQty" class="form-control form-control-sm" oninput="calcAdjNew()"></div>
+                    <div class="col-md-2"><label>单价</label><input type="number" step="0.01" id="adjNewPrice" class="form-control form-control-sm" oninput="calcAdjNew()"></div>
+                    <div class="col-md-2"><label>金额</label><input type="number" step="0.01" id="adjNewAmount" class="form-control form-control-sm" readonly></div>
+                </div>
+                <div class="row mb-2 align-items-end" id="adjIncSection" style="display:none;">
+                    <div class="col-md-4">
+                        <label>选择目标商品</label>
+                        <select id="adjIncSelect" class="form-control form-control-sm"></select>
+                    </div>
+                    <div class="col-md-2"><label>追加数量</label><input type="number" step="0.01" id="adjIncQty" class="form-control form-control-sm" oninput="calcAdjInc()"></div>
+                    <div class="col-md-2"><label>单价</label><input type="text" id="adjIncPrice" class="form-control form-control-sm" readonly></div>
+                    <div class="col-md-2"><label>追加金额</label><input type="text" id="adjIncAmount" class="form-control form-control-sm" readonly></div>
+                    <div class="col-md-2"><span class="text-muted small" id="adjIncHint">合计数量: 0</span></div>
+                </div>
+                <div id="adjReplaceSection" style="display:none;">
+                    <div class="row mb-2 align-items-end">
+                        <div class="col-md-4">
+                            <label>被替换的原明细</label>
+                            <select id="adjReplaceSourceSelect" class="form-control form-control-sm" onchange="updateAdjReplaceDiff()"></select>
+                        </div>
+                    </div>
+                    <div class="row mb-2 align-items-end">
+                        <div class="col-md-4">
+                            <label>替换商品</label>
+                            <div class="position-relative">
+                                <input type="text" id="adjReplaceProductInput" class="form-control form-control-sm" placeholder="点击选择替换商品" readonly>
+                                <div id="adjReplaceProductDropdown" class="search-dropdown" style="display:none;position:absolute;z-index:1000;background:#fff;border:1px solid #ddd;width:100%;max-height:220px;overflow-y:auto;"></div>
+                            </div>
+                        </div>
+                        <div class="col-md-2"><label>数量</label><input type="number" step="0.01" id="adjReplaceQty" class="form-control form-control-sm" oninput="calcAdjReplaceLine()"></div>
+                        <div class="col-md-2"><label>单价</label><input type="number" step="0.01" id="adjReplacePrice" class="form-control form-control-sm" oninput="calcAdjReplaceLine()"></div>
+                        <div class="col-md-2"><label>金额</label><input type="number" step="0.01" id="adjReplaceAmount" class="form-control form-control-sm" readonly></div>
+                        <div class="col-md-2"><label>&nbsp;</label><br><button class="btn btn-sm btn-outline-primary" onclick="addAdjReplaceLine()">加行</button></div>
+                    </div>
+                    <table class="table table-sm table-bordered" id="adjReplaceLineList">
+                        <thead><tr><th>替换商品</th><th>数量</th><th>单价</th><th>金额</th><th>操作</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                    <div>替换合计: <span id="adjReplaceLinesTotal">0.00</span> 元　<span id="adjReplaceDiffHint" class="small"></span></div>
+                </div>
+                <div class="row">
+                    <div class="col-md-2"><label>调整日期</label><input type="date" id="adjDate" class="form-control form-control-sm"></div>
+                    <div class="col-md-10"><label>&nbsp;</label><br><button class="btn btn-sm btn-primary" onclick="addAdjustment()">保存调整</button></div>
+                </div>
+                <h6 class="mt-3">本单调整记录（可回滚）</h6>
+                <table class="table table-sm table-bordered" id="adjRecordList">
+                    <thead><tr><th>类型</th><th>商品</th><th>数量</th><th>金额</th><th>日期</th><th>操作</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+        <script>
+            let adjOrder = null;
+            let adjRealItems = [];
+            let adjSelectedProduct = null;
+            let adjReplaceLines = [];
+            let adjSelectedReplaceProduct = null;
+
+            (function initOrderSearch() {
+                const input = document.getElementById('orderInput');
+                const dropdown = document.getElementById('orderDropdown');
+                input.addEventListener('input', async function() {
+                    const kw = this.value.trim();
+                    const res = await fetch('/api/sales_order/list?keyword=' + encodeURIComponent(kw) + '&page=1&page_size=20');
+                    const data = await res.json();
+                    const orders = data.items || data.data || [];
+                    dropdown.innerHTML = '';
+                    orders.forEach(o => {
+                        const li = document.createElement('div');
+                        li.className = 'search-item';
+                        li.style.padding = '6px 10px';
+                        li.style.cursor = 'pointer';
+                        li.textContent = o.order_no + ' | ' + (o.purchaser_name || '') + ' | ' + o.order_date + ' | ¥' + (o.final_amount || o.total_amount || 0).toFixed(2);
+                        li.onmousedown = () => selectAdjOrder(o);
+                        dropdown.appendChild(li);
+                    });
+                    dropdown.style.display = orders.length > 0 ? 'block' : 'none';
+                });
+                input.addEventListener('blur', function() { setTimeout(() => { dropdown.style.display = 'none'; }, 200); });
+            })();
+
+            async function selectAdjOrder(o) {
+                adjOrder = o;
+                document.getElementById('orderInput').value = o.order_no;
+                document.getElementById('orderDropdown').style.display = 'none';
+                document.getElementById('adjustArea').style.display = 'block';
+                document.getElementById('adjustOrderTitle').textContent = o.order_no + '（' + (o.purchaser_name || '') + '）';
+                document.getElementById('adjDate').value = new Date().toISOString().slice(0, 10);
+                const res = await fetch('/api/sales_order/detail/' + o.id);
+                const data = await res.json();
+                adjRealItems = data.items || [];
+                adjReplaceLines = [];
+                adjSelectedReplaceProduct = null;
+                initAdjIncSelect();
+                initAdjReplaceSelect();
+                initAdjProductSearch();
+                initAdjReplaceProductSearch();
+                renderAdjReplaceLines();
+                await loadCompare();
+                await loadAdjRecords();
+            }
+
+            async function loadCompare() {
+                const res = await fetch('/api/supplement/compare/' + adjOrder.id);
+                const data = await res.json();
+                document.getElementById('realTotalLabel').textContent = data.real_total.toFixed(2);
+                document.getElementById('adjTotalLabel').textContent = data.allocation_total.toFixed(2);
+                document.getElementById('diffLabel').textContent = (data.allocation_total - data.real_total).toFixed(2);
+                const realTbody = document.querySelector('#realTable tbody');
+                const adjTbody = document.querySelector('#adjTable tbody');
+                realTbody.innerHTML = '';
+                adjTbody.innerHTML = '';
+                data.items.forEach(item => {
+                    const name = item.display_name || item.product_name;
+                    const rr = document.createElement('tr');
+                    const ar = document.createElement('tr');
+                    if (item.is_new) {
+                        rr.innerHTML = '<td colspan="3" class="text-center text-muted small">—</td>';
+                        ar.style.backgroundColor = '#fff3cd';
+                        ar.innerHTML = '<td><strong>[虚增]</strong> ' + name + '</td><td>' + item.total_quantity.toFixed(2) + '</td><td>' + item.total_amount.toFixed(2) + '</td>';
+                    } else if (item.is_replaced) {
+                        rr.innerHTML = '<td>' + name + '</td><td>' + item.quantity.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td>';
+                        ar.style.backgroundColor = '#f8d7da';
+                        ar.innerHTML = '<td><del>' + name + '</del> <span class="badge badge-danger">已替换</span></td><td>' + item.total_quantity.toFixed(2) + '</td><td>' + item.total_amount.toFixed(2) + '</td>';
+                    } else if (item.is_increase) {
+                        rr.innerHTML = '<td>' + name + '</td><td>' + item.quantity.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td>';
+                        ar.style.backgroundColor = '#d4edda';
+                        ar.innerHTML = '<td>' + name + ' <span class="badge badge-success">+' + item.supplement_quantity.toFixed(2) + '</span></td><td>' + item.total_quantity.toFixed(2) + '</td><td>' + item.total_amount.toFixed(2) + '</td>';
+                    } else {
+                        rr.innerHTML = '<td>' + name + '</td><td>' + item.quantity.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td>';
+                        ar.innerHTML = '<td>' + name + '</td><td>' + item.total_quantity.toFixed(2) + '</td><td>' + item.total_amount.toFixed(2) + '</td>';
+                    }
+                    realTbody.appendChild(rr);
+                    adjTbody.appendChild(ar);
+                });
+            }
+
+            async function loadAdjRecords() {
+                const res = await fetch('/api/supplement/list_by_target/' + adjOrder.id);
+                const list = await res.json();
+                const tbody = document.querySelector('#adjRecordList tbody');
+                tbody.innerHTML = '';
+                const typeMap = { 'new_item': '虚增明细', 'increase_quantity': '变更数量', 'replace_remove': '替换-冲减', 'replace_add': '替换-换入' };
+                list.forEach(r => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = '<td>' + (typeMap[r.operation_type] || r.operation_type) + '</td><td>' + r.product_name + '</td><td>' + (r.quantity||0).toFixed(2) + '</td><td>' + (r.amount||0).toFixed(2) + '</td><td>' + (r.allocate_date||'') + '</td>' +
+                        '<td><button class="btn btn-xs btn-danger" onclick="rollbackAdj(' + r.id + ')">回滚</button></td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            function toggleAdjType() {
+                const t = document.querySelector('input[name="adjType"]:checked').value;
+                document.getElementById('adjNewSection').style.display = t === 'new_item' ? 'flex' : 'none';
+                document.getElementById('adjIncSection').style.display = t === 'increase_quantity' ? 'flex' : 'none';
+                document.getElementById('adjReplaceSection').style.display = t === 'replace' ? 'block' : 'none';
+            }
+
+            function initAdjReplaceSelect() {
+                const sel = document.getElementById('adjReplaceSourceSelect');
+                sel.innerHTML = '';
+                adjRealItems.forEach((item, idx) => {
+                    const opt = document.createElement('option');
+                    opt.value = idx;
+                    opt.textContent = item.product_name + ' (' + item.quantity.toFixed(2) + ' ' + (item.unit || '') + ' = ' + item.amount.toFixed(2) + '元)';
+                    sel.appendChild(opt);
+                });
+                if (adjRealItems.length > 0) sel.selectedIndex = 0;
+            }
+
+            function initAdjReplaceProductSearch() {
+                const input = document.getElementById('adjReplaceProductInput');
+                const dropdown = document.getElementById('adjReplaceProductDropdown');
+                if (input._init) return;
+                input.addEventListener('click', () => showAdjReplaceProducts(''));
+                input.addEventListener('dblclick', function() { this.readOnly = false; this.value = ''; this.focus(); });
+                input.addEventListener('input', function() { showAdjReplaceProducts(this.value.trim()); });
+                input.addEventListener('blur', () => setTimeout(() => { dropdown.style.display = 'none'; }, 200));
+                input._init = true;
+            }
+
+            async function showAdjReplaceProducts(kw) {
+                const res = await fetch('/api/product/list?keyword=' + encodeURIComponent(kw || '') + '&page_size=50');
+                const data = await res.json();
+                const products = data.items || data.data || [];
+                const dropdown = document.getElementById('adjReplaceProductDropdown');
+                dropdown.innerHTML = '';
+                products.forEach(p => {
+                    const li = document.createElement('div');
+                    li.className = 'search-item';
+                    li.style.padding = '6px 10px';
+                    li.style.cursor = 'pointer';
+                    const a2 = p.alias2 ? '(' + p.alias2 + ')' : '';
+                    const price = p.selling_price || p.base_price || 0;
+                    li.textContent = p.name + a2 + ' - ' + price.toFixed(2) + '元/' + (p.unit || '');
+                    li.onmousedown = () => selectAdjReplaceProduct(p);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = products.length > 0 ? 'block' : 'none';
+            }
+
+            function selectAdjReplaceProduct(p) {
+                adjSelectedReplaceProduct = p;
+                const input = document.getElementById('adjReplaceProductInput');
+                input.value = p.name + (p.alias2 ? '(' + p.alias2 + ')' : '');
+                input.readOnly = false;
+                document.getElementById('adjReplaceProductDropdown').style.display = 'none';
+                document.getElementById('adjReplacePrice').value = (p.selling_price || p.base_price || 0).toFixed(2);
+                calcAdjReplaceLine();
+            }
+
+            function calcAdjReplaceLine() {
+                const qty = parseFloat(document.getElementById('adjReplaceQty').value) || 0;
+                const price = parseFloat(document.getElementById('adjReplacePrice').value) || 0;
+                document.getElementById('adjReplaceAmount').value = (qty * price).toFixed(2);
+            }
+
+            function addAdjReplaceLine() {
+                if (!adjSelectedReplaceProduct) { alert('请选择替换商品'); return; }
+                const qty = parseFloat(document.getElementById('adjReplaceQty').value) || 0;
+                const price = parseFloat(document.getElementById('adjReplacePrice').value) || 0;
+                const amount = qty * price;
+                if (qty <= 0 || amount <= 0) { alert('请输入有效的数量和单价'); return; }
+                adjReplaceLines.push({
+                    product_id: adjSelectedReplaceProduct.id,
+                    product_name: adjSelectedReplaceProduct.name,
+                    alias1: adjSelectedReplaceProduct.alias1 || '',
+                    alias2: adjSelectedReplaceProduct.alias2 || '',
+                    spec: adjSelectedReplaceProduct.spec || '',
+                    unit: adjSelectedReplaceProduct.unit || '',
+                    unit_price: price, quantity: qty, amount: amount,
+                });
+                adjSelectedReplaceProduct = null;
+                document.getElementById('adjReplaceProductInput').value = '';
+                document.getElementById('adjReplaceQty').value = '';
+                document.getElementById('adjReplacePrice').value = '';
+                document.getElementById('adjReplaceAmount').value = '';
+                renderAdjReplaceLines();
+            }
+
+            function removeAdjReplaceLine(index) {
+                adjReplaceLines.splice(index, 1);
+                renderAdjReplaceLines();
+            }
+
+            function renderAdjReplaceLines() {
+                const tbody = document.querySelector('#adjReplaceLineList tbody');
+                tbody.innerHTML = '';
+                let total = 0;
+                adjReplaceLines.forEach((line, index) => {
+                    total += line.amount;
+                    const a2 = line.alias2 ? '(' + line.alias2 + ')' : '';
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = '<td>' + line.product_name + a2 + '</td><td>' + line.quantity.toFixed(2) + '</td><td>' + line.unit_price.toFixed(2) + '</td><td>' + line.amount.toFixed(2) + '</td>' +
+                        '<td><button class="btn btn-xs btn-danger" onclick="removeAdjReplaceLine(' + index + ')">删除</button></td>';
+                    tbody.appendChild(tr);
+                });
+                document.getElementById('adjReplaceLinesTotal').textContent = total.toFixed(2);
+                updateAdjReplaceDiff();
+            }
+
+            function updateAdjReplaceDiff() {
+                const idx = parseInt(document.getElementById('adjReplaceSourceSelect').value);
+                const hint = document.getElementById('adjReplaceDiffHint');
+                if (isNaN(idx) || !adjRealItems[idx]) { hint.textContent = ''; return; }
+                const origAmount = adjRealItems[idx].amount;
+                const replaceTotal = adjReplaceLines.reduce((s, l) => s + l.amount, 0);
+                const diff = replaceTotal - origAmount;
+                if (Math.abs(diff) <= 5.0) {
+                    hint.textContent = '差额 ' + diff.toFixed(2) + ' 元（在±5元内，可提交）';
+                    hint.className = 'text-success small';
+                } else {
+                    hint.textContent = '差额 ' + diff.toFixed(2) + ' 元（超过±5元限制）';
+                    hint.className = 'text-danger small';
+                }
+            }
+
+            function initAdjIncSelect() {
+                const sel = document.getElementById('adjIncSelect');
+                sel.innerHTML = '';
+                adjRealItems.forEach((item, idx) => {
+                    const opt = document.createElement('option');
+                    opt.value = idx;
+                    opt.textContent = item.product_name + ' (' + item.quantity.toFixed(2) + ' ' + (item.unit || '') + ')';
+                    sel.appendChild(opt);
+                });
+                sel.onchange = function() {
+                    const item = adjRealItems[parseInt(this.value)];
+                    if (item) { document.getElementById('adjIncPrice').value = item.unit_price.toFixed(2); calcAdjInc(); }
+                };
+                if (adjRealItems.length > 0) { sel.selectedIndex = 0; sel.onchange(); }
+            }
+
+            function calcAdjInc() {
+                const qty = parseFloat(document.getElementById('adjIncQty').value) || 0;
+                const price = parseFloat(document.getElementById('adjIncPrice').value) || 0;
+                document.getElementById('adjIncAmount').value = (qty * price).toFixed(2);
+                const item = adjRealItems[parseInt(document.getElementById('adjIncSelect').value)];
+                if (item) document.getElementById('adjIncHint').textContent = '合计数量: ' + (item.quantity + qty).toFixed(2);
+            }
+
+            function initAdjProductSearch() {
+                const input = document.getElementById('adjProductInput');
+                const dropdown = document.getElementById('adjProductDropdown');
+                if (input._init) return;
+                input.addEventListener('click', () => showAdjProducts(''));
+                input.addEventListener('dblclick', function() { this.readOnly = false; this.value = ''; this.focus(); });
+                input.addEventListener('input', function() { showAdjProducts(this.value.trim()); });
+                input.addEventListener('blur', () => setTimeout(() => { dropdown.style.display = 'none'; }, 200));
+                input._init = true;
+            }
+
+            async function showAdjProducts(kw) {
+                const res = await fetch('/api/product/list?keyword=' + encodeURIComponent(kw || '') + '&page_size=50');
+                const data = await res.json();
+                const products = data.items || data.data || [];
+                const dropdown = document.getElementById('adjProductDropdown');
+                dropdown.innerHTML = '';
+                products.forEach(p => {
+                    const li = document.createElement('div');
+                    li.className = 'search-item';
+                    li.style.padding = '6px 10px';
+                    li.style.cursor = 'pointer';
+                    const a2 = p.alias2 ? '(' + p.alias2 + ')' : '';
+                    const price = p.selling_price || p.base_price || 0;
+                    li.textContent = p.name + a2 + ' - ' + price.toFixed(2) + '元/' + (p.unit || '');
+                    li.onmousedown = () => selectAdjProduct(p);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = products.length > 0 ? 'block' : 'none';
+            }
+
+            function selectAdjProduct(p) {
+                adjSelectedProduct = p;
+                const input = document.getElementById('adjProductInput');
+                input.value = p.name + (p.alias2 ? '(' + p.alias2 + ')' : '');
+                input.readOnly = false;
+                document.getElementById('adjProductDropdown').style.display = 'none';
+                document.getElementById('adjNewPrice').value = (p.selling_price || p.base_price || 0).toFixed(2);
+                calcAdjNew();
+            }
+
+            function calcAdjNew() {
+                const qty = parseFloat(document.getElementById('adjNewQty').value) || 0;
+                const price = parseFloat(document.getElementById('adjNewPrice').value) || 0;
+                document.getElementById('adjNewAmount').value = (qty * price).toFixed(2);
+            }
+
+            async function addAdjustment() {
+                if (!adjOrder) return;
+                const t = document.querySelector('input[name="adjType"]:checked').value;
+                const allocDate = document.getElementById('adjDate').value;
+
+                if (t === 'replace') {
+                    const idx = parseInt(document.getElementById('adjReplaceSourceSelect').value);
+                    const src = adjRealItems[idx];
+                    if (!src) { alert('请选择被替换的原明细'); return; }
+                    if (adjReplaceLines.length === 0) { alert('请至少添加一条替换商品'); return; }
+                    const replaceTotal = adjReplaceLines.reduce((s, l) => s + l.amount, 0);
+                    const diff = replaceTotal - src.amount;
+                    if (Math.abs(diff) > 5.0) {
+                        alert('替换总金额 ' + replaceTotal.toFixed(2) + ' 元与原明细 ' + src.amount.toFixed(2) + ' 元差额 ' + diff.toFixed(2) + ' 元，超过±5元限制');
+                        return;
+                    }
+                    const srcRemark = adjOrder.order_no + ' 订单调整-替换[' + src.product_name + ']';
+                    // 冲减原明细
+                    const removeBody = {
+                        target_order_id: adjOrder.id, source_order_id: adjOrder.id,
+                        source_remark: srcRemark + ' 冲减',
+                        product_id: src.product_id, product_name: src.product_name,
+                        alias1: src.alias1 || '', alias2: src.alias2 || '',
+                        spec: src.spec || '', unit: src.unit || '',
+                        unit_price: src.unit_price, quantity: -src.quantity, amount: -src.amount,
+                        allocate_date: allocDate, operation_type: 'replace_remove', target_order_item_id: src.id,
+                    };
+                    let r1 = await fetch('/api/supplement/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(removeBody) });
+                    if (!r1.ok) { alert('保存失败(冲减): ' + await r1.text()); return; }
+                    // 换入替换商品
+                    for (const line of adjReplaceLines) {
+                        const addBody = {
+                            target_order_id: adjOrder.id, source_order_id: adjOrder.id,
+                            source_remark: srcRemark + ' 换入',
+                            product_id: line.product_id, product_name: line.product_name,
+                            alias1: line.alias1 || '', alias2: line.alias2 || '',
+                            spec: line.spec || '', unit: line.unit || '',
+                            unit_price: line.unit_price, quantity: line.quantity, amount: line.amount,
+                            allocate_date: allocDate, operation_type: 'replace_add', target_order_item_id: src.id,
+                        };
+                        let r2 = await fetch('/api/supplement/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(addBody) });
+                        if (!r2.ok) { alert('保存失败(换入): ' + await r2.text()); return; }
+                    }
+                    adjReplaceLines = [];
+                    renderAdjReplaceLines();
+                    await loadCompare();
+                    await loadAdjRecords();
+                    await loadAdjustedOrders();
+                    alert('替换已保存');
+                    return;
+                }
+
+                let body;
+                if (t === 'new_item') {
+                    if (!adjSelectedProduct) { alert('请选择要虚增的商品'); return; }
+                    const qty = parseFloat(document.getElementById('adjNewQty').value) || 0;
+                    const price = parseFloat(document.getElementById('adjNewPrice').value) || 0;
+                    const amount = qty * price;
+                    if (qty <= 0 || amount <= 0) { alert('请输入有效的数量和单价'); return; }
+                    body = {
+                        target_order_id: adjOrder.id, source_order_id: adjOrder.id,
+                        source_remark: adjOrder.order_no + ' 订单调整-虚增',
+                        product_id: adjSelectedProduct.id, product_name: adjSelectedProduct.name,
+                        alias1: adjSelectedProduct.alias1 || '', alias2: adjSelectedProduct.alias2 || '',
+                        spec: adjSelectedProduct.spec || '', unit: adjSelectedProduct.unit || '',
+                        unit_price: price, quantity: qty, amount: amount,
+                        allocate_date: allocDate,
+                        operation_type: 'new_item', target_order_item_id: null,
+                    };
+                } else {
+                    const idx = parseInt(document.getElementById('adjIncSelect').value);
+                    const item = adjRealItems[idx];
+                    if (!item) { alert('请选择目标商品'); return; }
+                    const qty = parseFloat(document.getElementById('adjIncQty').value) || 0;
+                    if (qty === 0) { alert('请输入变更数量'); return; }
+                    const amount = qty * item.unit_price;
+                    body = {
+                        target_order_id: adjOrder.id, source_order_id: adjOrder.id,
+                        source_remark: adjOrder.order_no + ' 订单调整-变更数量',
+                        product_id: item.product_id, product_name: item.product_name,
+                        alias1: item.alias1 || '', alias2: item.alias2 || '',
+                        spec: item.spec || '', unit: item.unit || '',
+                        unit_price: item.unit_price, quantity: qty, amount: amount,
+                        allocate_date: allocDate,
+                        operation_type: 'increase_quantity', target_order_item_id: item.id,
+                    };
+                }
+                const res = await fetch('/api/supplement/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                if (res.ok) {
+                    document.getElementById('adjNewQty').value = '';
+                    document.getElementById('adjIncQty').value = '';
+                    await loadCompare();
+                    await loadAdjRecords();
+                    await loadAdjustedOrders();
+                    alert('调整已保存');
+                } else {
+                    alert('保存失败: ' + await res.text());
+                }
+            }
+
+            async function rollbackAdj(id) {
+                if (!confirm('确定回滚该调整记录？')) return;
+                const res = await fetch('/api/supplement/delete/' + id, { method: 'DELETE' });
+                if (res.ok) {
+                    await loadCompare();
+                    await loadAdjRecords();
+                    await loadAdjustedOrders();
+                    alert('回滚成功');
+                } else {
+                    alert('回滚失败: ' + await res.text());
+                }
+            }
+
+            async function loadAdjustedOrders() {
+                const res = await fetch('/api/supplement/adjusted_orders');
+                const list = await res.json();
+                window._adjustedOrdersMap = {};
+                list.forEach(o => { window._adjustedOrdersMap[o.id] = o; });
+                const tbody = document.querySelector('#adjustedOrdersTable tbody');
+                document.getElementById('adjustedOrdersCount').textContent = list.length;
+                tbody.innerHTML = '';
+                if (!list.length) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted small">暂无</td></tr>';
+                    return;
+                }
+                list.forEach(o => {
+                    const tr = document.createElement('tr');
+                    tr.style.cursor = 'pointer';
+                    const diff = (o.adjust_amount || 0);
+                    const diffColor = diff > 0 ? 'text-success' : (diff < 0 ? 'text-danger' : 'text-muted');
+                    tr.innerHTML =
+                        '<td><a href="javascript:void(0)" onclick="selectAdjOrderById(' + o.id + ')">' + o.order_no + '</a></td>' +
+                        '<td>' + (o.purchaser_name || '') + '</td>' +
+                        '<td>' + (o.order_date || '') + '</td>' +
+                        '<td class="text-right">' + (o.total_amount || 0).toFixed(2) + '</td>' +
+                        '<td class="text-right ' + diffColor + '">' + (diff >= 0 ? '+' : '') + diff.toFixed(2) + '</td>' +
+                        '<td class="text-right"><strong>' + (o.adjusted_total || 0).toFixed(2) + '</strong></td>' +
+                        '<td class="text-center">' + (o.adjust_count || 0) + '</td>' +
+                        '<td>' + (o.last_adjust_date || '') + '</td>' +
+                        '<td><button class="btn btn-xs btn-outline-primary" onclick="selectAdjOrderById(' + o.id + ')">查看</button></td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            function selectAdjOrderById(id) {
+                const o = window._adjustedOrdersMap && window._adjustedOrdersMap[id];
+                if (o) selectAdjOrder(o);
+            }
+
+            // 页面初始载入变更订单列表
+            loadAdjustedOrders();
+        </script>
+    "####;
+    Html(layout_html("订单调整与同屏比对", "/query/order_adjust", &content))
+}
+
 async fn page_query_stock_flow() -> Html<String> {
     let content = r#"
         <div class="card p-4">
@@ -6156,6 +7403,144 @@ async fn page_query_stock_flow() -> Html<String> {
         </script>
     "#;
     Html(layout_html("库存明细台账", "/query/stock_flow", &content))
+}
+
+async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/stock_summary").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>出入库统计</h3>
+            <p class="text-muted small">按日汇总采购入库金额与销售出库金额，净额 = 入库金额 - 出库金额。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-6 d-flex align-items-end">
+                    <button onclick="searchStockSummary()" class="btn btn-primary">查询</button>
+                    <button onclick="exportStockSummary()" class="btn btn-success ml-2">导出Excel</button>
+                    <button onclick="resetDate('today')" class="btn btn-outline-secondary ml-2">今日</button>
+                    <button onclick="resetDate('7d')" class="btn btn-outline-secondary ml-2">近7天</button>
+                    <button onclick="resetDate('30d')" class="btn btn-outline-secondary ml-2">近30天</button>
+                    <button onclick="resetDate('month')" class="btn btn-outline-secondary ml-2">本月</button>
+                    <button onclick="resetDate('all')" class="btn btn-outline-secondary ml-2">全部</button>
+                </div>
+            </div>
+        </div>
+        <div class="row mt-3">
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计入库金额</div>
+                        <div class="h4 text-success mb-0" id="totalIn">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计净额（入-出）</div>
+                        <div class="h4 mb-0" id="totalNet">0.00</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="card p-3 mt-3">
+            <table class="table table-bordered table-sm">
+                <thead class="thead-light">
+                    <tr>
+                        <th>日期</th>
+                        <th>仓库</th>
+                        <th class="text-right">入库金额</th>
+                        <th class="text-center">入库单数</th>
+                        <th class="text-center">入库条数</th>
+                        <th class="text-right">出库金额</th>
+                        <th class="text-center">出库单数</th>
+                        <th class="text-center">出库条数</th>
+                        <th class="text-right">净额</th>
+                    </tr>
+                </thead>
+                <tbody id="resultTable"></tbody>
+            </table>
+        </div>
+        <script>
+            function resetDate(range) {
+                const today = new Date();
+                const fmt = d => d.toISOString().slice(0, 10);
+                const s = document.getElementById('startDate');
+                const e = document.getElementById('endDate');
+                if (range === 'today') { s.value = fmt(today); e.value = fmt(today); }
+                else if (range === '7d') { const t = new Date(today); t.setDate(today.getDate() - 6); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === '30d') { const t = new Date(today); t.setDate(today.getDate() - 29); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === 'month') { const t = new Date(today.getFullYear(), today.getMonth(), 1); s.value = fmt(t); e.value = fmt(today); }
+                else { s.value = ''; e.value = ''; }
+                searchStockSummary();
+            }
+
+            async function searchStockSummary() {
+                const url = '/api/query/stock_summary?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('resultTable');
+                tbody.innerHTML = '';
+                if (!data.rows || data.rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let prevDay = null;
+                    data.rows.forEach(it => {
+                        const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
+                        // 汇总行加粗背景
+                        const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
+                        // 如果日期变化，加一个可视分隔
+                        const dayDisplay = it.day !== prevDay ? it.day : '';
+                        prevDay = it.day;
+                        tbody.innerHTML += '<tr style="' + rowStyle + '">' +
+                            '<td>' + dayDisplay + '</td>' +
+                            '<td>' + it.warehouse_name + '</td>' +
+                            '<td class="text-right text-success">' + (it.in_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
+                            '<td class="text-right ' + netCls + '">' + (it.net_amount || 0).toFixed(2) + '</td>' +
+                            '</tr>';
+                    });
+                }
+                document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
+                document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
+                const net = data.total_net_amount || 0;
+                const netEl = document.getElementById('totalNet');
+                netEl.textContent = net.toFixed(2);
+                netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+            }
+
+            function exportStockSummary() {
+                const url = '/api/query/stock_summary/export?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                window.location.href = url;
+            }
+
+            resetDate('30d');
+        </script>
+    "#;
+    Html(layout_html("出入库统计", "/query/stock_summary", &content))
 }
 
 async fn page_query_stock_warning() -> Html<String> {
@@ -10059,44 +11444,75 @@ async fn api_product_toggle_status(Path(id): Path<i64>) -> impl IntoResponse {
 async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let category_id = params.get("category_id").and_then(|v| v.parse::<i64>().ok());
     let keyword_pattern = parse_keyword_pattern(&params);
-    
-    let rows = if let Some(cid) = category_id {
-        sqlx::query(
-            "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
-             FROM product p LEFT JOIN category c ON p.category_id = c.id
-             WHERE p.category_id IN (
-                 WITH RECURSIVE cat_tree(id) AS (
-                     SELECT id FROM category WHERE id = ?
-                     UNION ALL
-                     SELECT c.id FROM category c 
-                     JOIN cat_tree ct ON c.parent_id = ct.id
-                 )
-                 SELECT id FROM cat_tree
-             )
-             AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)
-             ORDER BY p.id DESC"
-        )
-        .bind(cid)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .fetch_all(pool())
-        .await
-        .unwrap_or_default()
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let offset = (page - 1) * page_size;
+
+    // 构造 WHERE 条件、绑定参数和 COUNT 基础 SQL
+    #[derive(Debug)]
+    struct QueryParts {
+        where_sql: String,
+        binds: Vec<String>,
+        category_bind: Option<i64>,
+    }
+
+    let query_parts = if let Some(cid) = category_id {
+        QueryParts {
+            where_sql: format!(
+                "WHERE p.category_id IN (
+                    WITH RECURSIVE cat_tree(id) AS (
+                        SELECT id FROM category WHERE id = ?
+                        UNION ALL
+                        SELECT c.id FROM category c 
+                        JOIN cat_tree ct ON c.parent_id = ct.id
+                    )
+                    SELECT id FROM cat_tree
+                )
+                AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)"
+            ),
+            binds: vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()],
+            category_bind: Some(cid),
+        }
     } else {
-        sqlx::query(
-            "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
-             FROM product p LEFT JOIN category c ON p.category_id = c.id
-             WHERE p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?
-             ORDER BY p.id DESC"
-        )
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .fetch_all(pool())
-        .await
-        .unwrap_or_default()
+        QueryParts {
+            where_sql: "WHERE p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?".to_string(),
+            binds: vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()],
+            category_bind: None,
+        }
     };
+
+    // 总数查询
+    let count_sql = format!(
+        "SELECT COUNT(*) as count FROM product p LEFT JOIN category c ON p.category_id = c.id {}",
+        query_parts.where_sql
+    );
+    let mut count_q = sqlx::query(AssertSqlSafe(count_sql.as_str()));
+    if let Some(cid) = query_parts.category_bind {
+        count_q = count_q.bind(cid);
+    }
+    for b in &query_parts.binds {
+        count_q = count_q.bind(b);
+    }
+    let total_row = count_q.fetch_one(pool()).await.unwrap();
+    let total: i64 = total_row.get("count");
+
+    // 分页数据查询
+    let data_sql = format!(
+        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
+         FROM product p LEFT JOIN category c ON p.category_id = c.id
+         {}
+         ORDER BY p.id DESC LIMIT ? OFFSET ?",
+        query_parts.where_sql
+    );
+    let mut data_q = sqlx::query(AssertSqlSafe(data_sql.as_str()));
+    if let Some(cid) = query_parts.category_bind {
+        data_q = data_q.bind(cid);
+    }
+    for b in &query_parts.binds {
+        data_q = data_q.bind(b);
+    }
+    data_q = data_q.bind(page_size).bind(offset);
+    let rows = data_q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut products: Vec<serde_json::Value> = Vec::new();
     for row in rows {
@@ -10171,6 +11587,8 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
             "base_unit": row.get::<String, _>("base_unit"),
             "base_price": row.get::<f64, _>("base_price"),
             "purchase_price": row.get::<f64, _>("purchase_price"),
+            "max_purchase_price": row.get::<f64, _>("max_purchase_price"),
+            "min_purchase_price": row.get::<f64, _>("min_purchase_price"),
             "image_url": row.get::<Option<String>, _>("image_url"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "status": row.get::<i64, _>("status"),
@@ -10181,7 +11599,16 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
         }));
     }
     
-    (StatusCode::OK, serde_json::to_string(&products).unwrap())
+    let total_pages = if page_size > 0 { (total + page_size - 1) / page_size } else { 0 };
+    let result = serde_json::json!({
+        "data": products,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
 async fn api_product_create(Json(req): Json<ProductReq>) -> impl IntoResponse {
@@ -10435,6 +11862,37 @@ async fn api_product_delete(headers: axum::http::HeaderMap, Json(req): Json<serd
     }
 }
 
+// 清理文件名前缀中的非法字符（保留中文、字母、数字、-、_）
+fn sanitize_filename_prefix(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.chars().take(60).collect()
+    }
+}
+
+// 将图片URL转换为服务器文件路径（兼容旧格式 /api/product/image/ 与新格式 /api/uploads/...）
+fn image_url_to_path(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("/api/uploads/") {
+        Some(format!("uploads/{}", rest))
+    } else if let Some(rest) = url.strip_prefix("/api/product/image/") {
+        Some(format!("uploads/{}", rest))
+    } else {
+        None
+    }
+}
+
 async fn api_product_upload_image(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     mut multipart: Multipart,
@@ -10445,7 +11903,17 @@ async fn api_product_upload_image(
     }
     let product_id = product_id.unwrap();
 
-    tokio::fs::create_dir_all("uploads").await.ok();
+    // 获取商品名称作为文件名前缀
+    let product_name: String = sqlx::query_scalar("SELECT name FROM product WHERE id = ?")
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "product".to_string());
+    let name_prefix = sanitize_filename_prefix(&product_name);
+
+    tokio::fs::create_dir_all("uploads/products").await.ok();
 
     let mut file_path = String::new();
     let mut has_file = false;
@@ -10470,8 +11938,8 @@ async fn api_product_upload_image(
 
         let timestamp = chrono::Utc::now().timestamp_millis();
         let random: u32 = rand::random();
-        let new_filename = format!("{}_{}.{}", timestamp, random, ext);
-        let path = format!("uploads/{}", new_filename);
+        let new_filename = format!("{}_{}_{}.{}", name_prefix, timestamp, random, ext);
+        let path = format!("uploads/products/{}", new_filename);
 
         let bytes = field.bytes().await.unwrap_or_default();
         if bytes.len() > 5 * 1024 * 1024 {
@@ -10482,7 +11950,7 @@ async fn api_product_upload_image(
             return (StatusCode::INTERNAL_SERVER_ERROR, "保存图片失败".to_string());
         }
 
-        file_path = format!("/api/product/image/{}", new_filename);
+        file_path = format!("/api/uploads/products/{}", new_filename);
     }
 
     if !has_file {
@@ -10516,9 +11984,7 @@ async fn api_product_delete_image(
     if let Some(row) = row {
         let image_url: Option<String> = row.get("image_url");
         if let Some(url) = image_url {
-            if url.starts_with("/api/product/image/") {
-                let filename = url.replace("/api/product/image/", "");
-                let path = format!("uploads/{}", filename);
+            if let Some(path) = image_url_to_path(&url) {
                 let _ = tokio::fs::remove_file(&path).await;
             }
         }
@@ -10530,6 +11996,298 @@ async fn api_product_delete_image(
         .await;
 
     (StatusCode::OK, "删除成功".to_string())
+}
+
+// 销售订单图片上传：type = customer(客户订单) / signed(已验收签字订单)
+async fn api_sales_order_upload_image(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
+    if order_id.is_none() {
+        return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
+    }
+    let order_id = order_id.unwrap();
+
+    let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
+    let (folder, prefix, column) = match image_type {
+        "customer" => ("customer_orders", "客户订单", "customer_order_image"),
+        "signed" => ("signed_orders", "签字验收单", "signed_order_image"),
+        _ => return (StatusCode::BAD_REQUEST, "无效的图片类型".to_string()),
+    };
+
+    // 获取销售单位（采购方）名称和订单日期作为前缀
+    let row = sqlx::query(
+        "SELECT p.name, so.order_date FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
+    )
+    .bind(order_id)
+    .fetch_optional(pool())
+    .await
+    .unwrap_or(None);
+
+    let (purchaser_name, order_date) = if let Some(r) = row {
+        let name: Option<String> = r.get("name");
+        let date: Option<String> = r.get("order_date");
+        (name.unwrap_or_else(|| "purchaser".to_string()), date.unwrap_or_else(|| "nodate".to_string()))
+    } else {
+        ("purchaser".to_string(), "nodate".to_string())
+    };
+
+    let name_prefix = format!("{}_{}_{}", sanitize_filename_prefix(&purchaser_name), order_date, prefix);
+    let full_folder = format!("uploads/{}", folder);
+    tokio::fs::create_dir_all(full_folder).await.ok();
+
+    let mut file_path = String::new();
+    let mut has_file = false;
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        if field.name() != Some("file") {
+            continue;
+        }
+        has_file = true;
+
+        let filename = field.file_name().unwrap_or_else(|| "unknown.jpg");
+        let ext = std::path::Path::new(filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase();
+
+        if !["jpg", "jpeg", "png", "gif", "webp"].contains(&ext.as_str()) {
+            return (StatusCode::BAD_REQUEST, "不支持的图片格式".to_string());
+        }
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let random: u32 = rand::random();
+        let new_filename = format!("{}_{}_{}.{}", name_prefix, timestamp, random, ext);
+        let path = format!("uploads/{}/{}", folder, new_filename);
+
+        let bytes = field.bytes().await.unwrap_or_default();
+        if bytes.len() > 5 * 1024 * 1024 {
+            return (StatusCode::BAD_REQUEST, "图片大小不能超过5MB".to_string());
+        }
+
+        if tokio::fs::write(&path, bytes).await.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "保存图片失败".to_string());
+        }
+
+        file_path = format!("/api/uploads/{}/{}", folder, new_filename);
+    }
+
+    if !has_file {
+        return (StatusCode::BAD_REQUEST, "请选择要上传的图片".to_string());
+    }
+
+    let update_sql = format!("UPDATE sales_order SET {} = ? WHERE id = ?", column);
+    let _ = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+        .bind(&file_path)
+        .bind(order_id)
+        .execute(pool())
+        .await;
+
+    (StatusCode::OK, serde_json::json!({ "url": file_path }).to_string())
+}
+
+async fn api_sales_order_delete_image(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, String) {
+    let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
+    if order_id.is_none() {
+        return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
+    }
+    let order_id = order_id.unwrap();
+
+    let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
+    let column = match image_type {
+        "customer" => "customer_order_image",
+        "signed" => "signed_order_image",
+        _ => return (StatusCode::BAD_REQUEST, "无效的图片类型".to_string()),
+    };
+
+    let select_sql = format!("SELECT {} as img FROM sales_order WHERE id = ?", column);
+    let row = sqlx::query(AssertSqlSafe(select_sql.as_str()))
+        .bind(order_id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+    if let Some(row) = row {
+        let image_url: Option<String> = row.get("img");
+        if let Some(url) = image_url {
+            if let Some(path) = image_url_to_path(&url) {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+
+    let update_sql = format!("UPDATE sales_order SET {} = NULL WHERE id = ?", column);
+    let _ = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+        .bind(order_id)
+        .execute(pool())
+        .await;
+
+    (StatusCode::OK, "删除成功".to_string())
+}
+
+// 采购单据列表：按供应商+日期查询
+async fn api_purchase_document_list(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let supplier_id = params.get("supplier_id").and_then(|s| s.parse::<i64>().ok());
+    let document_date = params.get("document_date").map(|s| s.as_str()).unwrap_or("");
+
+    let mut sql = "SELECT id, supplier_id, supplier_name, document_date, image_url, remark, create_at FROM purchase_document WHERE 1=1".to_string();
+    let rows = match (supplier_id, document_date.is_empty()) {
+        (Some(sid), false) => {
+            sql.push_str(" AND supplier_id = ? AND document_date = ?");
+            sql.push_str(" ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(sid)
+                .bind(document_date)
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+        (Some(sid), true) => {
+            sql.push_str(" AND supplier_id = ? ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(sid)
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+        (None, false) => {
+            sql.push_str(" AND document_date = ? ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(document_date)
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+        (None, true) => {
+            sql.push_str(" ORDER BY create_at DESC");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+        },
+    };
+
+    let result: Vec<serde_json::Value> = rows.iter().map(|row| serde_json::json!({
+        "id": row.get::<i64, _>("id"),
+        "supplier_id": row.get::<i64, _>("supplier_id"),
+        "supplier_name": row.get::<String, _>("supplier_name"),
+        "document_date": row.get::<String, _>("document_date"),
+        "image_url": row.get::<String, _>("image_url"),
+        "remark": row.get::<Option<String>, _>("remark"),
+        "create_at": row.get::<String, _>("create_at"),
+    })).collect();
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResponse {
+    let mut supplier_id: Option<i64> = None;
+    let mut supplier_name: Option<String> = None;
+    let mut document_date: Option<String> = None;
+    let mut remark: Option<String> = None;
+    // 先缓存文件字节与扩展名，待所有字段解析完再按 供应商+日期 前缀写盘
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_ext: String = "jpg".to_string();
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            let filename = field.file_name().unwrap_or_else(|| "unknown.jpg");
+            let ext = std::path::Path::new(filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("jpg")
+                .to_lowercase();
+            if !["jpg", "jpeg", "png", "gif", "webp"].contains(&ext.as_str()) {
+                continue;
+            }
+            let bytes = field.bytes().await.unwrap_or_default();
+            if bytes.len() > 10 * 1024 * 1024 {
+                continue;
+            }
+            file_ext = ext;
+            file_bytes = Some(bytes.to_vec());
+        } else if name == "supplier_id" {
+            if let Ok(v) = field.text().await {
+                supplier_id = v.parse::<i64>().ok();
+            }
+        } else if name == "supplier_name" {
+            supplier_name = field.text().await.ok();
+        } else if name == "document_date" {
+            document_date = field.text().await.ok();
+        } else if name == "remark" {
+            remark = field.text().await.ok();
+        }
+    }
+
+    if supplier_id.is_none() || supplier_name.is_none() || document_date.is_none() || file_bytes.is_none() {
+        return (StatusCode::BAD_REQUEST, "缺少必填参数".to_string());
+    }
+
+    let sname = supplier_name.unwrap();
+    let ddate = document_date.unwrap();
+    let name_prefix = format!("{}_{}", sanitize_filename_prefix(&sname), ddate);
+
+    tokio::fs::create_dir_all("uploads/purchase_documents").await.ok();
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let random: u32 = rand::random();
+    let new_filename = format!("{}_{}_{}.{}", name_prefix, timestamp, random, file_ext);
+    let path = format!("uploads/purchase_documents/{}", new_filename);
+
+    if tokio::fs::write(&path, file_bytes.unwrap()).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "保存图片失败".to_string());
+    }
+    let saved_url = format!("/api/uploads/purchase_documents/{}", new_filename);
+
+    let result = sqlx::query(
+        "INSERT INTO purchase_document(supplier_id, supplier_name, document_date, image_url, remark) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(supplier_id.unwrap())
+    .bind(&sname)
+    .bind(&ddate)
+    .bind(&saved_url)
+    .bind(remark)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(r) => {
+            let id = r.last_insert_rowid();
+            (StatusCode::OK, serde_json::json!({ "id": id, "url": saved_url }).to_string())
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "保存失败".to_string()),
+    }
+}
+
+async fn api_purchase_document_delete(Path(id): Path<i64>) -> impl IntoResponse {
+    let row = sqlx::query("SELECT image_url FROM purchase_document WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+    if let Some(row) = row {
+        let url: String = row.get("image_url");
+        if let Some(path) = image_url_to_path(&url) {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+
+    let result = sqlx::query("DELETE FROM purchase_document WHERE id = ?")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
+    }
 }
 
 async fn api_product_get_image(
@@ -10554,6 +12312,50 @@ async fn api_product_get_image(
                 _ => "image/jpeg",
             };
 
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime_type)],
+                content,
+            )
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "图片不存在".as_bytes().to_vec(),
+        ),
+    }
+}
+
+// 服务分类子目录下的图片：/api/uploads/{folder}/{filename}
+async fn api_get_uploaded_image(
+    Path((folder, filename)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // 仅允许已知子目录，防止路径穿越
+    let allowed = ["products", "customer_orders", "signed_orders", "purchase_documents"];
+    if !allowed.contains(&folder.as_str()) || filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "图片不存在".as_bytes().to_vec(),
+        );
+    }
+    let path = format!("uploads/{}/{}", folder, filename);
+    let file = tokio::fs::read(&path).await;
+
+    match file {
+        Ok(content) => {
+            let ext = std::path::Path::new(&filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("jpg")
+                .to_lowercase();
+            let mime_type = match ext.as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => "image/jpeg",
+            };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, mime_type)],
@@ -11303,6 +13105,60 @@ async fn api_order_generate_no(axum::extract::Query(params): axum::extract::Quer
     (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "order_no": order_no })).unwrap())
 }
 
+// 采购入库后，按商品ID更新当前进价/历史最高进价/历史最低进价
+// unit_price 为该采购明细单位单价，需换算回基础单位单价：base_unit_price = unit_price / ratio
+// 这里 base_quantity/quantity 可近似换算比例，但为稳妥直接用 unit_price 与商品当前记录比较（明细已按下单单位存储）。
+// 规则：当前进价 = 最近一次采购价；最高进价 = 历史最高；最低进价 = 历史最低（新品或价格为0时初始化）。
+async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
+    for item in items {
+        if item.product_id == 0 {
+            continue;
+        }
+        // 换算为基础单位单价
+        let base_unit_price = if let Some(bq) = item.base_quantity {
+            if bq > 0.0 && item.quantity > 0.0 {
+                // amount / base_quantity 得到基础单位单价
+                if item.amount > 0.0 { item.amount / bq } else { item.unit_price }
+            } else {
+                item.unit_price
+            }
+        } else {
+            item.unit_price
+        };
+        if base_unit_price <= 0.0 {
+            continue;
+        }
+
+        // 读取商品当前的最高/最低进价
+        let row = sqlx::query(
+            "SELECT purchase_price, max_purchase_price, min_purchase_price FROM product WHERE id = ?"
+        )
+        .bind(item.product_id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+        if let Some(r) = row {
+            let old_max: f64 = r.get::<f64, _>("max_purchase_price");
+            let old_min: f64 = r.get::<f64, _>("min_purchase_price");
+
+            // 若历史最高/最低为0（新品或首次采购），则以本次价格初始化
+            let new_max = if old_max <= 0.0 { base_unit_price } else { old_max.max(base_unit_price) };
+            let new_min = if old_min <= 0.0 { base_unit_price } else { old_min.min(base_unit_price) };
+
+            let _ = sqlx::query(
+                "UPDATE product SET purchase_price = ?, max_purchase_price = ?, min_purchase_price = ? WHERE id = ?"
+            )
+            .bind(base_unit_price)
+            .bind(new_max)
+            .bind(new_min)
+            .bind(item.product_id)
+            .execute(pool())
+            .await;
+        }
+    }
+}
+
 async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
     let result = sqlx::query(
         "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -11333,7 +13189,7 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                 );
                 
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for item in &req.items {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -11349,6 +13205,8 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
+                // 采购入库后更新商品进价（当前/最高/最低）
+                update_product_purchase_prices(&req.items).await;
             }
             StatusCode::OK
         }
@@ -11363,6 +13221,8 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
+    let supplier_id: Option<i64> = params.get("supplier_id").and_then(|s| s.parse().ok());
+    
     // 排序处理
     let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
     let sort_order = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
@@ -11374,35 +13234,57 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
         _ => format!("po.id {}", sort_order),
     };
     
-    let total_rows = sqlx::query(
-        "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
-         WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?"
-    )
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .fetch_one(pool())
-    .await
-    .unwrap();
+    let (total_sql, total_params) = if let Some(sid) = supplier_id {
+        (
+            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+             WHERE po.supplier_id = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)",
+            vec![sid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    } else {
+        (
+            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+             WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?",
+            vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    };
+    
+    let mut total_query = sqlx::query(total_sql);
+    for p in &total_params {
+        total_query = total_query.bind(p);
+    }
+    let total_rows = total_query.fetch_one(pool()).await.unwrap();
     let total: i64 = total_rows.get("count");
     
-    let sql = format!(
-        "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
-         FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
-         WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?
-         ORDER BY {} LIMIT ? OFFSET ?",
-        order_clause
-    );
+    let (sql, query_params) = if let Some(sid) = supplier_id {
+        (
+            format!(
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
+                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+                 WHERE po.supplier_id = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![sid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    } else {
+        (
+            format!(
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
+                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+                 WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    };
     
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(pool())
-        .await
-        .unwrap_or_default();
+    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for p in &query_params {
+        query = query.bind(p);
+    }
+    query = query.bind(page_size).bind(offset);
+    let rows = query.fetch_all(pool()).await.unwrap_or_default();
     
     let orders: Vec<serde_json::Value> = rows
         .iter()
@@ -11536,7 +13418,7 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                 
                 let order_id = req.id;
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for item in &req.items {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -11552,6 +13434,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
+                // 采购单更新后同步商品进价（当前/最高/最低）
+                update_product_purchase_prices(&req.items).await;
             }
             (StatusCode::OK, "更新成功".to_string())
         }
@@ -11857,7 +13741,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     }
 
     let order_row = sqlx::query(
-        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, COALESCE(p.name, '') as purchaser_name
+        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.customer_order_image, so.signed_order_image, COALESCE(p.name, '') as purchaser_name
          FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
     )
     .bind(id)
@@ -11919,6 +13803,8 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
         "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
         "status": row.get::<String, _>("status"),
         "remark": row.get::<Option<String>, _>("remark"),
+        "customer_order_image": row.get::<Option<String>, _>("customer_order_image"),
+        "signed_order_image": row.get::<Option<String>, _>("signed_order_image"),
         "purchaser_name": row.get::<String, _>("purchaser_name"),
         "items": items,
     });
@@ -12716,12 +14602,26 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
-    
+
+    // 排序处理：支持订单号、采购单位、日期、金额、状态列点击排序
+    let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
+    let sort_order_raw = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
+    // 仅允许 asc/desc，防止任意 SQL 片段注入
+    let sort_order = if sort_order_raw.eq_ignore_ascii_case("asc") { "asc" } else { "desc" };
+    let order_clause = match sort_field {
+        "order_no" => format!("so.order_no {}", sort_order),
+        "unit_name" => format!("p.name {}", sort_order),
+        "order_date" => format!("so.order_date {}", sort_order),
+        "total_amount" => format!("so.total_amount {}", sort_order),
+        "status" => format!("so.status {}", sort_order),
+        _ => format!("so.id {}", sort_order),
+    };
+
     let mut base_sql = String::from(
         " FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1"
     );
     let mut binds: Vec<String> = Vec::new();
-    
+
     if !purchaser_id.is_empty() {
         base_sql.push_str(" AND so.purchaser_id = ?");
         binds.push(purchaser_id.to_string());
@@ -12738,7 +14638,7 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
         base_sql.push_str(" AND so.status = ?");
         binds.push(status.to_string());
     }
-    
+
     let count_query = format!("SELECT COUNT(*){}", base_sql);
     let mut count_q = sqlx::query(AssertSqlSafe(count_query.as_str()));
     for b in &binds {
@@ -12746,10 +14646,10 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
     }
     let total_rows = count_q.fetch_one(pool()).await.unwrap();
     let total: i64 = total_rows.get("COUNT(*)");
-    
+
     let data_sql = format!(
-        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name {} ORDER BY so.id DESC LIMIT ? OFFSET ?",
-        base_sql
+        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name {} ORDER BY {} LIMIT ? OFFSET ?",
+        base_sql, order_clause
     );
     let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str()));
     for b in &binds {
@@ -13022,6 +14922,211 @@ async fn api_query_sales_summary(axum::extract::Query(params): axum::extract::Qu
         "by_product": by_product,
     });
     
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+// 报销口径汇总：目标单真实明细 + 分摊增项净额，排除耗材分摊来源单本身，避免重计
+async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    // 作为分摊来源的订单 id（排除，不计入报销口径）
+    let source_ids: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT source_order_id FROM consumable_allocation"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+    let source_set: std::collections::HashSet<i64> = source_ids.into_iter().collect();
+
+    let mut date_cond = String::from("");
+    let mut binds: Vec<String> = Vec::new();
+    if !start_date.is_empty() {
+        date_cond.push_str(" AND so.order_date >= ?");
+        binds.push(start_date.to_string());
+    }
+    if !end_date.is_empty() {
+        date_cond.push_str(" AND so.order_date <= ?");
+        binds.push(end_date.to_string());
+    }
+
+    // 1) 真实明细：按采购单位 & 商品聚合
+    let real_purchaser_sql = format!(
+        "SELECT so.purchaser_id, p.name, so.id as order_id, SUM(soi.amount) as amount, SUM(soi.quantity) as qty
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         JOIN purchaser p ON so.purchaser_id = p.id
+         WHERE 1=1 {}
+         GROUP BY so.id", date_cond
+    );
+    let mut q = sqlx::query(AssertSqlSafe(real_purchaser_sql.as_str()));
+    for b in &binds { q = q.bind(b); }
+    let real_rows = q.fetch_all(pool()).await.unwrap_or_default();
+
+    use std::collections::HashMap;
+    // 按采购单位累加：real_amount
+    let mut purchaser_map: HashMap<i64, (String, f64, f64)> = HashMap::new(); // id -> (name, real, supp)
+    for r in &real_rows {
+        let order_id = r.get::<i64, _>("order_id");
+        if source_set.contains(&order_id) { continue; } // 排除来源耗材单
+        let pid = r.get::<i64, _>("purchaser_id");
+        let name = r.get::<String, _>("name");
+        let amount = r.get::<f64, _>("amount");
+        let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
+        entry.1 += amount;
+    }
+
+    // 2) 分摊增项净额：按目标订单归属的采购单位聚合（含 replace_remove 负数抵消）
+    let supp_sql = format!(
+        "SELECT so.purchaser_id, p.name, SUM(osi.amount) as supp_amount
+         FROM order_supplement_item osi
+         JOIN sales_order so ON osi.target_order_id = so.id
+         JOIN purchaser p ON so.purchaser_id = p.id
+         WHERE 1=1 {}
+         GROUP BY so.purchaser_id", date_cond
+    );
+    let mut q2 = sqlx::query(AssertSqlSafe(supp_sql.as_str()));
+    for b in &binds { q2 = q2.bind(b); }
+    let supp_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    for r in &supp_rows {
+        let pid = r.get::<i64, _>("purchaser_id");
+        let name = r.get::<String, _>("name");
+        let supp_amount = r.get::<f64, _>("supp_amount");
+        let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
+        entry.2 += supp_amount;
+    }
+
+    let mut by_purchaser: Vec<serde_json::Value> = purchaser_map.values().map(|(name, real, supp)| {
+        serde_json::json!({
+            "name": name,
+            "real_amount": real,
+            "supplement_amount": supp,
+            "reimburse_amount": real + supp,
+        })
+    }).collect();
+    by_purchaser.sort_by(|a, b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 3) 按商品汇总（报销口径）：真实明细（排除来源单）+ 分摊增项
+    let mut product_map: HashMap<(String, String), (f64, f64)> = HashMap::new(); // (name,spec) -> (qty, amount)
+    let prod_real_sql = format!(
+        "SELECT soi.product_name, COALESCE(soi.spec,'') as spec, soi.order_id, soi.quantity, soi.amount
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         WHERE 1=1 {}", date_cond
+    );
+    let mut q3 = sqlx::query(AssertSqlSafe(prod_real_sql.as_str()));
+    for b in &binds { q3 = q3.bind(b); }
+    let prod_real_rows = q3.fetch_all(pool()).await.unwrap_or_default();
+    for r in &prod_real_rows {
+        let order_id = r.get::<i64, _>("order_id");
+        if source_set.contains(&order_id) { continue; }
+        let name = r.get::<String, _>("product_name");
+        let spec = r.get::<String, _>("spec");
+        let qty = r.get::<f64, _>("quantity");
+        let amount = r.get::<f64, _>("amount");
+        let entry = product_map.entry((name, spec)).or_insert((0.0, 0.0));
+        entry.0 += qty;
+        entry.1 += amount;
+    }
+    let prod_supp_sql = format!(
+        "SELECT osi.product_name, COALESCE(osi.spec,'') as spec, osi.quantity, osi.amount
+         FROM order_supplement_item osi
+         JOIN sales_order so ON osi.target_order_id = so.id
+         WHERE 1=1 {}", date_cond
+    );
+    let mut q4 = sqlx::query(AssertSqlSafe(prod_supp_sql.as_str()));
+    for b in &binds { q4 = q4.bind(b); }
+    let prod_supp_rows = q4.fetch_all(pool()).await.unwrap_or_default();
+    for r in &prod_supp_rows {
+        let name = r.get::<String, _>("product_name");
+        let spec = r.get::<String, _>("spec");
+        let qty = r.get::<f64, _>("quantity");
+        let amount = r.get::<f64, _>("amount");
+        let entry = product_map.entry((name, spec)).or_insert((0.0, 0.0));
+        entry.0 += qty;
+        entry.1 += amount;
+    }
+    let mut by_product: Vec<serde_json::Value> = product_map.iter().map(|((name, spec), (qty, amount))| {
+        serde_json::json!({
+            "product_name": name,
+            "spec": spec,
+            "quantity": qty,
+            "reimburse_amount": amount,
+        })
+    }).collect();
+    by_product.sort_by(|a, b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+
+    let result = serde_json::json!({
+        "by_purchaser": by_purchaser,
+        "by_product": by_product,
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+// 分摊来源统计：列出所有作为分摊来源的订单及其分摊去向
+async fn api_query_allocation_source(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    let mut sql = String::from(
+        "SELECT ca.source_order_id, ca.total_amount, ca.allocated_amount, ca.remaining_balance, ca.status,
+                so.order_no, so.order_date
+         FROM consumable_allocation ca
+         JOIN sales_order so ON ca.source_order_id = so.id
+         WHERE 1=1"
+    );
+    let mut binds: Vec<String> = Vec::new();
+    if !start_date.is_empty() {
+        sql.push_str(" AND so.order_date >= ?");
+        binds.push(start_date.to_string());
+    }
+    if !end_date.is_empty() {
+        sql.push_str(" AND so.order_date <= ?");
+        binds.push(end_date.to_string());
+    }
+    sql.push_str(" ORDER BY so.order_date DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds { q = q.bind(b); }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
+
+    let mut result: Vec<serde_json::Value> = Vec::new();
+    for r in &rows {
+        let source_order_id = r.get::<i64, _>("source_order_id");
+        // 查询该来源单分摊到的各目标单及金额
+        let targets = sqlx::query(
+            "SELECT so.order_no, SUM(osi.amount) as amount
+             FROM order_supplement_item osi
+             JOIN sales_order so ON osi.target_order_id = so.id
+             WHERE osi.source_order_id = ?
+             GROUP BY osi.target_order_id
+             HAVING SUM(osi.amount) <> 0
+             ORDER BY amount DESC"
+        )
+        .bind(source_order_id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+        let target_list: Vec<serde_json::Value> = targets.iter().map(|t| {
+            serde_json::json!({
+                "order_no": t.get::<String, _>("order_no"),
+                "amount": t.get::<f64, _>("amount"),
+            })
+        }).collect();
+
+        result.push(serde_json::json!({
+            "source_order_id": source_order_id,
+            "order_no": r.get::<String, _>("order_no"),
+            "order_date": r.get::<String, _>("order_date"),
+            "total_amount": r.get::<f64, _>("total_amount"),
+            "allocated_amount": r.get::<f64, _>("allocated_amount"),
+            "remaining_balance": r.get::<f64, _>("remaining_balance"),
+            "status": r.get::<i64, _>("status"),
+            "targets": target_list,
+        }));
+    }
+
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
@@ -13674,6 +15779,318 @@ async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
+struct StockSummaryRow {
+    day: String,
+    warehouse_id: i64,
+    warehouse_name: String,
+    is_summary: bool,
+    in_amount: f64,
+    in_item_count: i64,
+    in_order_count: i64,
+    out_amount: f64,
+    out_item_count: i64,
+    out_order_count: i64,
+    net_amount: f64,
+}
+
+async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64) {
+    // 采购入库按日+仓库汇总
+    let mut purchase_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() {
+        purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        purchase_where.push_str(&format!(" AND po.order_date <= '{}'", end_date));
+    }
+    let purchase_sql = format!(
+        "SELECT po.order_date as day,
+                COALESCE(po.warehouse_id, 0) as warehouse_id,
+                COALESCE(po.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(poi.amount), 0) as in_amount,
+                COUNT(poi.id) as in_item_count,
+                COUNT(DISTINCT po.id) as in_order_count
+         FROM purchase_order po
+         JOIN purchase_order_item poi ON poi.order_id = po.id
+         {}
+         GROUP BY po.order_date, po.warehouse_id, po.warehouse_name",
+        purchase_where
+    );
+    let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 销售出库按日+仓库汇总
+    let mut sales_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() {
+        sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        sales_where.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sales_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(soi.amount), 0) as out_amount,
+                COUNT(soi.id) as out_item_count,
+                COUNT(DISTINCT so.id) as out_order_count
+         FROM sales_order so
+         JOIN sales_order_item soi ON soi.order_id = so.id
+         {}
+         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+        sales_where
+    );
+    let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    use std::collections::{BTreeMap, HashMap};
+
+    // Key: (day, warehouse_id) -> (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name)
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String)>> = HashMap::new();
+
+    // 先收集所有仓库名称用于排序
+    let mut warehouse_names: BTreeMap<i64, String> = BTreeMap::new();
+
+    for row in &purchase_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("in_amount");
+        let items: i64 = row.get::<i64, _>("in_item_count");
+        let orders: i64 = row.get::<i64, _>("in_order_count");
+
+        warehouse_names.insert(wh_id, wh_name.clone());
+
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        e.0 += amount;
+        e.1 += items;
+        e.2 += orders;
+    }
+
+    for row in &sales_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let items: i64 = row.get::<i64, _>("out_item_count");
+        let orders: i64 = row.get::<i64, _>("out_order_count");
+
+        warehouse_names.insert(wh_id, wh_name.clone());
+
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        e.3 += amount;
+        e.4 += items;
+        e.5 += orders;
+    }
+
+    // 按日期倒序，每天输出仓库明细行 + 汇总行
+    let mut days: Vec<String> = day_wh_map.keys().cloned().collect();
+    days.sort_by(|a, b| b.cmp(a)); // 倒序
+
+    let mut rows: Vec<StockSummaryRow> = Vec::new();
+    let mut total_in = 0.0;
+    let mut total_out = 0.0;
+
+    for day in &days {
+        if let Some(wh_map) = day_wh_map.get(day) {
+            let mut day_in = 0.0;
+            let mut day_out = 0.0;
+            let mut day_in_items = 0;
+            let mut day_out_items = 0;
+            let mut day_in_orders = 0;
+            let mut day_out_orders = 0;
+
+            // 输出每个仓库行
+            for (wh_id, v) in wh_map {
+                day_in += v.0;
+                day_out += v.3;
+                day_in_items += v.1;
+                day_out_items += v.4;
+                day_in_orders += v.2;
+                day_out_orders += v.5;
+
+                rows.push(StockSummaryRow {
+                    day: day.clone(),
+                    warehouse_id: *wh_id,
+                    warehouse_name: v.6.clone(),
+                    is_summary: false,
+                    in_amount: v.0,
+                    in_item_count: v.1,
+                    in_order_count: v.2,
+                    out_amount: v.3,
+                    out_item_count: v.4,
+                    out_order_count: v.5,
+                    net_amount: v.0 - v.3,
+                });
+            }
+
+            // 输出当天汇总行
+            rows.push(StockSummaryRow {
+                day: day.clone(),
+                warehouse_id: -1,
+                warehouse_name: "当日汇总".to_string(),
+                is_summary: true,
+                in_amount: day_in,
+                in_item_count: day_in_items,
+                in_order_count: day_in_orders,
+                out_amount: day_out,
+                out_item_count: day_out_items,
+                out_order_count: day_out_orders,
+                net_amount: day_in - day_out,
+            });
+
+            total_in += day_in;
+            total_out += day_out;
+        }
+    }
+
+    (rows, total_in, total_out)
+}
+
+async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+
+    // 收集所有仓库列表（保持原有兼容性，虽然导出不再需要）
+    use std::collections::BTreeMap;
+    let mut warehouse_names: BTreeMap<i64, String> = BTreeMap::new();
+    for r in &rows {
+        if r.warehouse_id >= 0 {
+            warehouse_names.insert(r.warehouse_id, r.warehouse_name.clone());
+        }
+    }
+    let warehouse_list: Vec<serde_json::Value> = warehouse_names
+        .iter()
+        .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+        .collect();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "day": r.day,
+            "warehouse_id": r.warehouse_id,
+            "warehouse_name": r.warehouse_name,
+            "is_summary": r.is_summary,
+            "in_amount": r.in_amount,
+            "in_item_count": r.in_item_count,
+            "in_order_count": r.in_order_count,
+            "out_amount": r.out_amount,
+            "out_item_count": r.out_item_count,
+            "out_order_count": r.out_order_count,
+            "net_amount": r.net_amount,
+        })
+    }).collect();
+
+    let result = serde_json::json!({
+        "rows": items,
+        "warehouses": warehouse_list,
+        "total_in_amount": total_in,
+        "total_out_amount": total_out,
+        "total_net_amount": total_in - total_out,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("出入库统计").unwrap();
+
+    let header_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0x2E75B6))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+
+    let summary_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+
+    let num_format = rust_xlsxwriter::Format::new()
+        .set_num_format("#,##0.00")
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+
+    let num_format_sum = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_num_format("#,##0.00")
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "出库单数", "出库条数", "净额"];
+    for (col, header) in headers.iter().enumerate() {
+        worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
+    }
+
+    // 设置列宽
+    worksheet.set_column_width(0, 14).unwrap(); // 日期
+    worksheet.set_column_width(1, 16).unwrap(); // 仓库
+    worksheet.set_column_width_pixels(2, 90).unwrap(); // 金额列统一
+    worksheet.set_column_width_pixels(3, 70).unwrap();
+    worksheet.set_column_width_pixels(4, 70).unwrap();
+    worksheet.set_column_width_pixels(5, 90).unwrap();
+    worksheet.set_column_width_pixels(6, 70).unwrap();
+    worksheet.set_column_width_pixels(7, 70).unwrap();
+    worksheet.set_column_width_pixels(8, 90).unwrap();
+
+    let mut prev_day = String::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let sheet_row = (row_idx + 1) as u32;
+        // 日期只在第一次出现时填写
+        let day_display = if row.day != prev_day { row.day.as_str() } else { "" };
+        prev_day = row.day.clone();
+
+        if row.is_summary {
+            worksheet.write_with_format(sheet_row, 0, day_display, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 1, &row.warehouse_name, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format_sum).unwrap();
+        } else {
+            worksheet.write(sheet_row, 0, day_display).unwrap();
+            worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
+            worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 6, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 7, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format).unwrap();
+        }
+    }
+
+    // 最后附加一个总计行
+    let total_row = (rows.len() + 2) as u32;
+    worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
+    worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 8, total_in - total_out, &num_format_sum).unwrap();
+
+    let buf = workbook.save_to_buffer().unwrap();
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"stock_summary.xlsx\""),
+        ],
+        buf,
+    ).into_response()
+}
+
 async fn api_query_stock_warning() -> impl IntoResponse {
     let low_rows = sqlx::query(
         "SELECT p.name as product_name, p.spec, p.unit, i.quantity as current_stock, i.min_stock
@@ -13915,6 +16332,8 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
+    let purchaser_id: Option<i64> = params.get("purchaser_id").and_then(|s| s.parse().ok());
+    
     // 排序处理
     let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
     let sort_order = params.get("sort_order").map(|s| s.as_str()).unwrap_or("desc");
@@ -13926,35 +16345,57 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
         _ => format!("so.id {}", sort_order),
     };
     
-    let total_rows = sqlx::query(
-        "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
-         WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?"
-    )
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .bind(&keyword_pattern)
-    .fetch_one(pool())
-    .await
-    .unwrap();
+    let (total_sql, total_params) = if let Some(pid) = purchaser_id {
+        (
+            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+             WHERE so.purchaser_id = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)",
+            vec![pid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    } else {
+        (
+            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+             WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?",
+            vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    };
+    
+    let mut total_query = sqlx::query(total_sql);
+    for p in &total_params {
+        total_query = total_query.bind(p);
+    }
+    let total_rows = total_query.fetch_one(pool()).await.unwrap();
     let total: i64 = total_rows.get("count");
     
-    let sql = format!(
-        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
-         FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
-         WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
-         ORDER BY {} LIMIT ? OFFSET ?",
-        order_clause
-    );
+    let (sql, query_params) = if let Some(pid) = purchaser_id {
+        (
+            format!(
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
+                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+                 WHERE so.purchaser_id = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![pid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    } else {
+        (
+            format!(
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
+                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+                 WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        )
+    };
     
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(&keyword_pattern)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(pool())
-        .await
-        .unwrap_or_default();
+    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for p in &query_params {
+        query = query.bind(p);
+    }
+    query = query.bind(page_size).bind(offset);
+    let rows = query.fetch_all(pool()).await.unwrap_or_default();
     
     let orders: Vec<serde_json::Value> = rows
         .iter()
@@ -14073,6 +16514,2186 @@ fn get_category_sort_key(category_name: &str, parent_name: &str) -> i64 {
     999
 }
 
+async fn page_supplement() -> Html<String> {
+    let content = r#"
+        <div class="card mb-4">
+            <div class="card-body">
+                <h4>耗材分摊管理</h4>
+                
+                <div class="row" id="topSection">
+                    <div class="col-md-4">
+                        <label>采购单位</label>
+                        <div class="position-relative">
+                            <input type="text" id="purchaserInput" class="form-control" placeholder="单击选择 / 双击搜索" readonly>
+                            <div id="purchaserDropdown" class="search-dropdown"></div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <label>耗材订单（来源）</label>
+                        <div class="position-relative">
+                            <input type="text" id="consumableOrderInput" class="form-control" placeholder="单击选择 / 双击搜索" readonly>
+                            <div id="consumableOrderDropdown" class="search-dropdown"></div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <label>目标订单（分摊到）</label>
+                        <div class="position-relative">
+                            <input type="text" id="targetOrderInput" class="form-control" placeholder="单击选择 / 双击搜索" readonly>
+                            <div id="targetOrderDropdown" class="search-dropdown"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-3">
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <h6 class="mb-0">已进入分摊的订单列表 <span class="badge badge-info" id="allocatedOrdersCount">0</span></h6>
+                        <button class="btn btn-xs btn-outline-secondary" onclick="loadAllocatedOrders()">刷新</button>
+                    </div>
+                    <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
+                        <table class="table table-sm table-bordered mb-0" id="allocatedOrdersTable">
+                            <thead class="thead-light"><tr>
+                                <th>订单号</th><th>采购单位</th><th>订单日期</th>
+                                <th>总金额</th><th>已分摊</th><th>剩余余额</th>
+                                <th>状态</th><th>创建时间</th><th>完成时间</th><th>操作</th>
+                            </tr></thead>
+                            <tbody><tr><td colspan="10" class="text-center text-muted small">暂无</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="row mt-4" id="bottomSection">
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header bg-danger text-white d-flex justify-content-between align-items-center">
+                                <h5>可分摊源订单列表</h5>
+                                <div id="allocationStatusBadge" class="badge badge-light" style="display: none;">未分摊</div>
+                            </div>
+                            <div id="allocationSummary" class="card-body p-2" style="display: none; background-color: #fff3f3;">
+                                <div class="row">
+                                    <div class="col-md-3 text-center">
+                                        <div class="small text-muted">总金额</div>
+                                        <div class="font-bold" id="summaryTotal">0.00</div>
+                                    </div>
+                                    <div class="col-md-3 text-center">
+                                        <div class="small text-muted">已分摊</div>
+                                        <div class="font-bold text-success" id="summaryAllocated">0.00</div>
+                                    </div>
+                                    <div class="col-md-3 text-center">
+                                        <div class="small text-muted">未分摊余额</div>
+                                        <div class="font-bold text-danger" id="summaryRemaining">0.00</div>
+                                    </div>
+                                    <div class="col-md-3 text-center">
+                                        <div class="small text-muted">分摊状态</div>
+                                        <div class="font-bold" id="summaryStatus">未分摊</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card-body" style="height: 250px; overflow-y: auto;">
+                                <table class="table table-sm table-bordered" id="consumableOrderList">
+                                    <thead><tr><th>订单号</th><th>日期</th><th>金额</th><th>状态</th></tr></thead>
+                                    <tbody></tbody>
+                                </table>
+                            </div>
+                            <div class="card-footer">
+                                <div id="consumableOrderDetail">
+                                    <p>请选择订单查看详情</p>
+                                </div>
+                                <div id="allocationInitActions" class="mt-2" style="display: none;">
+                                    <button class="btn btn-sm btn-primary" onclick="createAllocation()">初始化分摊方案</button>
+                                </div>
+                                <div id="allocationManageActions" class="mt-2" style="display: none;">
+                                    <button class="btn btn-sm btn-success" onclick="confirmCompleteAllocation()">确认完成分摊</button>
+                                    <button class="btn btn-sm btn-warning" onclick="terminateAllocation()">终止分摊</button>
+                                    <button class="btn btn-sm btn-secondary" onclick="cancelAllocation()" title="仅在未产生分摊记录时可用；取消后回到未分摊状态">取消分摊方案</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header bg-success text-white">
+                                <h5>目标订单列表（可分摊到）</h5>
+                            </div>
+                            <div class="card-body" style="height: 250px; overflow-y: auto;">
+                                <table class="table table-sm table-bordered" id="targetOrderList">
+                                    <thead><tr><th>订单号</th><th>日期</th><th>金额</th><th>订单状态</th></tr></thead>
+                                    <tbody></tbody>
+                                </table>
+                            </div>
+                            <div class="card-footer">
+                                <div id="targetOrderDetail">
+                                    <p>请选择订单查看详情</p>
+                                </div>
+                                <div id="compareArea" style="display: none;">
+                                    <hr>
+                                    <h6>真实账套 vs 分摊账套 对比</h6>
+                                    <div class="row">
+                                        <div class="col-md-6">
+                                            <div class="card bg-light">
+                                                <div class="card-header py-1">
+                                                    <small><strong>真实账套</strong> - <span id="realTotalLabel">0.00</span> 元</small>
+                                                </div>
+                                                <div class="card-body p-1" style="max-height: 300px; overflow-y: auto;">
+                                                    <table class="table table-sm table-bordered mb-0" id="realTable">
+                                                        <thead class="thead-light"><tr><th>商品</th><th>数量</th><th>金额</th></tr></thead>
+                                                        <tbody></tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="card border-success">
+                                                <div class="card-header bg-success text-white py-1">
+                                                    <small><strong>分摊账套</strong> - <span id="allocTotalLabel">0.00</span> 元 <span class="badge badge-warning ml-1">差异 +<span id="diffTotalLabel">0.00</span></span></small>
+                                                </div>
+                                                <div class="card-body p-1" style="max-height: 300px; overflow-y: auto;">
+                                                    <table class="table table-sm table-bordered mb-0" id="allocTable">
+                                                        <thead class="thead-light"><tr><th>商品</th><th>数量</th><th>金额</th></tr></thead>
+                                                        <tbody></tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div id="supplementActionArea" class="mt-3" style="display: none;">
+                                    <hr>
+                                    <h6>增项操作</h6>
+                                    <div class="row mb-2">
+                                        <div class="col-md-12">
+                                            <label class="radio-inline mr-4">
+                                                <input type="radio" name="operationType" value="new_item" checked onchange="toggleOperationType()"> 新增商品行
+                                            </label>
+                                            <label class="radio-inline mr-4">
+                                                <input type="radio" name="operationType" value="increase_quantity" onchange="toggleOperationType()"> 追加已有商品数量
+                                            </label>
+                                            <label class="radio-inline">
+                                                <input type="radio" name="operationType" value="replace_item" onchange="toggleOperationType()"> 替换明细
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="row mb-2" id="newItemSection">
+                                        <div class="col-md-6">
+                                            <label>选择商品</label>
+                                            <div class="position-relative">
+                                                <input type="text" id="suppProductInput" class="form-control form-control-sm" placeholder="点击选择商品" readonly>
+                                                <div id="suppProductDropdown" class="search-dropdown"></div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>增项数量</label>
+                                            <input type="number" step="0.01" id="addQtyInput" class="form-control form-control-sm" oninput="calcSupplementAmount()">
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>单价</label>
+                                            <input type="number" step="0.01" id="addPriceInput" class="form-control form-control-sm" oninput="calcSupplementAmount()">
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>增项金额</label>
+                                            <input type="number" step="0.01" id="addAmountInput" class="form-control form-control-sm" readonly>
+                                        </div>
+                                    </div>
+                                    <div class="row mb-2" id="increaseQtySection" style="display: none;">
+                                        <div class="col-md-4">
+                                            <label>选择目标商品</label>
+                                            <select id="increaseProductSelect" class="form-control form-control-sm"></select>
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>追加数量</label>
+                                            <input type="number" step="0.01" id="increaseQtyInput" class="form-control form-control-sm" oninput="calcIncreaseAmount()">
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>单价</label>
+                                            <input type="text" id="increasePriceInput" class="form-control form-control-sm" readonly>
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>追加金额</label>
+                                            <input type="text" id="increaseAmountInput" class="form-control form-control-sm" readonly>
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label>&nbsp;</label><br>
+                                            <span class="text-muted small" id="increaseTotalHint">合计数量: 0</span>
+                                        </div>
+                                    </div>
+                                    <div id="replaceSection" style="display: none;">
+                                        <div class="row mb-2">
+                                            <div class="col-md-6">
+                                                <label>被替换的原明细（从真实明细选择）</label>
+                                                <select id="replaceSourceSelect" class="form-control form-control-sm" onchange="onReplaceSourceChange()"></select>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <label>&nbsp;</label><br>
+                                                <span class="text-muted small" id="replaceSourceHint">原明细金额: 0.00</span>
+                                            </div>
+                                        </div>
+                                        <div class="row mb-2 align-items-end">
+                                            <div class="col-md-5">
+                                                <label>替换为商品</label>
+                                                <div class="position-relative">
+                                                    <input type="text" id="replaceProductInput" class="form-control form-control-sm" placeholder="点击选择商品" readonly>
+                                                    <div id="replaceProductDropdown" class="search-dropdown"></div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-2">
+                                                <label>数量</label>
+                                                <input type="number" step="0.01" id="replaceQtyInput" class="form-control form-control-sm" oninput="calcReplaceAmount()">
+                                            </div>
+                                            <div class="col-md-2">
+                                                <label>单价</label>
+                                                <input type="number" step="0.01" id="replacePriceInput" class="form-control form-control-sm" oninput="calcReplaceAmount()">
+                                            </div>
+                                            <div class="col-md-2">
+                                                <label>金额</label>
+                                                <input type="number" step="0.01" id="replaceAmountInput" class="form-control form-control-sm" readonly>
+                                            </div>
+                                            <div class="col-md-1">
+                                                <button class="btn btn-sm btn-outline-primary" onclick="addReplaceLine()">加行</button>
+                                            </div>
+                                        </div>
+                                        <table class="table table-sm table-bordered" id="replaceLineList">
+                                            <thead><tr><th>替换为商品</th><th>数量</th><th>单价</th><th>金额</th><th>操作</th></tr></thead>
+                                            <tbody></tbody>
+                                        </table>
+                                        <div class="mb-2">
+                                            <span class="text-muted small">替换后合计: <span id="replaceLinesTotal">0.00</span> 元</span>
+                                            <span class="ml-3 small" id="replaceDiffHint"></span>
+                                        </div>
+                                    </div>
+                                    <div class="row">
+                                        <div class="col-md-2">
+                                            <label>分摊日期</label>
+                                            <input type="date" id="allocateDateInput" class="form-control form-control-sm">
+                                        </div>
+                                        <div class="col-md-10">
+                                            <label>&nbsp;</label><br>
+                                            <button class="btn btn-sm btn-primary" onclick="dispatchAddOperation()">添加到分摊</button>
+                                            <span class="text-danger ml-2" id="balanceWarning"></span>
+                                        </div>
+                                    </div>
+                                    <table class="table table-sm table-bordered mt-2" id="supplementList">
+                                        <thead><tr><th>操作类型</th><th>商品名称</th><th>数量</th><th>金额</th><th>来源订单</th><th>操作</th></tr></thead>
+                                        <tbody></tbody>
+                                    </table>
+                                    <button class="btn btn-sm btn-success" onclick="saveAllSupplements()">保存增项</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let currentPurchaserId = null;
+            let currentPurchaserName = '';
+            let consumableOrders = [];
+            let targetOrders = [];
+            let selectedConsumableOrder = null;
+            let selectedTargetOrder = null;
+            let consumableOrderDetails = [];
+            let targetOrderDetails = [];
+            let pendingSupplements = [];
+            let allocationSummary = null;
+            let pendingReplaceLines = [];
+            let selectedReplaceProduct = null;
+
+            function initPurchaserSearch() {
+                const input = document.getElementById('purchaserInput');
+                input.addEventListener('click', function() {
+                    this.readOnly = true;
+                    showPurchaserDropdown('');
+                });
+                input.addEventListener('dblclick', function() {
+                    this.readOnly = false;
+                    this.value = '';
+                    this.focus();
+                });
+                input.addEventListener('input', function() {
+                    showPurchaserDropdown(this.value.trim());
+                });
+                input.addEventListener('blur', function() {
+                    setTimeout(() => {
+                        document.getElementById('purchaserDropdown').style.display = 'none';
+                    }, 200);
+                });
+            }
+
+            function initConsumableOrderSearch() {
+                const input = document.getElementById('consumableOrderInput');
+                input.addEventListener('click', function() {
+                    this.readOnly = true;
+                    showConsumableOrderDropdown('');
+                });
+                input.addEventListener('dblclick', function() {
+                    this.readOnly = false;
+                    this.value = '';
+                    this.focus();
+                });
+                input.addEventListener('input', function() {
+                    showConsumableOrderDropdown(this.value.trim());
+                });
+                input.addEventListener('blur', function() {
+                    setTimeout(() => {
+                        document.getElementById('consumableOrderDropdown').style.display = 'none';
+                    }, 200);
+                });
+            }
+
+            function initTargetOrderSearch() {
+                const input = document.getElementById('targetOrderInput');
+                input.addEventListener('click', function() {
+                    this.readOnly = true;
+                    showTargetOrderDropdown('');
+                });
+                input.addEventListener('dblclick', function() {
+                    this.readOnly = false;
+                    this.value = '';
+                    this.focus();
+                });
+                input.addEventListener('input', function() {
+                    showTargetOrderDropdown(this.value.trim());
+                });
+                input.addEventListener('blur', function() {
+                    setTimeout(() => {
+                        document.getElementById('targetOrderDropdown').style.display = 'none';
+                    }, 200);
+                });
+            }
+
+            async function showPurchaserDropdown(keyword) {
+                const res = await fetch('/api/purchaser/list' + (keyword ? '?keyword=' + encodeURIComponent(keyword) : ''));
+                const data = await res.json();
+                const dropdown = document.getElementById('purchaserDropdown');
+                dropdown.innerHTML = '';
+                data.forEach(p => {
+                    const li = document.createElement('li');
+                    li.className = 'search-item';
+                    li.textContent = p.name;
+                    li.onclick = () => selectPurchaser(p.id, p.name);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = data.length > 0 ? 'block' : 'none';
+            }
+
+            function showConsumableOrderDropdown(keyword) {
+                const dropdown = document.getElementById('consumableOrderDropdown');
+                dropdown.innerHTML = '';
+                const filtered = consumableOrders.filter(o => 
+                    o.order_no.toLowerCase().includes(keyword.toLowerCase())
+                );
+                filtered.forEach(order => {
+                    const li = document.createElement('li');
+                    li.className = 'search-item';
+                    li.textContent = `${order.order_no} - ${order.order_date}`;
+                    li.onclick = () => selectConsumableOrder(order);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = filtered.length > 0 ? 'block' : 'none';
+            }
+
+            function showTargetOrderDropdown(keyword) {
+                const dropdown = document.getElementById('targetOrderDropdown');
+                dropdown.innerHTML = '';
+                const filtered = targetOrders.filter(o => 
+                    o.order_no.toLowerCase().includes(keyword.toLowerCase())
+                );
+                filtered.forEach(order => {
+                    const li = document.createElement('li');
+                    li.className = 'search-item';
+                    li.textContent = `${order.order_no} - ${order.order_date}`;
+                    li.onclick = () => selectTargetOrder(order);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = filtered.length > 0 ? 'block' : 'none';
+            }
+
+            function selectPurchaser(id, name) {
+                currentPurchaserId = id;
+                currentPurchaserName = name;
+                const input = document.getElementById('purchaserInput');
+                input.value = name;
+                input.readOnly = false;
+                document.getElementById('purchaserDropdown').style.display = 'none';
+                loadOrdersByPurchaser();
+                resetOrderSelection();
+            }
+
+            async function loadOrdersByPurchaser() {
+                if (!currentPurchaserId) return;
+                console.log('Loading orders for purchaser_id:', currentPurchaserId);
+                try {
+                    const res = await fetch('/api/sales_order/by_purchaser/' + currentPurchaserId);
+                    if (!res.ok) {
+                        console.error('API error:', res.status, res.statusText);
+                        alert('加载订单失败: ' + res.statusText);
+                        return;
+                    }
+                    const data = await res.json();
+                    console.log('API response:', data);
+                    consumableOrders = data;
+                    targetOrders = data;
+                    console.log('源订单:', consumableOrders.length, '目标订单:', targetOrders.length);
+                    renderOrderLists();
+                } catch (e) {
+                    console.error('Fetch error:', e);
+                    alert('加载订单失败: ' + e.message);
+                }
+            }
+
+            function renderOrderLists() {
+                const consumableTbody = document.querySelector('#consumableOrderList tbody');
+                consumableTbody.innerHTML = '';
+                const allocationStatusMap = { '-1': '未初始化', '0': '未分摊', '1': '分摊中', '2': '已完成', '3': '已终止' };
+                consumableOrders.forEach(order => {
+                    const tr = document.createElement('tr');
+                    tr.style.cursor = 'pointer';
+                    const allocationStatus = order.allocation_status !== undefined ? order.allocation_status : -1;
+                    const statusText = allocationStatusMap[allocationStatus] || '未知';
+                    tr.innerHTML = `<td>${order.order_no}</td><td>${order.order_date}</td><td>${order.total_amount.toFixed(2)}</td><td>${statusText}</td>`;
+                    tr.onclick = () => selectConsumableOrder(order);
+                    consumableTbody.appendChild(tr);
+                });
+
+                const targetTbody = document.querySelector('#targetOrderList tbody');
+                targetTbody.innerHTML = '';
+                targetOrders.forEach(order => {
+                    const tr = document.createElement('tr');
+                    tr.style.cursor = 'pointer';
+                    const statusText = ['accepted', 'settled'].includes(order.status) ? '已完成' : '未完成';
+                    tr.innerHTML = `<td>${order.order_no}</td><td>${order.order_date}</td><td>${order.total_amount.toFixed(2)}</td><td>${statusText}</td>`;
+                    tr.onclick = () => selectTargetOrder(order);
+                    targetTbody.appendChild(tr);
+                });
+            }
+
+            async function selectConsumableOrder(order) {
+                selectedConsumableOrder = order;
+                document.getElementById('consumableOrderInput').value = order.order_no;
+                const res = await fetch('/api/sales_order/detail/' + order.id);
+                const data = await res.json();
+                consumableOrderDetails = data.items || [];
+                await loadAllocationSummary(order.id);
+                renderConsumableOrderDetail();
+                await loadAllocationOrders(order.id);
+            }
+
+            function renderConsumableOrderDetail() {
+                const detailDiv = document.getElementById('consumableOrderDetail');
+                const hasScheme = allocationSummary && allocationSummary.exists;
+                const schemeItemIds = (hasScheme && allocationSummary.source_item_ids) ? allocationSummary.source_item_ids : [];
+                let html = `<h6>${selectedConsumableOrder.order_no} 明细</h6>`;
+                html += `<table class="table table-sm table-bordered"><thead><tr><th style="width:36px;">选</th><th>商品</th><th>规格</th><th>单位</th><th>数量</th><th>金额</th><th>类别</th></tr></thead><tbody>`;
+                consumableOrderDetails.forEach(item => {
+                    // 已有方案：仅勾选并高亮已纳入的明细行，复选框禁用；无方案：默认全选可编辑
+                    const inScheme = hasScheme ? schemeItemIds.includes(item.id) : true;
+                    const disabled = hasScheme ? 'disabled' : '';
+                    const rowStyle = (hasScheme && inScheme) ? ' style="background-color:#e8f4ff;"' : '';
+                    const checked = inScheme ? 'checked' : '';
+                    html += `<tr${rowStyle}><td class="text-center"><input type="checkbox" class="src-item-check" data-id="${item.id}" data-amount="${item.amount || 0}" ${checked} ${disabled} onchange="updateSelectedSourceTotal()"></td><td>${item.product_name || ''}</td><td>${item.spec || '-'}</td><td>${item.unit || ''}</td><td>${(item.quantity || 0).toFixed(2)}</td><td>${(item.amount || 0).toFixed(2)}</td><td>${item.category_name || ''}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                if (!hasScheme) {
+                    html += '<div class="mb-2"><span class="text-muted small">已选明细合计: <span id="selectedSourceTotal">0.00</span> 元（全选=整单分摊）</span></div>';
+                }
+                html += '<div id="allocationOrdersSection"></div>';
+                detailDiv.innerHTML = html;
+                if (!hasScheme) updateSelectedSourceTotal();
+            }
+
+            function updateSelectedSourceTotal() {
+                const el = document.getElementById('selectedSourceTotal');
+                if (!el) return;
+                let total = 0;
+                document.querySelectorAll('.src-item-check:checked').forEach(cb => {
+                    total += parseFloat(cb.getAttribute('data-amount')) || 0;
+                });
+                el.textContent = total.toFixed(2);
+            }
+
+            async function loadAllocationSummary(orderId) {
+                const res = await fetch('/api/allocation/summary/' + orderId);
+                const data = await res.json();
+                allocationSummary = data;
+                updateAllocationUI();
+            }
+
+            async function loadAllocationOrders(orderId) {
+                const res = await fetch('/api/supplement/list_by_source/' + orderId);
+                const supplements = await res.json();
+                
+                const section = document.getElementById('allocationOrdersSection');
+                if (!section) return;
+                
+                if (!supplements || supplements.length === 0) {
+                    section.innerHTML = '<p class="text-muted small">暂无分摊订单记录</p>';
+                    return;
+                }
+
+                let html = '<hr><h6>关联分摊订单（<span class="text-danger small">可回滚</span>）</h6>';
+                html += '<div style="max-height: 200px; overflow-y: auto;">';
+                html += '<table class="table table-sm table-bordered"><thead><tr><th>目标订单</th><th>商品</th><th>数量</th><th>金额</th><th>操作</th></tr></thead><tbody>';
+                
+                supplements.forEach(supp => {
+                    const opMap = { 'increase_quantity': '+追加', 'new_item': '+新增', 'replace_remove': '替换-冲减', 'replace_add': '替换-换入' };
+                    const opTypeText = opMap[supp.operation_type] || '+新增';
+                    html += `<tr><td>${supp.target_order_no || '未知'}</td><td>${opTypeText} ${supp.product_name}</td><td>${(supp.quantity || 0).toFixed(2)}</td><td>${(supp.amount || 0).toFixed(2)}</td>`;
+                    html += `<td><button class="btn btn-xs btn-danger" onclick="rollbackSupplement(${supp.id})">回滚</button></td></tr>`;
+                });
+                
+                html += '</tbody></table></div>';
+                section.innerHTML = html;
+            }
+
+            async function rollbackSupplement(supplementId) {
+                if (!confirm('确定回滚该分摊项？')) return;
+                try {
+                    const res = await fetch('/api/supplement/delete/' + supplementId, { method: 'DELETE' });
+                    if (res.ok) {
+                        alert('回滚成功');
+                        if (selectedConsumableOrder) {
+                            await loadAllocationSummary(selectedConsumableOrder.id);
+                            renderConsumableOrderDetail();
+                            await loadAllocationOrders(selectedConsumableOrder.id);
+                            await loadOrdersByPurchaser();
+                            await loadAllocatedOrders();
+                        }
+                    } else {
+                        const text = await res.text();
+                        alert('回滚失败: ' + text);
+                    }
+                } catch (e) {
+                    alert('回滚失败: ' + e.message);
+                }
+            }
+
+            async function cancelAllocation() {
+                if (!selectedConsumableOrder) return;
+                if (!allocationSummary || !allocationSummary.exists) {
+                    alert('当前订单未初始化分摊方案');
+                    return;
+                }
+                if ((allocationSummary.allocated_amount || 0) > 0.0001) {
+                    alert('已存在分摊记录，请先回滚全部分摊后再取消');
+                    return;
+                }
+                if (!confirm('确定取消该分摊方案？取消后订单将回到未分摊状态，可重新选择明细。')) return;
+                const res = await fetch('/api/allocation/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source_order_id: selectedConsumableOrder.id })
+                });
+                if (res.ok) {
+                    await loadAllocationSummary(selectedConsumableOrder.id);
+                    renderConsumableOrderDetail();
+                    await loadAllocationOrders(selectedConsumableOrder.id);
+                    await loadOrdersByPurchaser();
+                    await loadAllocatedOrders();
+                    alert('取消成功，已回到未分摊状态');
+                } else {
+                    const text = await res.text();
+                    alert('取消失败: ' + text);
+                }
+            }
+
+            async function loadAllocatedOrders() {
+                const res = await fetch('/api/allocation/allocated_orders');
+                const list = await res.json();
+                window._allocatedOrdersMap = {};
+                list.forEach(o => { window._allocatedOrdersMap[o.source_order_id] = o; });
+                const tbody = document.querySelector('#allocatedOrdersTable tbody');
+                document.getElementById('allocatedOrdersCount').textContent = list.length;
+                tbody.innerHTML = '';
+                if (!list.length) {
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted small">暂无</td></tr>';
+                    return;
+                }
+                const statusMap = { 0: ['未分摊', 'secondary'], 1: ['分摊中', 'info'], 2: ['已完成', 'success'], 3: ['已终止', 'warning'] };
+                list.forEach(o => {
+                    const tr = document.createElement('tr');
+                    const st = statusMap[o.status] || ['未知', 'light'];
+                    tr.innerHTML =
+                        '<td><a href="javascript:void(0)" onclick="selectAllocatedOrder(' + o.source_order_id + ')">' + (o.order_no || '') + '</a></td>' +
+                        '<td>' + (o.purchaser_name || '') + '</td>' +
+                        '<td>' + (o.order_date || '') + '</td>' +
+                        '<td class="text-right">' + (o.total_amount || 0).toFixed(2) + '</td>' +
+                        '<td class="text-right text-success">' + (o.allocated_amount || 0).toFixed(2) + '</td>' +
+                        '<td class="text-right text-danger">' + (o.remaining_balance || 0).toFixed(2) + '</td>' +
+                        '<td><span class="badge badge-' + st[1] + '">' + st[0] + '</span></td>' +
+                        '<td>' + (o.created_at || '') + '</td>' +
+                        '<td>' + (o.completed_at || '') + '</td>' +
+                        '<td><button class="btn btn-xs btn-outline-primary" onclick="selectAllocatedOrder(' + o.source_order_id + ')">查看</button></td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            async function selectAllocatedOrder(sourceOrderId) {
+                const o = window._allocatedOrdersMap && window._allocatedOrdersMap[sourceOrderId];
+                if (!o) return;
+                // 自动定位到该订单对应的采购单位并加载其订单列表
+                if (o.purchaser_id && currentPurchaserId !== o.purchaser_id) {
+                    currentPurchaserId = o.purchaser_id;
+                    currentPurchaserName = o.purchaser_name || '';
+                    document.getElementById('purchaserInput').value = currentPurchaserName;
+                    await loadOrdersByPurchaser();
+                }
+                const order = consumableOrders.find(x => x.id === sourceOrderId) || {
+                    id: sourceOrderId, order_no: o.order_no, order_date: o.order_date, total_amount: o.total_amount
+                };
+                await selectConsumableOrder(order);
+            }
+
+            function updateAllocationUI() {
+                const summaryDiv = document.getElementById('allocationSummary');
+                const initActions = document.getElementById('allocationInitActions');
+                const manageActions = document.getElementById('allocationManageActions');
+                const badge = document.getElementById('allocationStatusBadge');
+
+                if (!allocationSummary || !allocationSummary.exists) {
+                    summaryDiv.style.display = 'none';
+                    initActions.style.display = 'block';
+                    manageActions.style.display = 'none';
+                    badge.style.display = 'none';
+                    document.getElementById('balanceWarning').textContent = '';
+                    return;
+                }
+
+                summaryDiv.style.display = 'block';
+                initActions.style.display = 'none';
+                
+                document.getElementById('summaryTotal').textContent = allocationSummary.total_amount.toFixed(2);
+                document.getElementById('summaryAllocated').textContent = allocationSummary.allocated_amount.toFixed(2);
+                document.getElementById('summaryRemaining').textContent = allocationSummary.remaining_balance.toFixed(2);
+                
+                const statusMap = { 0: '未分摊', 1: '分摊中', 2: '已完成', 3: '已终止' };
+                const statusText = statusMap[allocationSummary.status] || '未知';
+                document.getElementById('summaryStatus').textContent = statusText;
+                
+                badge.textContent = statusText;
+                badge.style.display = 'inline-block';
+                
+                if (allocationSummary.status === 2) {
+                    badge.className = 'badge badge-success';
+                    manageActions.style.display = 'none';
+                } else if (allocationSummary.status === 3) {
+                    badge.className = 'badge badge-warning';
+                    manageActions.style.display = 'none';
+                } else {
+                    badge.className = allocationSummary.status === 1 ? 'badge badge-info' : 'badge badge-light';
+                    manageActions.style.display = 'block';
+                }
+            }
+
+            async function createAllocation() {
+                if (!selectedConsumableOrder) return;
+                const ids = [];
+                document.querySelectorAll('.src-item-check:checked').forEach(cb => {
+                    ids.push(parseInt(cb.getAttribute('data-id')));
+                });
+                if (ids.length === 0) {
+                    alert('请至少勾选一条要分摊的明细');
+                    return;
+                }
+                const remark = prompt('请输入分摊方案备注（选填）');
+                const res = await fetch('/api/allocation/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        source_order_id: selectedConsumableOrder.id,
+                        source_item_ids: ids,
+                        remark: remark || ''
+                    })
+                });
+                if (res.ok) {
+                    await loadAllocationSummary(selectedConsumableOrder.id);
+                    renderConsumableOrderDetail();
+                    await loadAllocationOrders(selectedConsumableOrder.id);
+                    await loadOrdersByPurchaser();
+                    await loadAllocatedOrders();
+                    alert('分摊方案创建成功');
+                } else {
+                    const text = await res.text();
+                    alert('创建失败: ' + text);
+                }
+            }
+
+            async function terminateAllocation() {
+                if (!selectedConsumableOrder) return;
+                const remark = prompt('请输入终止原因');
+                if (!remark) return;
+                const res = await fetch('/api/allocation/terminate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        source_order_id: selectedConsumableOrder.id,
+                        remark: remark
+                    })
+                });
+                if (res.ok) {
+                    await loadAllocationSummary(selectedConsumableOrder.id);
+                    await loadOrdersByPurchaser();
+                    await loadAllocatedOrders();
+                    alert('终止成功');
+                } else {
+                    const text = await res.text();
+                    alert(text);
+                }
+            }
+
+            async function confirmCompleteAllocation() {
+                if (!selectedConsumableOrder || !allocationSummary || !allocationSummary.exists) {
+                    alert('请先初始化分摊方案');
+                    return;
+                }
+                if (allocationSummary.status === 2) {
+                    alert('分摊方案已完成');
+                    return;
+                }
+                if (allocationSummary.status === 3) {
+                    alert('分摊方案已终止');
+                    return;
+                }
+
+                const remaining = allocationSummary.remaining_balance;
+                const threshold = Math.max(allocationSummary.total_amount * 0.05, 5.0);
+
+                let targetId = null;
+                let autoTail = false;
+
+                if (remaining > threshold) {
+                    alert(`剩余 ${remaining.toFixed(2)} 元未分摊，超过尾差限额（${threshold.toFixed(2)} 元），请继续分摊完成后确认。`);
+                    return;
+                }
+
+                if (remaining > 0.01) {
+                    const msg = `剩余 ${remaining.toFixed(2)} 元未分摊（限额 ${threshold.toFixed(2)} 元），
+系统将自动在已选目标订单中创建一笔"分摊尾差"冲销项。是否继续？`;
+                    if (!confirm(msg)) return;
+                    autoTail = true;
+                    if (selectedTargetOrder) {
+                        targetId = selectedTargetOrder.id;
+                    } else if (targetOrders.length > 0) {
+                        targetId = targetOrders[0].id;
+                    } else {
+                        alert('没有可用的目标订单来创建尾差冲销项');
+                        return;
+                    }
+                }
+
+                try {
+                    const res = await fetch('/api/allocation/complete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            source_order_id: selectedConsumableOrder.id,
+                            target_order_id: targetId,
+                            auto_tail: autoTail,
+                        })
+                    });
+                    const text = await res.text();
+                    if (res.ok) {
+                        const data = JSON.parse(text);
+                        const msg = data.auto_tail ? '分摊完成，已自动创建尾差冲销项。' : '分摊完成！';
+                        alert(msg);
+                        await loadAllocationSummary(selectedConsumableOrder.id);
+                        await loadOrdersByPurchaser();
+                        await loadAllocatedOrders();
+                    } else {
+                        alert(text);
+                    }
+                } catch (e) {
+                    alert('操作失败: ' + e.message);
+                }
+            }
+
+            async function selectTargetOrder(order) {
+                selectedTargetOrder = order;
+                document.getElementById('targetOrderInput').value = order.order_no;
+                const res = await fetch('/api/sales_order/detail/' + order.id);
+                const data = await res.json();
+                targetOrderDetails = data.items || [];
+                renderTargetOrderDetail();
+                document.getElementById('supplementActionArea').style.display = 'block';
+                document.getElementById('compareArea').style.display = 'block';
+                await loadCompareData(order.id);
+                initIncreaseProductSelect();
+                initSupplementProductSearch();
+            }
+
+            function renderTargetOrderDetail() {
+                const detailDiv = document.getElementById('targetOrderDetail');
+                let html = `<h6>${selectedTargetOrder.order_no} 明细</h6>`;
+                html += `<table class="table table-sm table-bordered"><thead><tr><th>商品</th><th>规格</th><th>单位</th><th>数量</th><th>金额</th></tr></thead><tbody>`;
+                targetOrderDetails.forEach((item, index) => {
+                    html += `<tr data-index="${index}"><td>${item.product_name || ''}</td><td>${item.spec || '-'}</td><td>${item.unit || ''}</td><td>${(item.quantity || 0).toFixed(2)}</td><td>${(item.amount || 0).toFixed(2)}</td>`;
+                });
+                html += '</tbody></table>';
+                detailDiv.innerHTML = html;
+            }
+
+            let compareData = null;
+            let selectedSupplementProduct = null;
+
+            async function loadCompareData(orderId) {
+                const res = await fetch('/api/supplement/compare/' + orderId);
+                compareData = await res.json();
+                renderCompareTables();
+                loadTargetSupplements(orderId);
+            }
+
+            function renderCompareTables() {
+                if (!compareData) return;
+                document.getElementById('realTotalLabel').textContent = compareData.real_total.toFixed(2);
+                document.getElementById('allocTotalLabel').textContent = compareData.allocation_total.toFixed(2);
+                document.getElementById('diffTotalLabel').textContent = (compareData.allocation_total - compareData.real_total).toFixed(2);
+
+                const realTbody = document.querySelector('#realTable tbody');
+                const allocTbody = document.querySelector('#allocTable tbody');
+                realTbody.innerHTML = '';
+                allocTbody.innerHTML = '';
+
+                compareData.items.forEach(item => {
+                    const realRow = document.createElement('tr');
+                    const allocRow = document.createElement('tr');
+                    const displayName = item.display_name || item.product_name;
+
+                    if (item.is_new) {
+                        realRow.innerHTML = `<td colspan="3" class="text-center text-muted small">—</td>`;
+                        allocRow.style.backgroundColor = '#fff3cd';
+                        allocRow.style.color = '#856404';
+                        allocRow.innerHTML = `<td><strong>[增项]</strong> ${displayName}</td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else if (item.is_replaced) {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.style.backgroundColor = '#f8d7da';
+                        allocRow.style.color = '#721c24';
+                        allocRow.innerHTML = `<td><del>${displayName}</del> <span class="badge badge-danger">已替换</span></td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else if (item.is_increase) {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.style.backgroundColor = '#d4edda';
+                        allocRow.style.color = '#155724';
+                        allocRow.innerHTML = `<td>${displayName} <span class="badge badge-success">+${item.supplement_quantity.toFixed(2)}</span></td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.innerHTML = `<td>${displayName}</td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    }
+                    realTbody.appendChild(realRow);
+                    allocTbody.appendChild(allocRow);
+                });
+            }
+
+            function toggleOperationType() {
+                const opType = document.querySelector('input[name="operationType"]:checked').value;
+                document.getElementById('newItemSection').style.display = opType === 'new_item' ? 'flex' : 'none';
+                document.getElementById('increaseQtySection').style.display = opType === 'increase_quantity' ? 'flex' : 'none';
+                document.getElementById('replaceSection').style.display = opType === 'replace_item' ? 'block' : 'none';
+                if (opType === 'replace_item') {
+                    initReplaceSourceSelect();
+                    initReplaceProductSearch();
+                }
+            }
+
+            function initReplaceSourceSelect() {
+                const select = document.getElementById('replaceSourceSelect');
+                select.innerHTML = '';
+                targetOrderDetails.forEach((item, index) => {
+                    const opt = document.createElement('option');
+                    opt.value = index;
+                    opt.textContent = `${item.product_name} (数量${item.quantity.toFixed(2)} × ${item.unit_price.toFixed(2)} = ${item.amount.toFixed(2)}元)`;
+                    select.appendChild(opt);
+                });
+                onReplaceSourceChange();
+            }
+
+            function onReplaceSourceChange() {
+                const idx = parseInt(document.getElementById('replaceSourceSelect').value);
+                if (!isNaN(idx) && targetOrderDetails[idx]) {
+                    document.getElementById('replaceSourceHint').textContent = `原明细金额: ${targetOrderDetails[idx].amount.toFixed(2)} 元`;
+                }
+                updateReplaceDiffHint();
+            }
+
+            function initReplaceProductSearch() {
+                const input = document.getElementById('replaceProductInput');
+                const dropdown = document.getElementById('replaceProductDropdown');
+                if (!input._init) {
+                    input.addEventListener('click', function() { showReplaceProductDropdown(''); });
+                    input.addEventListener('dblclick', function() { this.readOnly = false; this.value = ''; this.focus(); });
+                    input.addEventListener('input', function() { showReplaceProductDropdown(this.value.trim()); });
+                    input.addEventListener('blur', function() { setTimeout(() => { dropdown.style.display = 'none'; }, 200); });
+                    input._init = true;
+                }
+            }
+
+            async function showReplaceProductDropdown(keyword) {
+                const res = await fetch('/api/product/list?keyword=' + encodeURIComponent(keyword || '') + '&page_size=50');
+                const data = await res.json();
+                const products = data.items || data.data || [];
+                const nonConsumable = products.filter(p => !(p.category_name || '').includes('耗材'));
+                const dropdown = document.getElementById('replaceProductDropdown');
+                dropdown.innerHTML = '';
+                nonConsumable.forEach(p => {
+                    const li = document.createElement('li');
+                    li.className = 'search-item';
+                    const alias2 = p.alias2 ? `(${p.alias2})` : '';
+                    const price = p.selling_price || p.base_price || 0;
+                    li.textContent = `${p.name}${alias2} - ${price.toFixed(2)}元/${p.unit || ''}`;
+                    li.onclick = () => selectReplaceProduct(p);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = nonConsumable.length > 0 ? 'block' : 'none';
+            }
+
+            function selectReplaceProduct(p) {
+                selectedReplaceProduct = p;
+                const input = document.getElementById('replaceProductInput');
+                const alias2 = p.alias2 ? `(${p.alias2})` : '';
+                input.value = `${p.name}${alias2}`;
+                input.readOnly = false;
+                document.getElementById('replaceProductDropdown').style.display = 'none';
+                const price = p.selling_price || p.base_price || 0;
+                document.getElementById('replacePriceInput').value = price.toFixed(2);
+                calcReplaceAmount();
+            }
+
+            function calcReplaceAmount() {
+                const qty = parseFloat(document.getElementById('replaceQtyInput').value) || 0;
+                const price = parseFloat(document.getElementById('replacePriceInput').value) || 0;
+                document.getElementById('replaceAmountInput').value = (qty * price).toFixed(2);
+            }
+
+            function addReplaceLine() {
+                if (!selectedReplaceProduct) { alert('请选择替换的商品'); return; }
+                const qty = parseFloat(document.getElementById('replaceQtyInput').value) || 0;
+                const price = parseFloat(document.getElementById('replacePriceInput').value) || 0;
+                const amount = qty * price;
+                if (qty <= 0 || amount <= 0) { alert('请输入有效的数量和单价'); return; }
+                pendingReplaceLines.push({
+                    product_id: selectedReplaceProduct.id,
+                    product_name: selectedReplaceProduct.name,
+                    alias1: selectedReplaceProduct.alias1 || '',
+                    alias2: selectedReplaceProduct.alias2 || '',
+                    spec: selectedReplaceProduct.spec || '',
+                    unit: selectedReplaceProduct.unit || '',
+                    unit_price: price,
+                    quantity: qty,
+                    amount: amount,
+                });
+                selectedReplaceProduct = null;
+                document.getElementById('replaceProductInput').value = '';
+                document.getElementById('replaceQtyInput').value = '';
+                document.getElementById('replacePriceInput').value = '';
+                document.getElementById('replaceAmountInput').value = '';
+                renderReplaceLines();
+            }
+
+            function removeReplaceLine(index) {
+                pendingReplaceLines.splice(index, 1);
+                renderReplaceLines();
+            }
+
+            function renderReplaceLines() {
+                const tbody = document.querySelector('#replaceLineList tbody');
+                tbody.innerHTML = '';
+                let total = 0;
+                pendingReplaceLines.forEach((line, index) => {
+                    total += line.amount;
+                    const alias2 = line.alias2 ? `(${line.alias2})` : '';
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `<td>${line.product_name}${alias2}</td><td>${line.quantity.toFixed(2)}</td><td>${line.unit_price.toFixed(2)}</td><td>${line.amount.toFixed(2)}</td>` +
+                        `<td><button class="btn btn-xs btn-danger" onclick="removeReplaceLine(${index})">删除</button></td>`;
+                    tbody.appendChild(tr);
+                });
+                document.getElementById('replaceLinesTotal').textContent = total.toFixed(2);
+                updateReplaceDiffHint();
+            }
+
+            function updateReplaceDiffHint() {
+                const idx = parseInt(document.getElementById('replaceSourceSelect').value);
+                const hint = document.getElementById('replaceDiffHint');
+                if (isNaN(idx) || !targetOrderDetails[idx]) { hint.textContent = ''; return; }
+                const origAmount = targetOrderDetails[idx].amount;
+                const replaceTotal = pendingReplaceLines.reduce((s, l) => s + l.amount, 0);
+                const diff = replaceTotal - origAmount;
+                if (Math.abs(diff) <= 5.0) {
+                    hint.textContent = `差额 ${diff.toFixed(2)} 元（在±5元内，可提交）`;
+                    hint.className = 'text-success small';
+                } else {
+                    hint.textContent = `差额 ${diff.toFixed(2)} 元（超过±5元限制）`;
+                    hint.className = 'text-danger small';
+                }
+            }
+
+            function addReplacement() {
+                if (!selectedConsumableOrder || !selectedTargetOrder) { alert('请先选择耗材订单和目标订单'); return; }
+                if (!allocationSummary || !allocationSummary.exists) { alert('请先初始化分摊方案'); return; }
+                if (allocationSummary.status === 2) { alert('分摊已完成，不可继续分摊'); return; }
+                if (allocationSummary.status === 3) { alert('分摊已终止'); return; }
+
+                const idx = parseInt(document.getElementById('replaceSourceSelect').value);
+                if (isNaN(idx) || !targetOrderDetails[idx]) { alert('请选择被替换的原明细'); return; }
+                if (pendingReplaceLines.length === 0) { alert('请至少添加一条替换商品'); return; }
+
+                const src = targetOrderDetails[idx];
+                const origAmount = src.amount;
+                const replaceTotal = pendingReplaceLines.reduce((s, l) => s + l.amount, 0);
+                const diff = replaceTotal - origAmount;
+                if (Math.abs(diff) > 5.0) {
+                    alert(`替换总金额 ${replaceTotal.toFixed(2)} 元与原明细 ${origAmount.toFixed(2)} 元差额 ${diff.toFixed(2)} 元，超过±5元限制`);
+                    return;
+                }
+
+                const allocDate = document.getElementById('allocateDateInput').value;
+                const groupTag = 'RPL' + Date.now();
+                const srcRemark = `${selectedConsumableOrder.order_no} 替换[${src.product_name}]`;
+
+                // 冲减原明细：负数记录
+                pendingSupplements.push({
+                    id: null,
+                    source_order_id: selectedConsumableOrder.id,
+                    target_order_id: selectedTargetOrder.id,
+                    source_remark: srcRemark + ' 冲减',
+                    product_id: src.product_id,
+                    product_name: src.product_name,
+                    alias1: src.alias1 || '',
+                    alias2: src.alias2 || '',
+                    spec: src.spec || '',
+                    unit: src.unit || '',
+                    unit_price: src.unit_price,
+                    quantity: -src.quantity,
+                    amount: -origAmount,
+                    allocate_date: allocDate,
+                    operation_type: 'replace_remove',
+                    target_order_item_id: src.id,
+                });
+
+                // 新增替换商品：正数记录
+                pendingReplaceLines.forEach(line => {
+                    pendingSupplements.push({
+                        id: null,
+                        source_order_id: selectedConsumableOrder.id,
+                        target_order_id: selectedTargetOrder.id,
+                        source_remark: srcRemark + ' 换入',
+                        product_id: line.product_id,
+                        product_name: line.product_name,
+                        alias1: line.alias1,
+                        alias2: line.alias2,
+                        spec: line.spec,
+                        unit: line.unit,
+                        unit_price: line.unit_price,
+                        quantity: line.quantity,
+                        amount: line.amount,
+                        allocate_date: allocDate,
+                        operation_type: 'replace_add',
+                        target_order_item_id: src.id,
+                    });
+                });
+
+                pendingReplaceLines = [];
+                renderReplaceLines();
+                renderPendingSupplements();
+                updateBalanceWarning();
+                renderLocalComparePreview();
+            }
+
+
+            function initIncreaseProductSelect() {
+                const select = document.getElementById('increaseProductSelect');
+                select.innerHTML = '';
+                targetOrderDetails.forEach((item, index) => {
+                    const opt = document.createElement('option');
+                    opt.value = index;
+                    opt.textContent = `${item.product_name} (${item.quantity.toFixed(2)} ${item.unit || ''})`;
+                    select.appendChild(opt);
+                });
+                select.onchange = function() {
+                    const idx = parseInt(this.value);
+                    const item = targetOrderDetails[idx];
+                    document.getElementById('increasePriceInput').value = item.unit_price.toFixed(2);
+                    calcIncreaseAmount();
+                };
+                if (targetOrderDetails.length > 0) {
+                    select.selectedIndex = 0;
+                    select.onchange();
+                }
+            }
+
+            function calcIncreaseAmount() {
+                const qty = parseFloat(document.getElementById('increaseQtyInput').value) || 0;
+                const price = parseFloat(document.getElementById('increasePriceInput').value) || 0;
+                const amount = qty * price;
+                document.getElementById('increaseAmountInput').value = amount.toFixed(2);
+                const idx = parseInt(document.getElementById('increaseProductSelect').value);
+                if (!isNaN(idx) && targetOrderDetails[idx]) {
+                    const origQty = targetOrderDetails[idx].quantity;
+                    document.getElementById('increaseTotalHint').textContent = `合计数量: ${(origQty + qty).toFixed(2)}`;
+                }
+            }
+
+            function initSupplementProductSearch() {
+                const input = document.getElementById('suppProductInput');
+                const dropdown = document.getElementById('suppProductDropdown');
+                if (!input._init) {
+                    input.addEventListener('click', function() {
+                        showSupplementProductDropdown('');
+                    });
+                    input.addEventListener('dblclick', function() {
+                        this.readOnly = false;
+                        this.value = '';
+                        this.focus();
+                    });
+                    input.addEventListener('input', function() {
+                        showSupplementProductDropdown(this.value.trim());
+                    });
+                    input.addEventListener('blur', function() {
+                        setTimeout(() => { dropdown.style.display = 'none'; }, 200);
+                    });
+                    input._init = true;
+                }
+            }
+
+            async function showSupplementProductDropdown(keyword) {
+                const res = await fetch('/api/product/list?keyword=' + encodeURIComponent(keyword || '') + '&page_size=50');
+                const data = await res.json();
+                const products = data.items || data.data || [];
+                const nonConsumable = products.filter(p => {
+                    const cat = p.category_name || '';
+                    return !cat.includes('耗材');
+                });
+                const dropdown = document.getElementById('suppProductDropdown');
+                dropdown.innerHTML = '';
+                nonConsumable.forEach(p => {
+                    const li = document.createElement('li');
+                    li.className = 'search-item';
+                    const alias2 = p.alias2 ? `(${p.alias2})` : '';
+                    const price = p.selling_price || p.base_price || 0;
+                    li.textContent = `${p.name}${alias2} - ${price.toFixed(2)}元/${p.unit || ''}`;
+                    li.onclick = () => selectSupplementProduct(p);
+                    dropdown.appendChild(li);
+                });
+                dropdown.style.display = nonConsumable.length > 0 ? 'block' : 'none';
+            }
+
+            function selectSupplementProduct(p) {
+                selectedSupplementProduct = p;
+                const input = document.getElementById('suppProductInput');
+                const alias2 = p.alias2 ? `(${p.alias2})` : '';
+                input.value = `${p.name}${alias2}`;
+                input.readOnly = false;
+                document.getElementById('suppProductDropdown').style.display = 'none';
+                const price = p.selling_price || p.base_price || 0;
+                document.getElementById('addPriceInput').value = price.toFixed(2);
+                calcSupplementAmount();
+            }
+
+            function calcSupplementAmount() {
+                const qty = parseFloat(document.getElementById('addQtyInput').value) || 0;
+                const price = parseFloat(document.getElementById('addPriceInput').value) || 0;
+                document.getElementById('addAmountInput').value = (qty * price).toFixed(2);
+            }
+
+            function dispatchAddOperation() {
+                const opType = document.querySelector('input[name="operationType"]:checked').value;
+                if (opType === 'replace_item') {
+                    addReplacement();
+                } else {
+                    addSupplement();
+                }
+            }
+
+            function addSupplement() {
+                if (!selectedConsumableOrder || !selectedTargetOrder) {
+                    alert('请先选择耗材订单和目标订单');
+                    return;
+                }
+                if (!allocationSummary || !allocationSummary.exists) {
+                    alert('请先初始化分摊方案');
+                    return;
+                }
+                if (allocationSummary.status === 2) {
+                    alert('分摊已完成，不可继续分摊');
+                    return;
+                }
+                if (allocationSummary.status === 3) {
+                    alert('分摊已终止');
+                    return;
+                }
+                const opType = document.querySelector('input[name="operationType"]:checked').value;
+                let qty, amount, productId, productName, alias1, alias2, spec, unit, unitPrice, targetItemId;
+
+                if (opType === 'new_item') {
+                    if (!selectedSupplementProduct) {
+                        alert('请选择要增项的商品');
+                        return;
+                    }
+                    qty = parseFloat(document.getElementById('addQtyInput').value) || 0;
+                    unitPrice = parseFloat(document.getElementById('addPriceInput').value) || 0;
+                    amount = qty * unitPrice;
+                    if (qty <= 0 || amount <= 0) {
+                        alert('请输入有效的增项数量和单价');
+                        return;
+                    }
+                    productId = selectedSupplementProduct.id;
+                    productName = selectedSupplementProduct.name;
+                    alias1 = selectedSupplementProduct.alias1 || '';
+                    alias2 = selectedSupplementProduct.alias2 || '';
+                    spec = selectedSupplementProduct.spec || '';
+                    unit = selectedSupplementProduct.unit || '';
+                    targetItemId = null;
+                } else {
+                    const idx = parseInt(document.getElementById('increaseProductSelect').value);
+                    if (isNaN(idx) || !targetOrderDetails[idx]) {
+                        alert('请选择要追加的商品');
+                        return;
+                    }
+                    qty = parseFloat(document.getElementById('increaseQtyInput').value) || 0;
+                    const item = targetOrderDetails[idx];
+                    unitPrice = item.unit_price;
+                    amount = qty * unitPrice;
+                    if (qty <= 0) {
+                        alert('请输入有效的追加数量');
+                        return;
+                    }
+                    productId = item.product_id;
+                    productName = item.product_name;
+                    alias1 = item.alias1 || '';
+                    alias2 = item.alias2 || '';
+                    spec = item.spec || '';
+                    unit = item.unit || '';
+                    targetItemId = item.id;
+                }
+
+                const currentAllocSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
+                if (amount > allocationSummary.remaining_balance - currentAllocSum) {
+                    alert('增项金额不能超过未分摊余额');
+                    return;
+                }
+
+                pendingSupplements.push({
+                    id: null,
+                    source_order_id: selectedConsumableOrder.id,
+                    target_order_id: selectedTargetOrder.id,
+                    source_remark: selectedConsumableOrder.order_no + ' 耗材分摊',
+                    product_id: productId,
+                    product_name: productName,
+                    alias1: alias1,
+                    alias2: alias2,
+                    spec: spec,
+                    unit: unit,
+                    unit_price: unitPrice,
+                    quantity: qty,
+                    amount: amount,
+                    allocate_date: document.getElementById('allocateDateInput').value,
+                    operation_type: opType,
+                    target_order_item_id: targetItemId,
+                });
+
+                document.getElementById('addQtyInput').value = '';
+                document.getElementById('increaseQtyInput').value = '';
+                renderPendingSupplements();
+                updateBalanceWarning();
+                renderLocalComparePreview();
+            }
+
+            function updateBalanceWarning() {
+                const pendingSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
+                const remaining = allocationSummary ? allocationSummary.remaining_balance - pendingSum : 0;
+                const warn = document.getElementById('balanceWarning');
+                if (remaining < 0) {
+                    warn.textContent = `超出余额 ${Math.abs(remaining).toFixed(2)} 元`;
+                } else {
+                    warn.textContent = `剩余可分摊: ${remaining.toFixed(2)} 元`;
+                    warn.className = 'text-success ml-2';
+                }
+            }
+
+            function renderLocalComparePreview() {
+                if (!compareData || !selectedTargetOrder) return;
+                const pending = pendingSupplements.filter(s => !s.id);
+                const preview = JSON.parse(JSON.stringify(compareData));
+                const itemMap = {};
+                preview.items.forEach(item => {
+                    if (item.id > 0) itemMap[item.id] = item;
+                });
+
+                pending.forEach(s => {
+                    if (s.operation_type === 'increase_quantity' && s.target_order_item_id && itemMap[s.target_order_item_id]) {
+                        const it = itemMap[s.target_order_item_id];
+                        it.supplement_quantity += s.quantity;
+                        it.supplement_amount += s.amount;
+                        it.total_quantity += s.quantity;
+                        it.total_amount += s.amount;
+                        it.is_increase = true;
+                    } else if (s.operation_type === 'replace_remove' && s.target_order_item_id && itemMap[s.target_order_item_id]) {
+                        const it = itemMap[s.target_order_item_id];
+                        it.supplement_quantity += s.quantity;
+                        it.supplement_amount += s.amount;
+                        it.total_quantity += s.quantity;
+                        it.total_amount += s.amount;
+                        it.is_replaced = true;
+                    } else if (s.operation_type === 'new_item' || s.operation_type === 'replace_add') {
+                        preview.items.push({
+                            id: -Math.random(),
+                            product_id: s.product_id,
+                            product_name: s.product_name,
+                            display_name: s.product_name + (s.alias2 ? `(${s.alias2})` : ''),
+                            quantity: 0,
+                            amount: 0,
+                            is_new: true,
+                            is_increase: false,
+                            supplement_quantity: s.quantity,
+                            supplement_amount: s.amount,
+                            total_quantity: s.quantity,
+                            total_amount: s.amount,
+                        });
+                    }
+                });
+
+                preview.supplement_total = compareData.supplement_total + pending.reduce((sum, s) => sum + s.amount, 0);
+                preview.allocation_total = compareData.allocation_total + pending.reduce((sum, s) => sum + s.amount, 0);
+
+                const allocTbody = document.querySelector('#allocTable tbody');
+                const realTbody = document.querySelector('#realTable tbody');
+                realTbody.innerHTML = '';
+                allocTbody.innerHTML = '';
+                document.getElementById('allocTotalLabel').textContent = preview.allocation_total.toFixed(2);
+                document.getElementById('diffTotalLabel').textContent = (preview.allocation_total - preview.real_total).toFixed(2);
+
+                preview.items.forEach(item => {
+                    const realRow = document.createElement('tr');
+                    const allocRow = document.createElement('tr');
+                    const displayName = item.display_name || item.product_name;
+
+                    if (item.is_new) {
+                        realRow.innerHTML = `<td colspan="3" class="text-center text-muted small">—</td>`;
+                        allocRow.style.backgroundColor = '#fff3cd';
+                        allocRow.style.color = '#856404';
+                        allocRow.innerHTML = `<td><strong>[增项]</strong> ${displayName}</td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else if (item.is_replaced) {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.style.backgroundColor = '#f8d7da';
+                        allocRow.style.color = '#721c24';
+                        allocRow.innerHTML = `<td><del>${displayName}</del> <span class="badge badge-danger">已替换</span></td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else if (item.is_increase) {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.style.backgroundColor = '#d4edda';
+                        allocRow.style.color = '#155724';
+                        allocRow.innerHTML = `<td>${displayName} <span class="badge badge-success">+${item.supplement_quantity.toFixed(2)}</span></td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    } else {
+                        realRow.innerHTML = `<td>${displayName}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td>`;
+                        allocRow.innerHTML = `<td>${displayName}</td><td>${item.total_quantity.toFixed(2)}</td><td>${item.total_amount.toFixed(2)}</td>`;
+                    }
+                    realTbody.appendChild(realRow);
+                    allocTbody.appendChild(allocRow);
+                });
+            }
+
+            function renderPendingSupplements() {
+                const tbody = document.querySelector('#supplementList tbody');
+                tbody.innerHTML = '';
+                const typeMap = {
+                    'new_item': '新增商品',
+                    'increase_quantity': '追加数量',
+                    'replace_remove': '替换-冲减',
+                    'replace_add': '替换-换入',
+                };
+                pendingSupplements.forEach((item, index) => {
+                    const typeText = typeMap[item.operation_type] || item.operation_type;
+                    const savedBadge = item.id ? '<span class="badge badge-info">已保存</span>' : '';
+                    const isNeg = item.amount < 0;
+                    const rowStyle = item.operation_type === 'replace_remove' ? ' style="color:#a94442;"' : (item.operation_type === 'replace_add' ? ' style="color:#3c763d;"' : '');
+                    tbody.innerHTML += `<tr${rowStyle}><td>${typeText} ${savedBadge}</td><td>${item.product_name}</td><td>${item.quantity.toFixed(2)}</td><td>${item.amount.toFixed(2)}</td><td>${item.source_order_no || (selectedConsumableOrder?.order_no || '')}</td><td>${!item.id ? '<button class="btn btn-xs btn-danger" onclick="removePendingSupplement(' + index + ')">删除</button>' : ''}</td></tr>`;
+                });
+            }
+
+            function removePendingSupplement(index) {
+                pendingSupplements.splice(index, 1);
+                renderPendingSupplements();
+                updateBalanceWarning();
+                renderLocalComparePreview();
+            }
+
+            async function loadTargetSupplements(orderId) {
+                const res = await fetch('/api/supplement/list_by_target/' + orderId);
+                const data = await res.json();
+                pendingSupplements = data;
+                renderPendingSupplements();
+                updateBalanceWarning();
+            }
+
+            async function saveAllSupplements() {
+                const toSave = pendingSupplements.filter(s => !s.id);
+                if (toSave.length === 0) {
+                    alert('没有待保存的增项');
+                    return;
+                }
+                for (const item of toSave) {
+                    await fetch('/api/supplement/create', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(item),
+                    });
+                }
+                alert('增项保存成功');
+                if (selectedConsumableOrder) {
+                    await loadAllocationSummary(selectedConsumableOrder.id);
+                    await loadAllocationOrders(selectedConsumableOrder.id);
+                }
+                if (selectedTargetOrder) {
+                    await loadCompareData(selectedTargetOrder.id);
+                }
+                await loadOrdersByPurchaser();
+            }
+
+            function resetOrderSelection() {
+                selectedConsumableOrder = null;
+                selectedTargetOrder = null;
+                allocationSummary = null;
+                compareData = null;
+                selectedSupplementProduct = null;
+                document.getElementById('consumableOrderInput').value = '';
+                document.getElementById('targetOrderInput').value = '';
+                document.getElementById('consumableOrderDetail').innerHTML = '<p>请选择订单查看详情</p>';
+                document.getElementById('targetOrderDetail').innerHTML = '<p>请选择订单查看详情</p>';
+                document.getElementById('supplementActionArea').style.display = 'none';
+                document.getElementById('compareArea').style.display = 'none';
+                document.getElementById('allocationSummary').style.display = 'none';
+                document.getElementById('allocationInitActions').style.display = 'none';
+                document.getElementById('allocationManageActions').style.display = 'none';
+                document.getElementById('allocationStatusBadge').style.display = 'none';
+                pendingSupplements = [];
+                renderPendingSupplements();
+            }
+
+            document.addEventListener('click', function(e) {
+                if (!e.target.closest('#purchaserInput') && !e.target.closest('#purchaserDropdown')) {
+                    document.getElementById('purchaserDropdown').style.display = 'none';
+                }
+            });
+
+            initPurchaserSearch();
+            initConsumableOrderSearch();
+            initTargetOrderSearch();
+            
+            const allocateDateInput = document.getElementById('allocateDateInput');
+            if (allocateDateInput) {
+                allocateDateInput.value = new Date().toISOString().split('T')[0];
+            }
+            loadAllocatedOrders();
+        </script>
+    "#;
+    Html(layout_html("耗材分摊管理", "supplement", content))
+}
+
+async fn api_sales_order_by_purchaser(Path(purchaser_id): Path<i64>) -> impl IntoResponse {
+    let orders = sqlx::query(
+        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount as discount_total, so.status,
+                p.name as purchaser_name, so.purchaser_id
+         FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id
+         WHERE so.purchaser_id = ? ORDER BY so.order_date DESC"
+    )
+    .bind(purchaser_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let order_ids: Vec<i64> = orders.iter().map(|row| row.get::<i64, _>("id")).collect();
+
+    let mut allocation_status_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    if !order_ids.is_empty() {
+        let placeholders = order_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT source_order_id, status FROM consumable_allocation WHERE source_order_id IN ({}) ORDER BY id ASC",
+            placeholders
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+        for id in &order_ids {
+            query = query.bind(*id);
+        }
+        let rows = query.fetch_all(pool()).await.unwrap_or_default();
+        for row in rows {
+            let source_id = row.get::<i64, _>("source_order_id");
+            let status = row.get::<i64, _>("status");
+            // 与 summary 保持一致：仅保留最早一条记录
+            allocation_status_map.entry(source_id).or_insert(status);
+        }
+    }
+
+    let result: Vec<serde_json::Value> = orders.iter().map(|row| {
+        let order_id = row.get::<i64, _>("id");
+        let allocation_status = allocation_status_map.get(&order_id).copied().unwrap_or(-1);
+        serde_json::json!({
+            "id": order_id,
+            "order_no": row.get::<String, _>("order_no"),
+            "order_date": row.get::<String, _>("order_date"),
+            "total_amount": row.get::<f64, _>("total_amount"),
+            "discount_rate": row.get::<f64, _>("discount_rate"),
+            "discount_total": row.get::<f64, _>("discount_total"),
+            "status": row.get::<String, _>("status"),
+            "allocation_status": allocation_status,
+            "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "purchaser_id": row.get::<i64, _>("purchaser_id"),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_allocation_create(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let remark = req.get("remark").and_then(|v| v.as_str()).unwrap_or("");
+
+    // 勾选的来源明细 id 列表
+    let item_ids: Vec<i64> = req.get("source_item_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+
+    if item_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "请至少勾选一条明细").into_response();
+    }
+
+    // 检查是否已存在分摊方案，防止重复创建
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM consumable_allocation WHERE source_order_id = ?)"
+    )
+    .bind(source_order_id)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(false);
+
+    if exists {
+        return (StatusCode::BAD_REQUEST, "该订单已有分摊方案").into_response();
+    }
+
+    // 服务端按勾选明细重算分摊总额，确保金额可信
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT COALESCE(SUM(amount), 0) FROM sales_order_item WHERE order_id = ? AND id IN ({})",
+        placeholders
+    );
+    let mut q = sqlx::query_scalar::<_, f64>(AssertSqlSafe(sql.as_str())).bind(source_order_id);
+    for iid in &item_ids {
+        q = q.bind(*iid);
+    }
+    let total_amount: f64 = q.fetch_one(pool()).await.unwrap_or(0.0);
+
+    if total_amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, "勾选明细的金额合计为 0，无法初始化").into_response();
+    }
+
+    let item_ids_str = item_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+
+    let result = sqlx::query(
+        "INSERT INTO consumable_allocation(source_order_id, total_amount, allocated_amount, remaining_balance, status, remark, created_at, source_item_ids) VALUES (?, ?, 0, ?, 0, ?, datetime('now'), ?)"
+    )
+    .bind(source_order_id)
+    .bind(total_amount)
+    .bind(total_amount)
+    .bind(remark)
+    .bind(&item_ids_str)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(res) => (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "id": res.last_insert_rowid(), "total_amount": total_amount })).unwrap()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("创建分摊方案失败: {}", e)).into_response(),
+    }
+}
+
+async fn api_allocation_summary(Path(source_order_id): Path<i64>) -> impl IntoResponse {
+    let row = sqlx::query(
+        "SELECT * FROM consumable_allocation WHERE source_order_id = ? ORDER BY id ASC LIMIT 1"
+    )
+    .bind(source_order_id)
+    .fetch_optional(pool())
+    .await
+    .unwrap_or(None);
+
+    if row.is_none() {
+        return (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "exists": false })).unwrap());
+    }
+
+    let r = row.unwrap();
+    let item_ids_str = r.get::<Option<String>, _>("source_item_ids").unwrap_or_default();
+    let source_item_ids: Vec<i64> = item_ids_str.split(',').filter_map(|s| s.trim().parse::<i64>().ok()).collect();
+    let summary = serde_json::json!({
+        "exists": true,
+        "id": r.get::<i64, _>("id"),
+        "source_order_id": r.get::<i64, _>("source_order_id"),
+        "total_amount": r.get::<f64, _>("total_amount"),
+        "allocated_amount": r.get::<f64, _>("allocated_amount"),
+        "remaining_balance": r.get::<f64, _>("remaining_balance"),
+        "status": r.get::<i64, _>("status"),
+        "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
+        "created_at": r.get::<String, _>("created_at"),
+        "completed_at": r.get::<Option<String>, _>("completed_at").unwrap_or_default(),
+        "source_item_ids": source_item_ids,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&summary).unwrap())
+}
+
+async fn api_allocation_allocated_orders() -> impl IntoResponse {
+    // 列出所有已进入分摊（存在 consumable_allocation 记录）的源订单
+    let rows = sqlx::query(
+        "SELECT ca.id as alloc_id, ca.source_order_id, ca.total_amount, ca.allocated_amount, ca.remaining_balance,
+                ca.status, ca.remark, ca.created_at, ca.completed_at,
+                so.order_no, so.order_date, so.purchaser_id,
+                p.name as purchaser_name
+         FROM consumable_allocation ca
+         LEFT JOIN sales_order so ON ca.source_order_id = so.id
+         LEFT JOIN purchaser p ON so.purchaser_id = p.id
+         ORDER BY ca.created_at DESC, ca.id DESC"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        serde_json::json!({
+            "alloc_id": row.get::<i64, _>("alloc_id"),
+            "source_order_id": row.get::<i64, _>("source_order_id"),
+            "order_no": row.get::<Option<String>, _>("order_no").unwrap_or_default(),
+            "order_date": row.get::<Option<String>, _>("order_date").unwrap_or_default(),
+            "purchaser_id": row.get::<Option<i64>, _>("purchaser_id").unwrap_or(0),
+            "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "total_amount": row.get::<f64, _>("total_amount"),
+            "allocated_amount": row.get::<f64, _>("allocated_amount"),
+            "remaining_balance": row.get::<f64, _>("remaining_balance"),
+            "status": row.get::<i64, _>("status"),
+            "remark": row.get::<Option<String>, _>("remark").unwrap_or_default(),
+            "created_at": row.get::<Option<String>, _>("created_at").unwrap_or_default(),
+            "completed_at": row.get::<Option<String>, _>("completed_at").unwrap_or_default(),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_allocation_terminate(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let remark = req.get("remark").and_then(|v| v.as_str()).unwrap_or("");
+
+    let result = sqlx::query(
+        "UPDATE consumable_allocation SET status = 3, remark = ?, completed_at = datetime('now') WHERE source_order_id = ? AND status != 2"
+    )
+    .bind(remark)
+    .bind(source_order_id)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(res) => {
+            if res.rows_affected() > 0 {
+                (StatusCode::OK, "终止成功").into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "无法终止：订单不存在或已完成").into_response()
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("终止失败: {}", e)).into_response(),
+    }
+}
+
+async fn api_allocation_cancel(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let row = match sqlx::query(
+        "SELECT id, allocated_amount, status FROM consumable_allocation WHERE source_order_id = ?"
+    )
+    .bind(source_order_id)
+    .fetch_optional(pool())
+    .await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "分摊方案不存在").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败: {}", e)).into_response(),
+    };
+
+    let allocated: f64 = row.get("allocated_amount");
+    let status: i64 = row.get("status");
+
+    if status == 2 {
+        return (StatusCode::BAD_REQUEST, "分摊方案已完成，无法取消").into_response();
+    }
+    if allocated > 0.0001 {
+        return (StatusCode::BAD_REQUEST, format!("尚有已分摊金额 {:.2} 元，请先回滚全部分摊记录后再取消", allocated)).into_response();
+    }
+
+    let result = sqlx::query(
+        "DELETE FROM consumable_allocation WHERE source_order_id = ? AND allocated_amount <= 0.0001 AND status != 2"
+    )
+    .bind(source_order_id)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(res) => {
+            if res.rows_affected() > 0 {
+                (StatusCode::OK, "取消成功").into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "无法取消分摊方案").into_response()
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("取消失败: {}", e)).into_response(),
+    }
+}
+
+async fn api_allocation_complete(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let source_order_id = req.get("source_order_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let target_order_id = req.get("target_order_id").and_then(|v| v.as_i64());
+    let auto_tail = req.get("auto_tail").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let row = match sqlx::query(
+        "SELECT id, remaining_balance, total_amount, status FROM consumable_allocation WHERE source_order_id = ?"
+    )
+    .bind(source_order_id)
+    .fetch_optional(pool())
+    .await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "分摊方案不存在").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询失败: {}", e)).into_response(),
+    };
+
+    let alloc_id: i64 = row.get("id");
+    let remaining_balance: f64 = row.get("remaining_balance");
+    let total_amount: f64 = row.get("total_amount");
+    let status: i64 = row.get("status");
+
+    if status == 2 {
+        return (StatusCode::BAD_REQUEST, "分摊方案已完成").into_response();
+    }
+    if status == 3 {
+        return (StatusCode::BAD_REQUEST, "分摊方案已终止").into_response();
+    }
+
+    let threshold = (total_amount * 0.05).max(5.0);
+
+    if remaining_balance > threshold && !auto_tail {
+        return (StatusCode::BAD_REQUEST, format!("剩余 {:.2} 元未分摊，超过尾差限额（{:.2} 元），请继续分摊或终止方案", remaining_balance, threshold)).into_response();
+    }
+
+    if auto_tail && remaining_balance > 0.0 {
+        if let Some(tid) = target_order_id {
+            let target_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+                .bind(tid)
+                .fetch_one(pool())
+                .await
+                .unwrap_or(false);
+
+            if target_exists {
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let _ = sqlx::query(
+                    "INSERT INTO order_supplement_item(target_order_id, source_order_id, source_remark, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, amount, allocate_date, operation_type, target_order_item_id) VALUES (?, ?, ?, ?, ?, '', '', '', '次', 0, 1, ?, ?, 'new_item', NULL)"
+                )
+                .bind(tid)
+                .bind(source_order_id)
+                .bind(format!("耗材分摊尾差（源订单: {:.2} 元中剩余 {:.2} 元）", total_amount, remaining_balance))
+                .bind(-1)
+                .bind("分摊尾差")
+                .bind(remaining_balance)
+                .bind(remaining_balance)
+                .bind(&today)
+                .execute(pool())
+                .await;
+            }
+        }
+    }
+
+    let result = sqlx::query(
+        "UPDATE consumable_allocation SET status = 2, completed_at = datetime('now'), remaining_balance = 0 WHERE id = ?"
+    )
+    .bind(alloc_id)
+    .execute(pool())
+    .await;
+
+    match result {
+        Ok(_) => (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "auto_tail": auto_tail && remaining_balance > 0.0 })).unwrap()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("完成分摊失败: {}", e)).into_response(),
+    }
+}
+
+async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> impl IntoResponse {
+    let result = sqlx::query(
+        "INSERT INTO order_supplement_item(target_order_id, source_order_id, source_remark, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, amount, allocate_date, operation_type, target_order_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(req.target_order_id)
+    .bind(req.source_order_id)
+    .bind(req.source_remark)
+    .bind(req.product_id)
+    .bind(&req.product_name)
+    .bind(req.alias1)
+    .bind(req.alias2)
+    .bind(req.spec)
+    .bind(&req.unit)
+    .bind(req.unit_price)
+    .bind(req.quantity)
+    .bind(req.amount)
+    .bind(&req.allocate_date)
+    .bind(&req.operation_type)
+    .bind(req.target_order_item_id)
+    .execute(pool())
+    .await;
+
+
+    match result {
+        Ok(res) => {
+            // replace_remove 是替换操作中的冲减记录（负数金额），不消耗分摊余额
+            if req.operation_type != "replace_remove" {
+                let _ = sqlx::query(
+                    "UPDATE consumable_allocation SET allocated_amount = allocated_amount + ?, remaining_balance = remaining_balance - ?, status = CASE WHEN remaining_balance - ? <= 0 THEN 2 ELSE 1 END WHERE source_order_id = ?"
+                )
+                .bind(req.amount)
+                .bind(req.amount)
+                .bind(req.amount)
+                .bind(req.source_order_id)
+                .execute(pool())
+                .await;
+                
+                let _ = sqlx::query(
+                    "UPDATE consumable_allocation SET completed_at = datetime('now') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
+                )
+                .bind(req.source_order_id)
+                .execute(pool())
+                .await;
+            }
+
+            (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "id": res.last_insert_rowid() })).unwrap())
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("创建增项失败: {}", e)),
+    }
+}
+
+async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoResponse {
+    let rows = sqlx::query(
+        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, so.order_no as source_order_no
+         FROM order_supplement_item soi LEFT JOIN sales_order so ON soi.source_order_id = so.id
+         WHERE soi.target_order_id = ? ORDER BY soi.allocate_date DESC"
+    )
+    .bind(order_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        serde_json::json!({
+            "id": row.get::<i64, _>("id"),
+            "target_order_id": row.get::<i64, _>("target_order_id"),
+            "source_order_id": row.get::<i64, _>("source_order_id"),
+            "source_order_no": row.get::<Option<String>, _>("source_order_no").unwrap_or_default(),
+            "source_remark": row.get::<Option<String>, _>("source_remark").unwrap_or_default(),
+            "product_id": row.get::<i64, _>("product_id"),
+            "product_name": row.get::<String, _>("product_name"),
+            "alias1": row.get::<Option<String>, _>("alias1").unwrap_or_default(),
+            "alias2": row.get::<Option<String>, _>("alias2").unwrap_or_default(),
+            "spec": row.get::<Option<String>, _>("spec").unwrap_or_default(),
+            "unit": row.get::<String, _>("unit"),
+            "unit_price": row.get::<f64, _>("unit_price"),
+            "quantity": row.get::<f64, _>("quantity"),
+            "amount": row.get::<f64, _>("amount"),
+            "allocate_date": row.get::<String, _>("allocate_date"),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_adjusted_orders() -> impl IntoResponse {
+    // 列出所有存在自调整记录（target_order_id == source_order_id）的订单
+    let rows = sqlx::query(
+        "SELECT so.id, so.order_no, so.order_date, so.total_amount,
+                p.name as purchaser_name,
+                COALESCE(SUM(osi.amount), 0) as adjust_amount,
+                COUNT(osi.id) as adjust_count,
+                MAX(osi.allocate_date) as last_adjust_date
+         FROM sales_order so
+         INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id AND osi.source_order_id = so.id
+         LEFT JOIN purchaser p ON so.purchaser_id = p.id
+         GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name
+         ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC"
+    )
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let total: f64 = row.get::<f64, _>("total_amount");
+        let adjust: f64 = row.get::<f64, _>("adjust_amount");
+        serde_json::json!({
+            "id": row.get::<i64, _>("id"),
+            "order_no": row.get::<String, _>("order_no"),
+            "order_date": row.get::<String, _>("order_date"),
+            "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "total_amount": total,
+            "adjust_amount": adjust,
+            "adjusted_total": total + adjust,
+            "adjust_count": row.get::<i64, _>("adjust_count"),
+            "last_adjust_date": row.get::<Option<String>, _>("last_adjust_date").unwrap_or_default(),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_supplement_list_by_source(Path(order_id): Path<i64>) -> impl IntoResponse {
+    let rows = sqlx::query(
+        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, so.order_no as target_order_no
+         FROM order_supplement_item soi LEFT JOIN sales_order so ON soi.target_order_id = so.id
+         WHERE soi.source_order_id = ? ORDER BY soi.allocate_date DESC"
+    )
+    .bind(order_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+        serde_json::json!({
+            "id": row.get::<i64, _>("id"),
+            "target_order_id": row.get::<i64, _>("target_order_id"),
+            "target_order_no": row.get::<Option<String>, _>("target_order_no").unwrap_or_default(),
+            "source_order_id": row.get::<i64, _>("source_order_id"),
+            "source_remark": row.get::<Option<String>, _>("source_remark").unwrap_or_default(),
+            "product_id": row.get::<i64, _>("product_id"),
+            "product_name": row.get::<String, _>("product_name"),
+            "alias1": row.get::<Option<String>, _>("alias1").unwrap_or_default(),
+            "alias2": row.get::<Option<String>, _>("alias2").unwrap_or_default(),
+            "spec": row.get::<Option<String>, _>("spec").unwrap_or_default(),
+            "unit": row.get::<String, _>("unit"),
+            "unit_price": row.get::<f64, _>("unit_price"),
+            "quantity": row.get::<f64, _>("quantity"),
+            "amount": row.get::<f64, _>("amount"),
+            "allocate_date": row.get::<String, _>("allocate_date"),
+            "operation_type": row.get::<String, _>("operation_type"),
+        })
+    }).collect();
+
+    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+}
+
+async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
+    let row = sqlx::query(
+        "SELECT source_order_id, amount, operation_type FROM order_supplement_item WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_optional(pool())
+    .await
+    .unwrap_or(None);
+
+    if row.is_none() {
+        return (StatusCode::NOT_FOUND, "增项不存在").into_response();
+    }
+
+    let r = row.unwrap();
+    let source_order_id: i64 = r.get("source_order_id");
+    let amount: f64 = r.get("amount");
+    let operation_type: String = r.get("operation_type");
+
+    let result = sqlx::query("DELETE FROM order_supplement_item WHERE id = ?")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(res) => {
+            if res.rows_affected() > 0 {
+                // replace_remove 记录删除时不回滚分摊金额（创建时也未计入）
+                if operation_type != "replace_remove" {
+                    let _ = sqlx::query(
+                        "UPDATE consumable_allocation SET allocated_amount = allocated_amount - ?, remaining_balance = remaining_balance + ?, status = CASE WHEN remaining_balance + ? < total_amount THEN 1 ELSE 0 END WHERE source_order_id = ? AND status != 3"
+                    )
+                    .bind(amount)
+                    .bind(amount)
+                    .bind(amount)
+                    .bind(source_order_id)
+                    .execute(pool())
+                    .await;
+
+                    let _ = sqlx::query(
+                        "UPDATE consumable_allocation SET completed_at = NULL WHERE source_order_id = ? AND status = 2 AND completed_at IS NOT NULL"
+                    )
+                    .bind(source_order_id)
+                    .execute(pool())
+                    .await;
+
+                    // 若已分摊金额已归零，则删除该分摊方案，回到"未分摊"初始态，
+                    // 允许重新勾选明细并再次初始化分摊
+                    let _ = sqlx::query(
+                        "DELETE FROM consumable_allocation WHERE source_order_id = ? AND status != 3 AND allocated_amount <= 0.0001"
+                    )
+                    .bind(source_order_id)
+                    .execute(pool())
+                    .await;
+                }
+
+                (StatusCode::OK, "回滚成功").into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "增项不存在").into_response()
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("回滚失败: {}", e)).into_response(),
+    }
+}
+
+async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse {
+    let item_rows = sqlx::query(
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+                p.category_id, pc.name as category_name, pc.parent_id, pc2.name as parent_name
+         FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
+         LEFT JOIN category pc ON p.category_id = pc.id
+         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+         WHERE soi.order_id = ?"
+    )
+    .bind(order_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    let supplement_rows = sqlx::query(
+        "SELECT id, target_order_id, source_order_id, source_remark, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, amount, allocate_date, operation_type, target_order_item_id
+         FROM order_supplement_item WHERE target_order_id = ?"
+    )
+    .bind(order_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    use std::collections::HashMap;
+    let mut item_map: HashMap<i64, serde_json::Value> = HashMap::new();
+    let mut real_items: Vec<serde_json::Value> = Vec::new();
+    for r in &item_rows {
+        let id = r.get::<i64, _>("id");
+        let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+        let product_name = r.get::<String, _>("product_name");
+        let display_name = if alias2.is_empty() {
+            product_name.clone()
+        } else {
+            format!("{}({})", product_name, alias2)
+        };
+        let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
+        let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
+        let sort_key = get_category_sort_key(&category_name, &parent_name);
+        let item = serde_json::json!({
+            "id": id,
+            "product_id": r.get::<i64, _>("product_id"),
+            "product_name": product_name,
+            "display_name": display_name,
+            "alias1": r.get::<Option<String>, _>("alias1").unwrap_or_default(),
+            "alias2": alias2,
+            "spec": spec,
+            "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
+            "unit_price": r.get::<f64, _>("unit_price"),
+            "quantity": r.get::<f64, _>("quantity"),
+            "amount": r.get::<f64, _>("amount"),
+            "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
+            "category_name": category_name,
+            "parent_name": parent_name,
+            "sort_key": sort_key,
+            "is_increase": false,
+            "is_new": false,
+            "is_replaced": false,
+            "supplement_quantity": 0.0,
+            "supplement_amount": 0.0,
+            "total_quantity": r.get::<f64, _>("quantity"),
+            "total_amount": r.get::<f64, _>("amount"),
+        });
+        item_map.insert(id, item.clone());
+        real_items.push(item);
+    }
+
+    let mut new_items: Vec<serde_json::Value> = Vec::new();
+    for r in &supplement_rows {
+        let op_type = r.get::<String, _>("operation_type");
+        let target_item_id = r.get::<Option<i64>, _>("target_order_item_id");
+        let qty = r.get::<f64, _>("quantity");
+        let amt = r.get::<f64, _>("amount");
+
+        if op_type == "increase_quantity" || op_type == "replace_remove" {
+            if let Some(tid) = target_item_id {
+                if let Some(existing) = item_map.get_mut(&tid) {
+                    let s_qty = existing["supplement_quantity"].as_f64().unwrap_or(0.0) + qty;
+                    let s_amt = existing["supplement_amount"].as_f64().unwrap_or(0.0) + amt;
+                    let t_qty = existing["quantity"].as_f64().unwrap_or(0.0) + s_qty;
+                    let t_amt = existing["amount"].as_f64().unwrap_or(0.0) + s_amt;
+                    existing["supplement_quantity"] = serde_json::json!(s_qty);
+                    existing["supplement_amount"] = serde_json::json!(s_amt);
+                    existing["total_quantity"] = serde_json::json!(t_qty);
+                    existing["total_amount"] = serde_json::json!(t_amt);
+                    if op_type == "replace_remove" {
+                        existing["is_replaced"] = serde_json::json!(true);
+                    } else {
+                        existing["is_increase"] = serde_json::json!(true);
+                    }
+                }
+            }
+        } else {
+            let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+            let product_name = r.get::<String, _>("product_name");
+            let display_name = if alias2.is_empty() {
+                product_name.clone()
+            } else {
+                format!("{}({})", product_name, alias2)
+            };
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
+            new_items.push(serde_json::json!({
+                "id": -r.get::<i64, _>("id"),
+                "supplement_id": r.get::<i64, _>("id"),
+                "product_id": r.get::<i64, _>("product_id"),
+                "product_name": product_name,
+                "display_name": display_name,
+                "alias1": r.get::<Option<String>, _>("alias1").unwrap_or_default(),
+                "alias2": alias2,
+                "spec": spec,
+                "unit": r.get::<String, _>("unit"),
+                "unit_price": r.get::<f64, _>("unit_price"),
+                "quantity": 0.0,
+                "amount": 0.0,
+                "remark": source_remark,
+                "category_name": "",
+                "parent_name": "",
+                "sort_key": 9999,
+                "is_increase": false,
+                "is_new": true,
+                "supplement_quantity": qty,
+                "supplement_amount": amt,
+                "total_quantity": qty,
+                "total_amount": amt,
+                "allocate_date": r.get::<String, _>("allocate_date"),
+            }));
+        }
+    }
+
+    let mut real_total = 0.0;
+    let mut supplement_total = 0.0;
+    let mut alloc_total = 0.0;
+
+    let mut combined: Vec<serde_json::Value> = Vec::new();
+    for (_, item) in &item_map {
+        real_total += item["amount"].as_f64().unwrap_or(0.0);
+        supplement_total += item["supplement_amount"].as_f64().unwrap_or(0.0);
+        alloc_total += item["total_amount"].as_f64().unwrap_or(0.0);
+        combined.push(item.clone());
+    }
+    for item in &new_items {
+        supplement_total += item["supplement_amount"].as_f64().unwrap_or(0.0);
+        alloc_total += item["total_amount"].as_f64().unwrap_or(0.0);
+        combined.push(item.clone());
+    }
+
+    combined.sort_by(|a, b| {
+        let sa = a["sort_key"].as_i64().unwrap_or(9999);
+        let sb = b["sort_key"].as_i64().unwrap_or(9999);
+        sa.cmp(&sb)
+    });
+
+    let result = serde_json::json!({
+        "real_total": real_total,
+        "supplement_total": supplement_total,
+        "allocation_total": alloc_total,
+        "items": combined,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
 async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse {
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
@@ -14091,9 +18712,9 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     let row = order_row.unwrap();
     let order_no = row.get::<String, _>("order_no");
     let order_date = row.get::<String, _>("order_date");
-    let total_amount = row.get::<f64, _>("total_amount");
+    let _total_amount = row.get::<f64, _>("total_amount");
     let discount_rate = row.get::<f64, _>("discount_rate");
-    let final_amount = row.get::<f64, _>("final_amount");
+    let _final_amount = row.get::<f64, _>("final_amount");
     let purchaser_name = row.get::<String, _>("purchaser_name");
 
     let supplier_name = "湖南食全味美餐饮管理有限公司".to_string();
@@ -14112,39 +18733,100 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     .await
     .unwrap_or_default();
 
-    let mut items: Vec<(i64, String, String, f64, f64, f64, String)> = Vec::new();
+    let supplement_rows = sqlx::query(
+        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+                pc.name as category_name, pc2.name as parent_name
+         FROM order_supplement_item soi
+         LEFT JOIN product p ON soi.product_id = p.id
+         LEFT JOIN category pc ON p.category_id = pc.id
+         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+         WHERE soi.target_order_id = ?"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    use std::collections::HashMap;
+    let mut item_map: HashMap<i64, (i64, String, String, f64, f64, f64, String)> = HashMap::new();
     for r in &item_rows {
+        let rid = r.get::<i64, _>("id");
         let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+        let product_name = r.get::<String, _>("product_name");
         let food_name = if alias2.is_empty() {
-            r.get::<String, _>("product_name")
+            product_name
         } else {
-            alias2
+            format!("{}({})", product_name, alias2)
         };
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
         let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
         let original_remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
-        let remark = if spec.is_empty() {
-            original_remark
-        } else if original_remark.is_empty() {
-            spec
-        } else {
-            format!("{}; {}", spec, original_remark)
-        };
+        let remark = if spec.is_empty() { original_remark } else if original_remark.is_empty() { spec } else { format!("{}; {}", spec, original_remark) };
         let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
-        items.push((
-            sort_key,
-            food_name,
-            unit,
-            r.get::<f64, _>("unit_price"),
-            r.get::<f64, _>("quantity"),
-            r.get::<f64, _>("amount"),
-            remark,
-        ));
+        item_map.insert(rid, (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark));
     }
 
+    for r in &supplement_rows {
+        let op_type = r.get::<String, _>("operation_type");
+        let target_item_id = r.get::<Option<i64>, _>("target_order_item_id");
+        let qty = r.get::<f64, _>("quantity");
+        let amt = r.get::<f64, _>("amount");
+
+        // 替换-冲减：不导出（原被替换商品也需从导出中扣除）
+        if op_type == "replace_remove" {
+            if let Some(tid) = target_item_id {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.5 + amt;
+                    // 若原明细被完全冲减（数量或金额归零），从导出中移除
+                    if new_qty.abs() < 0.001 || new_amt.abs() < 0.001 {
+                        item_map.remove(&tid);
+                    } else {
+                        *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, entry.6.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
+        if op_type == "increase_quantity" {
+            if let Some(tid) = target_item_id {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.5 + amt;
+                    let new_remark = format!("{}（含增项+{}）", entry.6, qty);
+                    *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, new_remark);
+                }
+            }
+        } else {
+            // new_item 或 replace_add：作为新明细导出，按商品类别归类排序
+            let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+            let product_name = r.get::<String, _>("product_name");
+            let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
+            let unit = r.get::<String, _>("unit");
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
+            let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
+            let sort_key = get_category_sort_key(&category_name, &parent_name);
+            let remark = if op_type == "replace_add" {
+                // 替换换入：按类别正常导出，不额外标记
+                spec
+            } else {
+                // 普通新增增项：保留标记
+                let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
+                if spec.is_empty() { format!("[增项] {}", source_remark) } else { format!("{}; [增项] {}", spec, source_remark) }
+            };
+            item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
+        }
+    }
+
+    let mut items: Vec<(i64, String, String, f64, f64, f64, String)> = item_map.into_values().collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let accept_total_amount: f64 = items.iter().map(|(_, _, _, _, _, amount, _)| amount).sum();
+    let accept_final_amount = accept_total_amount * (1.0 - discount_rate / 100.0);
 
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
@@ -14178,6 +18860,12 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
         let cell_left_format = Format::new()
             .set_font_size(10)
             .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+
+        let cell_right_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
             .set_align(FormatAlign::VerticalCenter)
             .set_border(FormatBorder::Thin);
 
@@ -14253,7 +18941,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 worksheet.write_with_format(current_row, 0, seq_num, &cell_format)?;
                 worksheet.write_with_format(current_row, 1, food_name, &cell_left_format)?;
                 worksheet.write_with_format(current_row, 2, spec, &cell_format)?;
-                worksheet.write_with_format(current_row, 3, *quantity, &cell_format)?;
+                worksheet.write_with_format(current_row, 3, *quantity, &cell_right_format)?;
                 worksheet.write_with_format(current_row, 4, *unit_price, &money_format)?;
                 worksheet.write_with_format(current_row, 5, *amount, &money_format)?;
                 worksheet.write_with_format(current_row, 6, "", &cell_format)?;
@@ -14290,7 +18978,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 .set_align(FormatAlign::VerticalCenter)
                 .set_border(FormatBorder::Thin);
 
-            worksheet.write_with_format(current_row, 3, total_amount, &money_format)?;
+            worksheet.write_with_format(current_row, 3, accept_total_amount, &money_format)?;
             current_row += 1;
 
             worksheet.merge_range(current_row, 0, current_row, 2, "下浮率：", &label_format)?;
@@ -14300,7 +18988,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
 
             worksheet.merge_range(current_row, 0, current_row, 2, "下浮后总价：", &label_format)?;
             worksheet.merge_range(current_row, 3, current_row, 5, "", &cell_format)?;
-            worksheet.write_with_format(current_row, 3, final_amount, &money_format)?;
+            worksheet.write_with_format(current_row, 3, accept_final_amount, &money_format)?;
             current_row += 1;
 
             worksheet.merge_range(purchaser_start_row, 6, purchaser_start_row + 2, 8, "收货单位：", &purchaser_label_format)?;
@@ -14327,6 +19015,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 } else {
                     format = format.set_border_left(FormatBorder::Thin).set_border_right(FormatBorder::Thin);
                 }
+                worksheet.set_row_height(current_row, 10)?;
                 worksheet.merge_range(current_row, 0, current_row, 12, item, &format)?;
                 current_row += 1;
             }
@@ -14375,7 +19064,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 }
 
                 let row = current_row;
-                worksheet.set_row_height(row, 20)?;
+                worksheet.set_row_height(row, 25)?;
                 if sig_row == 0 {
                     worksheet.merge_range(row, 0, row, 1, "食材供应人员①：", &label_fmt)?;
                     worksheet.merge_range(row, 2, row, 3, "联系方式：", &contact_fmt)?;
@@ -16116,7 +20805,9 @@ fn build_router() -> Router {
         .route("/inventory", get(page_inventory))
         .route("/purchase", get(page_purchase))
         .route("/sales", get(page_sales))
+        .route("/supplement", get(page_supplement))
         .route("/query/purchase_order", get(page_query_purchase_order))
+        .route("/query/purchase_document", get(page_query_purchase_document))
         .route("/query/purchase_price", get(page_query_purchase_price))
         .route("/query/purchase_summary", get(page_query_purchase_summary))
         .route("/query/supplier_balance", get(page_query_supplier_balance))
@@ -16125,8 +20816,12 @@ fn build_router() -> Router {
         .route("/query/sales_price", get(page_query_sales_price))
         .route("/query/purchaser_balance", get(page_query_purchaser_balance))
         .route("/query/product_rank", get(page_query_product_rank))
+        .route("/query/reimburse_summary", get(page_query_reimburse_summary))
+        .route("/query/allocation_source", get(page_query_allocation_source))
+        .route("/query/order_adjust", get(page_order_adjust))
         .route("/query/stock_balance", get(page_query_stock_balance))
         .route("/query/stock_flow", get(page_query_stock_flow))
+        .route("/query/stock_summary", get(page_query_stock_summary))
         .route("/query/stock_warning", get(page_query_stock_warning))
         .route("/query/slow_stock", get(page_query_slow_stock))
         .route("/query/income_expense", get(page_query_income_expense))
@@ -16177,6 +20872,7 @@ fn build_router() -> Router {
         .route("/api/product/upload_image", post(api_product_upload_image))
         .route("/api/product/delete_image", get(api_product_delete_image))
         .route("/api/product/image/{filename}", get(api_product_get_image))
+        .route("/api/uploads/{folder}/{filename}", get(api_get_uploaded_image))
         .route("/api/product/unit/create", post(api_product_unit_create))
         .route("/api/product/unit/update", post(api_product_unit_update))
         .route("/api/product/unit/delete", post(api_product_unit_delete))
@@ -16206,13 +20902,28 @@ fn build_router() -> Router {
         .route("/api/purchase_order/import", post(api_purchase_order_import))
         .route("/api/sales_order/create", post(api_sales_order_create))
         .route("/api/sales_order/list", get(api_sales_order_list))
+        .route("/api/sales_order/by_purchaser/{purchaser_id}", get(api_sales_order_by_purchaser))
         .route("/api/sales_order/detail/{id}", get(api_sales_order_detail))
         .route("/api/sales_order/update", post(api_sales_order_update))
+        .route("/api/sales_order/upload_image", post(api_sales_order_upload_image))
+        .route("/api/sales_order/delete_image", post(api_sales_order_delete_image))
         .route("/api/sales_order/delete/{id}", delete(api_sales_order_delete))
         .route("/api/sales_order/export", get(api_sales_order_export))
         .route("/api/sales_order/import", post(api_sales_order_import))
         .route("/api/sales_order/accept/{id}", get(api_sales_order_accept))
         .route("/api/sales_order/accept_excel/{id}", get(api_sales_order_accept_excel))
+        .route("/api/supplement/create", post(api_supplement_create))
+        .route("/api/supplement/list_by_target/{order_id}", get(api_supplement_list_by_target))
+        .route("/api/supplement/adjusted_orders", get(api_adjusted_orders))
+        .route("/api/supplement/list_by_source/{order_id}", get(api_supplement_list_by_source))
+        .route("/api/supplement/delete/{id}", delete(api_supplement_delete))
+        .route("/api/supplement/compare/{order_id}", get(api_supplement_compare))
+        .route("/api/allocation/create", post(api_allocation_create))
+        .route("/api/allocation/summary/{source_order_id}", get(api_allocation_summary))
+        .route("/api/allocation/allocated_orders", get(api_allocation_allocated_orders))
+        .route("/api/allocation/terminate", post(api_allocation_terminate))
+        .route("/api/allocation/cancel", post(api_allocation_cancel))
+        .route("/api/allocation/complete", post(api_allocation_complete))
         .route("/api/sales_order/sort_items", get(api_sales_order_sort_items))
         .route("/api/sales_order/sort_items_excel", get(api_sales_order_sort_items_excel))
         .route("/api/sales_order/sort_items_by_purchaser", get(api_sales_order_sort_items_by_purchaser))
@@ -16232,6 +20943,9 @@ fn build_router() -> Router {
         .route("/api/sales_order/sort_comprehensive", get(api_sales_order_sort_comprehensive))
         .route("/api/sales_order/sort_comprehensive_excel", get(api_sales_order_sort_comprehensive_excel))
         .route("/api/query/purchase_order", get(api_query_purchase_order))
+        .route("/api/purchase_document/list", get(api_purchase_document_list))
+        .route("/api/purchase_document/upload", post(api_purchase_document_upload))
+        .route("/api/purchase_document/delete/{id}", delete(api_purchase_document_delete))
         .route("/api/query/purchase_order/export", get(api_query_purchase_order_export))
         .route("/api/query/purchase_price", get(api_query_purchase_price))
         .route("/api/query/purchase_summary", get(api_query_purchase_summary))
@@ -16244,8 +20958,12 @@ fn build_router() -> Router {
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
         .route("/api/query/purchaser_balance/export", get(api_query_purchaser_balance_export))
         .route("/api/query/product_rank", get(api_query_product_rank))
+        .route("/api/query/reimburse_summary", get(api_query_reimburse_summary))
+        .route("/api/query/allocation_source", get(api_query_allocation_source))
         .route("/api/query/stock_balance", get(api_query_stock_balance))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
+        .route("/api/query/stock_summary", get(api_query_stock_summary))
+        .route("/api/query/stock_summary/export", get(api_query_stock_summary_export))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
         .route("/api/query/slow_stock", get(api_query_slow_stock))
         .route("/api/query/income_expense", get(api_query_income_expense))
