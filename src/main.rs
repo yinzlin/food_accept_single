@@ -90,7 +90,7 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" => Some("purchaser"),
         "/query/purchase_order" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
         "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
-        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" => Some("admin"),
+        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
         "/system" | "/api/system/config" => Some("super_admin"),
@@ -1251,6 +1251,9 @@ fn sidebar_html() -> String {
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_flow">
                                     <a href="/query/stock_flow"><span class="node-icon">📋</span><span class="node-label">库存明细台账</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/stock_summary">
+                                    <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">出入库统计</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_warning">
                                     <a href="/query/stock_warning"><span class="node-icon">⚠️</span><span class="node-label">库存上下限预警</span></a>
@@ -7111,6 +7114,129 @@ async fn page_query_stock_flow() -> Html<String> {
         </script>
     "#;
     Html(layout_html("库存明细台账", "/query/stock_flow", &content))
+}
+
+async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/stock_summary").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>出入库统计</h3>
+            <p class="text-muted small">按日汇总采购入库金额与销售出库金额，净额 = 入库金额 - 出库金额。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-6 d-flex align-items-end">
+                    <button onclick="searchStockSummary()" class="btn btn-primary">查询</button>
+                    <button onclick="resetDate('today')" class="btn btn-outline-secondary ml-2">今日</button>
+                    <button onclick="resetDate('7d')" class="btn btn-outline-secondary ml-2">近7天</button>
+                    <button onclick="resetDate('30d')" class="btn btn-outline-secondary ml-2">近30天</button>
+                    <button onclick="resetDate('month')" class="btn btn-outline-secondary ml-2">本月</button>
+                    <button onclick="resetDate('all')" class="btn btn-outline-secondary ml-2">全部</button>
+                </div>
+            </div>
+        </div>
+        <div class="row mt-3">
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计入库金额</div>
+                        <div class="h4 text-success mb-0" id="totalIn">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计净额（入-出）</div>
+                        <div class="h4 mb-0" id="totalNet">0.00</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="card p-3 mt-3">
+            <table class="table table-bordered table-sm">
+                <thead class="thead-light">
+                    <tr>
+                        <th>日期</th>
+                        <th class="text-right">入库金额</th>
+                        <th class="text-center">入库单数</th>
+                        <th class="text-center">入库条数</th>
+                        <th class="text-right">出库金额</th>
+                        <th class="text-center">出库单数</th>
+                        <th class="text-center">出库条数</th>
+                        <th class="text-right">净额</th>
+                    </tr>
+                </thead>
+                <tbody id="resultTable"></tbody>
+            </table>
+        </div>
+        <script>
+            function resetDate(range) {
+                const today = new Date();
+                const fmt = d => d.toISOString().slice(0, 10);
+                const s = document.getElementById('startDate');
+                const e = document.getElementById('endDate');
+                if (range === 'today') { s.value = fmt(today); e.value = fmt(today); }
+                else if (range === '7d') { const t = new Date(today); t.setDate(today.getDate() - 6); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === '30d') { const t = new Date(today); t.setDate(today.getDate() - 29); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === 'month') { const t = new Date(today.getFullYear(), today.getMonth(), 1); s.value = fmt(t); e.value = fmt(today); }
+                else { s.value = ''; e.value = ''; }
+                searchStockSummary();
+            }
+
+            async function searchStockSummary() {
+                const url = '/api/query/stock_summary?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('resultTable');
+                tbody.innerHTML = '';
+                if (!data.items || data.items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    data.items.forEach(it => {
+                        const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
+                        tbody.innerHTML += '<tr>' +
+                            '<td>' + it.day + '</td>' +
+                            '<td class="text-right text-success">' + (it.in_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
+                            '<td class="text-right ' + netCls + '">' + (it.net_amount || 0).toFixed(2) + '</td>' +
+                            '</tr>';
+                    });
+                }
+                document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
+                document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
+                const net = data.total_net_amount || 0;
+                const netEl = document.getElementById('totalNet');
+                netEl.textContent = net.toFixed(2);
+                netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+            }
+
+            resetDate('30d');
+        </script>
+    "#;
+    Html(layout_html("出入库统计", "/query/stock_summary", &content))
 }
 
 async fn page_query_stock_warning() -> Html<String> {
@@ -14912,6 +15038,112 @@ async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
+async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    // 采购入库按日汇总（金额、条数、订单数）
+    let mut purchase_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() {
+        purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        purchase_where.push_str(&format!(" AND po.order_date <= '{}'", end_date));
+    }
+    let purchase_sql = format!(
+        "SELECT po.order_date as day,
+                COALESCE(SUM(poi.amount), 0) as amount,
+                COUNT(poi.id) as item_count,
+                COUNT(DISTINCT po.id) as order_count
+         FROM purchase_order po
+         JOIN purchase_order_item poi ON poi.order_id = po.id
+         {}
+         GROUP BY po.order_date",
+        purchase_where
+    );
+    let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 销售出库按日汇总
+    let mut sales_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() {
+        sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        sales_where.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sales_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(SUM(soi.amount), 0) as amount,
+                COUNT(soi.id) as item_count,
+                COUNT(DISTINCT so.id) as order_count
+         FROM sales_order so
+         JOIN sales_order_item soi ON soi.order_id = so.id
+         {}
+         GROUP BY so.order_date",
+        sales_where
+    );
+    let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    use std::collections::BTreeMap;
+    let mut day_map: BTreeMap<String, (f64, i64, i64, f64, i64, i64)> = BTreeMap::new();
+    // (in_amount, in_items, in_orders, out_amount, out_items, out_orders)
+
+    for row in &purchase_rows {
+        let day: String = row.get("day");
+        let amount: f64 = row.get::<f64, _>("amount");
+        let items: i64 = row.get::<i64, _>("item_count");
+        let orders: i64 = row.get::<i64, _>("order_count");
+        let e = day_map.entry(day).or_insert((0.0, 0, 0, 0.0, 0, 0));
+        e.0 += amount;
+        e.1 += items;
+        e.2 += orders;
+    }
+    for row in &sales_rows {
+        let day: String = row.get("day");
+        let amount: f64 = row.get::<f64, _>("amount");
+        let items: i64 = row.get::<i64, _>("item_count");
+        let orders: i64 = row.get::<i64, _>("order_count");
+        let e = day_map.entry(day).or_insert((0.0, 0, 0, 0.0, 0, 0));
+        e.3 += amount;
+        e.4 += items;
+        e.5 += orders;
+    }
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut total_in = 0.0;
+    let mut total_out = 0.0;
+    // 按日期倒序输出
+    for (day, v) in day_map.iter().rev() {
+        total_in += v.0;
+        total_out += v.3;
+        items.push(serde_json::json!({
+            "day": day,
+            "in_amount": v.0,
+            "in_item_count": v.1,
+            "in_order_count": v.2,
+            "out_amount": v.3,
+            "out_item_count": v.4,
+            "out_order_count": v.5,
+            "net_amount": v.0 - v.3,
+        }));
+    }
+
+    let result = serde_json::json!({
+        "items": items,
+        "total_in_amount": total_in,
+        "total_out_amount": total_out,
+        "total_net_amount": total_in - total_out,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
 async fn api_query_stock_warning() -> impl IntoResponse {
     let low_rows = sqlx::query(
         "SELECT p.name as product_name, p.spec, p.unit, i.quantity as current_stock, i.min_stock
@@ -19641,6 +19873,7 @@ fn build_router() -> Router {
         .route("/query/order_adjust", get(page_order_adjust))
         .route("/query/stock_balance", get(page_query_stock_balance))
         .route("/query/stock_flow", get(page_query_stock_flow))
+        .route("/query/stock_summary", get(page_query_stock_summary))
         .route("/query/stock_warning", get(page_query_stock_warning))
         .route("/query/slow_stock", get(page_query_slow_stock))
         .route("/query/income_expense", get(page_query_income_expense))
@@ -19775,6 +20008,7 @@ fn build_router() -> Router {
         .route("/api/query/allocation_source", get(api_query_allocation_source))
         .route("/api/query/stock_balance", get(api_query_stock_balance))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
+        .route("/api/query/stock_summary", get(api_query_stock_summary))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
         .route("/api/query/slow_stock", get(api_query_slow_stock))
         .route("/api/query/income_expense", get(api_query_income_expense))
