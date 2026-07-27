@@ -17766,8 +17766,8 @@ async fn page_supplement() -> Html<String> {
                 }
 
                 const currentAllocSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
-                if (amount > allocationSummary.remaining_balance - currentAllocSum) {
-                    alert('增项金额不能超过未分摊余额');
+                if (amount > allocationSummary.remaining_balance - currentAllocSum + 5.0) {
+                    alert('增项金额不能超过未分摊余额（允许上浮 5 元尾差）');
                     return;
                 }
 
