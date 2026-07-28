@@ -14950,14 +14950,14 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
         binds.push(end_date.to_string());
     }
 
-    // 1) 真实明细：按采购单位 & 商品聚合
+    // 1) 真实明细：按采购单位聚合（真实账套口径，含全部订单，不排除来源耗材单）
     let real_purchaser_sql = format!(
-        "SELECT so.purchaser_id, p.name, so.id as order_id, SUM(soi.amount) as amount, SUM(soi.quantity) as qty
+        "SELECT so.purchaser_id, p.name, SUM(soi.amount) as amount
          FROM sales_order_item soi
          JOIN sales_order so ON soi.order_id = so.id
          JOIN purchaser p ON so.purchaser_id = p.id
          WHERE 1=1 {}
-         GROUP BY so.id", date_cond
+         GROUP BY so.purchaser_id", date_cond
     );
     let mut q = sqlx::query(AssertSqlSafe(real_purchaser_sql.as_str()));
     for b in &binds { q = q.bind(b); }
@@ -14967,8 +14967,6 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
     // 按采购单位累加：real_amount
     let mut purchaser_map: HashMap<i64, (String, f64, f64)> = HashMap::new(); // id -> (name, real, supp)
     for r in &real_rows {
-        let order_id = r.get::<i64, _>("order_id");
-        if source_set.contains(&order_id) { continue; } // 排除来源耗材单
         let pid = r.get::<i64, _>("purchaser_id");
         let name = r.get::<String, _>("name");
         let amount = r.get::<f64, _>("amount");
@@ -14976,8 +14974,8 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
         entry.1 += amount;
     }
 
-    // 2) 分摊增项净额：按目标订单归属的采购单位聚合（含 replace_remove 负数抵消）
-    let supp_sql = format!(
+    // 2a) 分摊增项：作为「目标单」收到的增项（正），按目标单采购单位聚合
+    let supp_target_sql = format!(
         "SELECT so.purchaser_id, p.name, SUM(osi.amount) as supp_amount
          FROM order_supplement_item osi
          JOIN sales_order so ON osi.target_order_id = so.id
@@ -14985,15 +14983,41 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
          WHERE 1=1 {}
          GROUP BY so.purchaser_id", date_cond
     );
-    let mut q2 = sqlx::query(AssertSqlSafe(supp_sql.as_str()));
+    let mut q2 = sqlx::query(AssertSqlSafe(supp_target_sql.as_str()));
     for b in &binds { q2 = q2.bind(b); }
-    let supp_rows = q2.fetch_all(pool()).await.unwrap_or_default();
-    for r in &supp_rows {
+    let supp_target_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    for r in &supp_target_rows {
         let pid = r.get::<i64, _>("purchaser_id");
         let name = r.get::<String, _>("name");
         let supp_amount = r.get::<f64, _>("supp_amount");
         let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
         entry.2 += supp_amount;
+    }
+
+    // 2b) 分摊减项：来源耗材单在报销口径里不报销，扣除其「真实明细金额」（非已分摊金额）
+    // 净额 = 目标单收到的分摊增项(+) − 来源单真实金额(−)，正好等于分摊尾差（超分为正、少分为负）
+    // 仅针对实际作为分摊来源的订单
+    if !source_set.is_empty() {
+        let source_real_sql = format!(
+            "SELECT so.purchaser_id, p.name, so.id as order_id, SUM(soi.amount) as amount
+             FROM sales_order_item soi
+             JOIN sales_order so ON soi.order_id = so.id
+             JOIN purchaser p ON so.purchaser_id = p.id
+             WHERE 1=1 {}
+             GROUP BY so.id", date_cond
+        );
+        let mut q2b = sqlx::query(AssertSqlSafe(source_real_sql.as_str()));
+        for b in &binds { q2b = q2b.bind(b); }
+        let source_real_rows = q2b.fetch_all(pool()).await.unwrap_or_default();
+        for r in &source_real_rows {
+            let order_id = r.get::<i64, _>("order_id");
+            if !source_set.contains(&order_id) { continue; } // 只扣除来源单
+            let pid = r.get::<i64, _>("purchaser_id");
+            let name = r.get::<String, _>("name");
+            let amount = r.get::<f64, _>("amount");
+            let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
+            entry.2 -= amount;
+        }
     }
 
     let mut by_purchaser: Vec<serde_json::Value> = purchaser_map.values().map(|(name, real, supp)| {
@@ -16436,54 +16460,178 @@ async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
     .fetch_optional(pool())
     .await
     .unwrap_or(None);
-    
+
     if order_row.is_none() {
         return (StatusCode::NOT_FOUND, "订单不存在".to_string());
     }
-    
+
     let row = order_row.unwrap();
-    
+    let discount_rate = row.get::<f64, _>("discount_rate");
+
+    // 1) 真实明细（带分类信息，用于排序）
     let item_rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark
-         FROM sales_order_item soi WHERE soi.order_id = ?"
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+                p.category_id, pc.name as category_name, pc2.name as parent_name
+         FROM sales_order_item soi
+         LEFT JOIN product p ON soi.product_id = p.id
+         LEFT JOIN category pc ON p.category_id = pc.id
+         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+         WHERE soi.order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
     .await
     .unwrap_or_default();
 
-    let items: Vec<serde_json::Value> = item_rows
-        .iter()
-        .map(|r| {
-            let food_name = r.get::<Option<String>, _>("alias2").unwrap_or_default();
-            let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
-            let remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
+    use std::collections::HashMap;
+    let mut item_map: HashMap<i64, (i64, String, String, String, f64, f64, f64, String, i64)> = HashMap::new(); // sort_key, food_name, spec, unit, unit_price, quantity, amount, remark, original_id
+    // product_id -> 真实明细行 id，用于分摊增项 target_order_item_id 失效时回退匹配
+    let mut product_to_key: HashMap<i64, i64> = HashMap::new();
+    for r in &item_rows {
+        let rid = r.get::<i64, _>("id");
+        let pid = r.get::<i64, _>("product_id");
+        product_to_key.entry(pid).or_insert(rid);
+        let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+        let product_name = r.get::<String, _>("product_name");
+        let food_name = if alias2.is_empty() {
+            product_name.clone()
+        } else {
+            format!("{}({})", product_name, alias2)
+        };
+        let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
+        let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        let original_remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
+        let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
+        let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
+        let sort_key = get_category_sort_key(&category_name, &parent_name);
+        item_map.insert(rid, (sort_key, food_name, spec, unit, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), original_remark, rid));
+    }
+
+    // 2) 合并分摊增项（与验收单导出 Excel 一致的逻辑）
+    let supplement_rows = sqlx::query(
+        "SELECT id, target_order_id, source_order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, amount, operation_type, target_order_item_id
+         FROM order_supplement_item WHERE target_order_id = ?"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for r in &supplement_rows {
+        let op_type = r.get::<String, _>("operation_type");
+        let target_item_id = r.get::<Option<i64>, _>("target_order_item_id");
+        let supp_product_id = r.get::<i64, _>("product_id");
+        let qty = r.get::<f64, _>("quantity");
+        let amt = r.get::<f64, _>("amount");
+        let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+        let product_name = r.get::<String, _>("product_name");
+
+        // 解析目标明细行 key：优先用 target_order_item_id，失效时用 product_id 回退匹配
+        let resolved_key: Option<i64> = match target_item_id {
+            Some(tid) if item_map.contains_key(&tid) => Some(tid),
+            _ => product_to_key.get(&supp_product_id).copied(),
+        };
+
+        // 替换-冲减：负数金额，若归零则移除
+        if op_type == "replace_remove" {
+            if let Some(tid) = resolved_key {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.6 + amt;
+                    if new_qty.abs() < 0.001 || new_amt.abs() < 0.001 {
+                        item_map.remove(&tid);
+                    } else {
+                        entry.4 = new_qty;
+                        entry.6 = new_amt;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 追加数量：叠加到原明细
+        if op_type == "increase_quantity" {
+            if let Some(tid) = resolved_key {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.6 + amt;
+                    let new_remark = format!("{}（含增项+{}）", entry.7, qty);
+                    entry.4 = new_qty;
+                    entry.6 = new_amt;
+                    entry.7 = new_remark;
+                }
+            }
+        } else {
+            // new_item 或 replace_add：作为新明细
+            let food_name = if alias2.is_empty() { product_name.clone() } else { format!("{}({})", product_name, alias2) };
+            let unit = r.get::<String, _>("unit");
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            // 通过 product_id 反查分类名做排序
+            let category_query = sqlx::query(
+                "SELECT pc.name as category_name, pc2.name as parent_name
+                 FROM product p
+                 LEFT JOIN category pc ON p.category_id = pc.id
+                 LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+                 WHERE p.id = ?"
+            )
+            .bind(r.get::<i64, _>("product_id"))
+            .fetch_optional(pool())
+            .await
+            .ok()
+            .flatten();
+            let (cat_name, parent_name) = if let Some(cr) = category_query {
+                (cr.get::<Option<String>, _>("category_name").unwrap_or_default(),
+                 cr.get::<Option<String>, _>("parent_name").unwrap_or_default())
+            } else {
+                (String::new(), String::new())
+            };
+            let sort_key = get_category_sort_key(&cat_name, &parent_name);
+            let remark = if op_type == "replace_add" {
+                spec.clone()
+            } else {
+                if spec.is_empty() { "[增项]".to_string() } else { format!("{}; [增项]", spec) }
+            };
+            item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, spec, unit, r.get::<f64, _>("unit_price"), qty, amt, remark, 0));
+        }
+    }
+
+    let mut items_vec: Vec<_> = item_map.into_values().collect();
+    items_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // 3) 按合并后明细重算验收金额
+    let accept_total_amount: f64 = items_vec.iter().map(|item| item.6).sum();
+    let accept_final_amount = accept_total_amount * (1.0 - discount_rate / 100.0);
+
+    // 4) 输出 JSON（字段名与原接口一致）
+    let items: Vec<serde_json::Value> = items_vec
+        .into_iter()
+        .map(|(_sort_key, food_name, _spec, unit, unit_price, quantity, amount, remark, original_id)| {
             serde_json::json!({
-                "id": r.get::<i64, _>("id"),
-                "product_id": r.get::<i64, _>("product_id"),
-                "product_name": r.get::<String, _>("product_name"),
-                "food_name": if food_name.is_empty() { r.get::<String, _>("product_name") } else { food_name },
-                "alias2": r.get::<Option<String>, _>("alias2"),
+                "id": original_id,
+                "product_id": 0,
+                "product_name": food_name.clone(),
+                "food_name": food_name,
+                "alias2": "",
                 "spec": unit,
                 "unit": unit,
-                "unit_price": r.get::<f64, _>("unit_price"),
-                "quantity": r.get::<f64, _>("quantity"),
-                "amount": r.get::<f64, _>("amount"),
+                "unit_price": unit_price,
+                "quantity": quantity,
+                "amount": amount,
                 "remark": remark,
             })
         })
         .collect();
-    
+
     let supplier_name = "湖南食全味美餐饮管理有限公司".to_string();
     let car_no = "湘A·NY360".to_string();
-    
+
     let accept_data = serde_json::json!({
         "id": row.get::<i64, _>("id"),
         "order_no": row.get::<String, _>("order_no"),
         "order_date": row.get::<String, _>("order_date"),
-        "total_amount": row.get::<f64, _>("total_amount"),
-        "discount_rate": row.get::<f64, _>("discount_rate"),
-        "final_amount": row.get::<f64, _>("final_amount"),
+        "total_amount": accept_total_amount,
+        "discount_rate": discount_rate,
+        "final_amount": accept_final_amount,
         "remark": row.get::<Option<String>, _>("remark"),
         "purchaser_name": row.get::<String, _>("purchaser_name"),
         "purchaser_address": row.get::<Option<String>, _>("purchaser_address"),
@@ -16491,7 +16639,7 @@ async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
         "car_no": car_no,
         "items": items,
     });
-    
+
     (StatusCode::OK, serde_json::to_string(&accept_data).unwrap())
 }
 
@@ -18370,7 +18518,7 @@ async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> impl 
 
 async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, so.order_no as source_order_no
+        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id, so.order_no as source_order_no
          FROM order_supplement_item soi LEFT JOIN sales_order so ON soi.source_order_id = so.id
          WHERE soi.target_order_id = ? ORDER BY soi.allocate_date DESC"
     )
@@ -18396,6 +18544,8 @@ async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoRe
             "quantity": row.get::<f64, _>("quantity"),
             "amount": row.get::<f64, _>("amount"),
             "allocate_date": row.get::<String, _>("allocate_date"),
+            "operation_type": row.get::<String, _>("operation_type"),
+            "target_order_item_id": row.get::<Option<i64>, _>("target_order_item_id"),
         })
     }).collect();
 
@@ -18403,7 +18553,7 @@ async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoRe
 }
 
 async fn api_adjusted_orders() -> impl IntoResponse {
-    // 列出所有存在自调整记录（target_order_id == source_order_id）的订单
+    // 列出所有收到分摊增项/调整的目标订单（target_order_id 指向该订单即视为有变更）
     let rows = sqlx::query(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount,
                 p.name as purchaser_name,
@@ -18411,7 +18561,7 @@ async fn api_adjusted_orders() -> impl IntoResponse {
                 COUNT(osi.id) as adjust_count,
                 MAX(osi.allocate_date) as last_adjust_date
          FROM sales_order so
-         INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id AND osi.source_order_id = so.id
+         INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name
          ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC"
@@ -18756,8 +18906,12 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
 
     use std::collections::HashMap;
     let mut item_map: HashMap<i64, (i64, String, String, f64, f64, f64, String)> = HashMap::new();
+    // product_id -> 真实明细行 id，用于分摊增项 target_order_item_id 失效时回退匹配
+    let mut product_to_key: HashMap<i64, i64> = HashMap::new();
     for r in &item_rows {
         let rid = r.get::<i64, _>("id");
+        let pid = r.get::<i64, _>("product_id");
+        product_to_key.entry(pid).or_insert(rid);
         let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
         let product_name = r.get::<String, _>("product_name");
         let food_name = if alias2.is_empty() {
@@ -18778,12 +18932,20 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     for r in &supplement_rows {
         let op_type = r.get::<String, _>("operation_type");
         let target_item_id = r.get::<Option<i64>, _>("target_order_item_id");
+        let supp_product_id = r.get::<i64, _>("product_id");
         let qty = r.get::<f64, _>("quantity");
         let amt = r.get::<f64, _>("amount");
 
+        // 解析目标明细行 key：优先用 target_order_item_id，失效时用 product_id 回退匹配
+        // （销售订单更新会 DELETE+INSERT 导致 sales_order_item.id 变化，旧 target_order_item_id 会失效）
+        let resolved_key: Option<i64> = match target_item_id {
+            Some(tid) if item_map.contains_key(&tid) => Some(tid),
+            _ => product_to_key.get(&supp_product_id).copied(),
+        };
+
         // 替换-冲减：不导出（原被替换商品也需从导出中扣除）
         if op_type == "replace_remove" {
-            if let Some(tid) = target_item_id {
+            if let Some(tid) = resolved_key {
                 if let Some(entry) = item_map.get_mut(&tid) {
                     let new_qty = entry.4 + qty;
                     let new_amt = entry.5 + amt;
@@ -18799,7 +18961,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
         }
 
         if op_type == "increase_quantity" {
-            if let Some(tid) = target_item_id {
+            if let Some(tid) = resolved_key {
                 if let Some(entry) = item_map.get_mut(&tid) {
                     let new_qty = entry.4 + qty;
                     let new_amt = entry.5 + amt;
