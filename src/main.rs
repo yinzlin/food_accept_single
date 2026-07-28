@@ -90,7 +90,7 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
         "/query/purchase_order" | "/query/purchase_document" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
         "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
-        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" => Some("admin"),
+        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" | "/query/stock_summary_reimburse" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
         "/system" | "/api/system/config" => Some("super_admin"),
@@ -1297,7 +1297,10 @@ fn sidebar_html() -> String {
                                     <a href="/query/stock_flow"><span class="node-icon">📋</span><span class="node-label">库存明细台账</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_summary">
-                                    <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">出入库统计</span></a>
+                                    <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">真实出入库统计</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/stock_summary_reimburse">
+                                    <a href="/query/stock_summary_reimburse"><span class="node-icon">🧾</span><span class="node-label">报销出入库统计</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_warning">
                                     <a href="/query/stock_warning"><span class="node-icon">⚠️</span><span class="node-label">库存上下限预警</span></a>
@@ -7412,8 +7415,8 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
     }
     let content = r#"
         <div class="card p-4">
-            <h3>出入库统计</h3>
-            <p class="text-muted small">按日汇总采购入库金额与销售出库金额，净额 = 入库金额 - 出库金额。</p>
+            <h3>真实出入库统计</h3>
+            <p class="text-muted small">真实账套口径：按日汇总采购入库金额与销售出库金额，净额 = 入库金额 - 出库金额。出库金额取自销售订单真实明细，不含分摊增项。</p>
             <div class="row mb-3">
                 <div class="col-md-3">
                     <label>开始日期：</label>
@@ -7540,7 +7543,143 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
             resetDate('30d');
         </script>
     "#;
-    Html(layout_html("出入库统计", "/query/stock_summary", &content))
+    Html(layout_html("真实出入库统计", "/query/stock_summary", &content))
+}
+
+async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/stock_summary_reimburse").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>报销出入库统计</h3>
+            <p class="text-muted small">报销账套口径：出库金额 = 真实出库 + 分摊增项净额（目标单收到的分摊 − 来源耗材单金额）。入库金额与真实账套一致。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-6 d-flex align-items-end">
+                    <button onclick="searchStockSummary()" class="btn btn-primary">查询</button>
+                    <button onclick="exportStockSummary()" class="btn btn-success ml-2">导出Excel</button>
+                    <button onclick="resetDate('today')" class="btn btn-outline-secondary ml-2">今日</button>
+                    <button onclick="resetDate('7d')" class="btn btn-outline-secondary ml-2">近7天</button>
+                    <button onclick="resetDate('30d')" class="btn btn-outline-secondary ml-2">近30天</button>
+                    <button onclick="resetDate('month')" class="btn btn-outline-secondary ml-2">本月</button>
+                    <button onclick="resetDate('all')" class="btn btn-outline-secondary ml-2">全部</button>
+                </div>
+            </div>
+        </div>
+        <div class="row mt-3">
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计入库金额</div>
+                        <div class="h4 text-success mb-0" id="totalIn">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计净额（入-出）</div>
+                        <div class="h4 mb-0" id="totalNet">0.00</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="card p-3 mt-3">
+            <table class="table table-bordered table-sm">
+                <thead class="thead-light">
+                    <tr>
+                        <th>日期</th>
+                        <th>仓库</th>
+                        <th class="text-right">入库金额</th>
+                        <th class="text-center">入库单数</th>
+                        <th class="text-center">入库条数</th>
+                        <th class="text-right">出库金额</th>
+                        <th class="text-center">出库单数</th>
+                        <th class="text-center">出库条数</th>
+                        <th class="text-right">净额</th>
+                    </tr>
+                </thead>
+                <tbody id="resultTable"></tbody>
+            </table>
+        </div>
+        <script>
+            function resetDate(range) {
+                const today = new Date();
+                const fmt = d => d.toISOString().slice(0, 10);
+                const s = document.getElementById('startDate');
+                const e = document.getElementById('endDate');
+                if (range === 'today') { s.value = fmt(today); e.value = fmt(today); }
+                else if (range === '7d') { const t = new Date(today); t.setDate(today.getDate() - 6); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === '30d') { const t = new Date(today); t.setDate(today.getDate() - 29); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === 'month') { const t = new Date(today.getFullYear(), today.getMonth(), 1); s.value = fmt(t); e.value = fmt(today); }
+                else { s.value = ''; e.value = ''; }
+                searchStockSummary();
+            }
+
+            async function searchStockSummary() {
+                const url = '/api/query/stock_summary_reimburse?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('resultTable');
+                tbody.innerHTML = '';
+                if (!data.rows || data.rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let prevDay = null;
+                    data.rows.forEach(it => {
+                        const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
+                        const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
+                        const dayDisplay = it.day !== prevDay ? it.day : '';
+                        prevDay = it.day;
+                        tbody.innerHTML += '<tr style="' + rowStyle + '">' +
+                            '<td>' + dayDisplay + '</td>' +
+                            '<td>' + it.warehouse_name + '</td>' +
+                            '<td class="text-right text-success">' + (it.in_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
+                            '<td class="text-right ' + netCls + '">' + (it.net_amount || 0).toFixed(2) + '</td>' +
+                            '</tr>';
+                    });
+                }
+                document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
+                document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
+                const net = data.total_net_amount || 0;
+                const netEl = document.getElementById('totalNet');
+                netEl.textContent = net.toFixed(2);
+                netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+            }
+
+            function exportStockSummary() {
+                const url = '/api/query/stock_summary_reimburse/export?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                window.location.href = url;
+            }
+
+            resetDate('30d');
+        </script>
+    "#;
+    Html(layout_html("报销出入库统计", "/query/stock_summary_reimburse", &content))
 }
 
 async fn page_query_stock_warning() -> Html<String> {
@@ -15976,6 +16115,182 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
     (rows, total_in, total_out)
 }
 
+async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64) {
+    // 入库：与真实账套一致
+    let mut purchase_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date)); }
+    if !end_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date <= '{}'", end_date)); }
+    let purchase_sql = format!(
+        "SELECT po.order_date as day,
+                COALESCE(po.warehouse_id, 0) as warehouse_id,
+                COALESCE(po.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(poi.amount), 0) as in_amount,
+                COUNT(poi.id) as in_item_count,
+                COUNT(DISTINCT po.id) as in_order_count
+         FROM purchase_order po
+         JOIN purchase_order_item poi ON poi.order_id = po.id
+         {}
+         GROUP BY po.order_date, po.warehouse_id, po.warehouse_name",
+        purchase_where
+    );
+    let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 真实出库
+    let mut sales_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() { sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date)); }
+    if !end_date.is_empty() { sales_where.push_str(&format!(" AND so.order_date <= '{}'", end_date)); }
+    let sales_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(soi.amount), 0) as out_amount,
+                COUNT(soi.id) as out_item_count,
+                COUNT(DISTINCT so.id) as out_order_count
+         FROM sales_order so
+         JOIN sales_order_item soi ON soi.order_id = so.id
+         {}
+         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+        sales_where
+    );
+    let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 分摊调整1：目标单收到的增项金额（+出库），按目标单日期+仓库
+    let adj1_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                SUM(osi.amount) as out_amount
+         FROM order_supplement_item osi
+         JOIN sales_order so ON osi.target_order_id = so.id
+         WHERE 1=1 {}
+         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+        sales_where
+    );
+    let adj1_rows = sqlx::query(AssertSqlSafe(adj1_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 分摊调整2：来源耗材单真实金额（−出库），按来源单日期+仓库
+    let adj2_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                SUM(soi.amount) as out_amount
+         FROM sales_order so
+         JOIN sales_order_item soi ON soi.order_id = so.id
+         WHERE so.id IN (SELECT DISTINCT source_order_id FROM order_supplement_item) {}",
+        if sales_where.len() > 8 { format!(" AND {}", &sales_where[9..]) } else { String::new() }
+    );
+    let adj2_rows = sqlx::query(AssertSqlSafe(adj2_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    use std::collections::{BTreeMap, HashMap};
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String)>> = HashMap::new();
+
+    for row in &purchase_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("in_amount");
+        let items: i64 = row.get::<i64, _>("in_item_count");
+        let orders: i64 = row.get::<i64, _>("in_order_count");
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        e.0 += amount; e.1 += items; e.2 += orders;
+    }
+
+    for row in &sales_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let items: i64 = row.get::<i64, _>("out_item_count");
+        let orders: i64 = row.get::<i64, _>("out_order_count");
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        e.3 += amount; e.4 += items; e.5 += orders;
+    }
+
+    // 加目标单分摊增项
+    for row in &adj1_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        e.3 += amount;
+    }
+
+    // 减来源单真实金额
+    for row in &adj2_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        e.3 -= amount;
+    }
+
+    let mut days: Vec<String> = day_wh_map.keys().cloned().collect();
+    days.sort_by(|a, b| b.cmp(a));
+
+    let mut rows: Vec<StockSummaryRow> = Vec::new();
+    let mut total_in = 0.0;
+    let mut total_out = 0.0;
+
+    for day in &days {
+        if let Some(wh_map) = day_wh_map.get(day) {
+            let mut day_in = 0.0;
+            let mut day_out = 0.0;
+            let mut day_in_items = 0;
+            let mut day_out_items = 0;
+            let mut day_in_orders = 0;
+            let mut day_out_orders = 0;
+
+            for (wh_id, v) in wh_map {
+                day_in += v.0; day_out += v.3;
+                day_in_items += v.1; day_out_items += v.4;
+                day_in_orders += v.2; day_out_orders += v.5;
+
+                rows.push(StockSummaryRow {
+                    day: day.clone(),
+                    warehouse_id: *wh_id,
+                    warehouse_name: v.6.clone(),
+                    is_summary: false,
+                    in_amount: v.0,
+                    in_item_count: v.1,
+                    in_order_count: v.2,
+                    out_amount: v.3,
+                    out_item_count: v.4,
+                    out_order_count: v.5,
+                    net_amount: v.0 - v.3,
+                });
+            }
+
+            rows.push(StockSummaryRow {
+                day: day.clone(), warehouse_id: -1, warehouse_name: "当日汇总".to_string(),
+                is_summary: true,
+                in_amount: day_in, in_item_count: day_in_items, in_order_count: day_in_orders,
+                out_amount: day_out, out_item_count: day_out_items, out_order_count: day_out_orders,
+                net_amount: day_in - day_out,
+            });
+            total_in += day_in; total_out += day_out;
+        }
+    }
+    (rows, total_in, total_out)
+}
+
 async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
@@ -16110,6 +16425,123 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
         [
             (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
             (header::CONTENT_DISPOSITION, "attachment; filename=\"stock_summary.xlsx\""),
+        ],
+        buf,
+    ).into_response()
+}
+
+async fn api_query_stock_summary_reimburse(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out) = compute_stock_summary_reimburse(start_date, end_date).await;
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "day": r.day,
+            "warehouse_id": r.warehouse_id,
+            "warehouse_name": r.warehouse_name,
+            "is_summary": r.is_summary,
+            "in_amount": r.in_amount,
+            "in_item_count": r.in_item_count,
+            "in_order_count": r.in_order_count,
+            "out_amount": r.out_amount,
+            "out_item_count": r.out_item_count,
+            "out_order_count": r.out_order_count,
+            "net_amount": r.net_amount,
+        })
+    }).collect();
+
+    let result = serde_json::json!({
+        "rows": items,
+        "total_in_amount": total_in,
+        "total_out_amount": total_out,
+        "total_net_amount": total_in - total_out,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out) = compute_stock_summary_reimburse(start_date, end_date).await;
+
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("报销出入库统计").unwrap();
+
+    let header_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0x2E75B6))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+    let summary_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+    let num_format = rust_xlsxwriter::Format::new()
+        .set_num_format("#,##0.00")
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+    let num_format_sum = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_num_format("#,##0.00")
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "出库单数", "出库条数", "净额"];
+    for (col, header) in headers.iter().enumerate() {
+        worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
+    }
+    worksheet.set_column_width(0, 14).unwrap();
+    worksheet.set_column_width(1, 16).unwrap();
+    worksheet.set_column_width_pixels(2, 90).unwrap();
+    worksheet.set_column_width_pixels(3, 70).unwrap();
+    worksheet.set_column_width_pixels(4, 70).unwrap();
+    worksheet.set_column_width_pixels(5, 90).unwrap();
+    worksheet.set_column_width_pixels(6, 70).unwrap();
+    worksheet.set_column_width_pixels(7, 70).unwrap();
+    worksheet.set_column_width_pixels(8, 90).unwrap();
+
+    let mut prev_day = String::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let sheet_row = (row_idx + 1) as u32;
+        let day_display = if row.day != prev_day { row.day.as_str() } else { "" };
+        prev_day = row.day.clone();
+        if row.is_summary {
+            worksheet.write_with_format(sheet_row, 0, day_display, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 1, &row.warehouse_name, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format_sum).unwrap();
+        } else {
+            worksheet.write(sheet_row, 0, day_display).unwrap();
+            worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
+            worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 6, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 7, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format).unwrap();
+        }
+    }
+
+    let total_row = (rows.len() + 2) as u32;
+    worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
+    worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 8, total_in - total_out, &num_format_sum).unwrap();
+
+    let buf = workbook.save_to_buffer().unwrap();
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"stock_summary_reimburse.xlsx\""),
         ],
         buf,
     ).into_response()
@@ -20991,6 +21423,7 @@ fn build_router() -> Router {
         .route("/query/stock_balance", get(page_query_stock_balance))
         .route("/query/stock_flow", get(page_query_stock_flow))
         .route("/query/stock_summary", get(page_query_stock_summary))
+        .route("/query/stock_summary_reimburse", get(page_query_stock_summary_reimburse))
         .route("/query/stock_warning", get(page_query_stock_warning))
         .route("/query/slow_stock", get(page_query_slow_stock))
         .route("/query/income_expense", get(page_query_income_expense))
@@ -21133,6 +21566,8 @@ fn build_router() -> Router {
         .route("/api/query/stock_flow", get(api_query_stock_flow))
         .route("/api/query/stock_summary", get(api_query_stock_summary))
         .route("/api/query/stock_summary/export", get(api_query_stock_summary_export))
+        .route("/api/query/stock_summary_reimburse", get(api_query_stock_summary_reimburse))
+        .route("/api/query/stock_summary_reimburse/export", get(api_query_stock_summary_reimburse_export))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
         .route("/api/query/slow_stock", get(api_query_slow_stock))
         .route("/api/query/income_expense", get(api_query_income_expense))
