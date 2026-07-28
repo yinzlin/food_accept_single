@@ -16161,6 +16161,7 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         .unwrap_or_default();
 
     // 分摊调整1：目标单收到的增项金额（+出库），按目标单日期+仓库
+    // 注意：sales_where 本身已含 "WHERE 1=1 AND ..."，此处直接拼接，避免重复 WHERE 导致 SQL 失败
     let adj1_sql = format!(
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
@@ -16168,7 +16169,7 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
                 SUM(osi.amount) as out_amount
          FROM order_supplement_item osi
          JOIN sales_order so ON osi.target_order_id = so.id
-         WHERE 1=1 {}
+         {}
          GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
         sales_where
     );
@@ -16178,6 +16179,7 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         .unwrap_or_default();
 
     // 分摊调整2：来源耗材单真实金额（−出库），按来源单日期+仓库
+    // 来源集合与「报销口径汇总」保持一致，统一使用 consumable_allocation.source_order_id
     let adj2_sql = format!(
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
@@ -16185,8 +16187,9 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
                 SUM(soi.amount) as out_amount
          FROM sales_order so
          JOIN sales_order_item soi ON soi.order_id = so.id
-         WHERE so.id IN (SELECT DISTINCT source_order_id FROM order_supplement_item) {}",
-        if sales_where.len() > 8 { format!(" AND {}", &sales_where[9..]) } else { String::new() }
+         {} AND so.id IN (SELECT DISTINCT source_order_id FROM consumable_allocation)
+         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+        sales_where
     );
     let adj2_rows = sqlx::query(AssertSqlSafe(adj2_sql.as_str()))
         .fetch_all(pool())
