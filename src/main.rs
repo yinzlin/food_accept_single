@@ -5408,18 +5408,32 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
             async function updatePrices() {{
                 if (!currentOrderId) {{ alert('请先选择要编辑的订单'); return; }}
-                if (!confirm('确定要一键更新当前订单所有明细的售价为商品最新基础售价？\\n此操作将同步修改订单金额。')) return;
+                if (!confirm('将自动填入商品最新基础售价，请核对后手动保存修改。\\n确定继续？')) return;
                 const btn = document.getElementById('updatePricesBtn');
                 btn.disabled = true;
-                btn.textContent = '更新中...';
+                btn.textContent = '获取中...';
                 try {{
                     const res = await fetch('/api/sales_order/update_prices/' + currentOrderId, {{ method: 'POST' }});
-                    const msg = await res.text();
-                    alert(msg);
-                    // 重新加载订单数据
-                    await loadOrderDetail(currentOrderId);
+                    const data = await res.json();
+                    if (data.errors && data.errors.length > 0) {{
+                        alert('部分商品获取售价失败：\\n' + data.errors.join('\\n'));
+                    }}
+                    // 更新表单中的 items 数据（不写入数据库）
+                    const priceMap = {{}};
+                    data.items.forEach(i => {{ priceMap[i.product_id] = i; }});
+                    let changed = 0;
+                    items.forEach((item, idx) => {{
+                        const newData = priceMap[item.product_id];
+                        if (newData) {{
+                            item.unit_price = newData.unit_price;
+                            item.amount = newData.amount;
+                            changed++;
+                        }}
+                    }});
+                    renderItems();
+                    alert('已获取 ' + changed + ' 项商品最新售价，请核对后点击"保存修改"。');
                 }} catch (e) {{
-                    alert('更新失败：' + e.message);
+                    alert('获取失败：' + e.message);
                 }} finally {{
                     btn.disabled = false;
                     btn.textContent = '一键更新售价';
@@ -14091,7 +14105,7 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     }
 }
 
-// 一键更新订单中所有明细的售价为商品最新 base_price
+// 一键获取订单明细的最新售价（不写入数据库），返回给前端供用户手动保存
 async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
     match check_api_permission(&headers, "/api/sales_order/update_prices").await {
         Err(e) => return e,
@@ -14110,13 +14124,15 @@ async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id):
         return (StatusCode::NOT_FOUND, "订单不存在或无明细".to_string());
     }
 
+    let mut result_items = Vec::new();
     let mut errors = Vec::new();
+    let mut new_total = 0.0;
+
     for item in &items {
         let item_id: i64 = item.get("id");
         let product_id: i64 = item.get("product_id");
         let quantity: f64 = item.get("quantity");
 
-        // 获取商品最新 base_price
         let price_row: Option<(f64,)> = sqlx::query_as(
             "SELECT COALESCE(base_price, 0) FROM product WHERE id = ?"
         )
@@ -14128,14 +14144,13 @@ async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id):
         match price_row {
             Some((new_price,)) if new_price > 0.0 => {
                 let new_amount = new_price * quantity;
-                let _ = sqlx::query(
-                    "UPDATE sales_order_item SET unit_price = ?, amount = ? WHERE id = ?"
-                )
-                .bind(new_price)
-                .bind(new_amount)
-                .bind(item_id)
-                .execute(pool())
-                .await;
+                new_total += new_amount;
+                result_items.push(serde_json::json!({
+                    "item_id": item_id,
+                    "product_id": product_id,
+                    "unit_price": new_price,
+                    "amount": new_amount,
+                }));
             }
             Some((_,)) => {
                 errors.push(format!("商品ID {} 售价为0，跳过", product_id));
@@ -14146,16 +14161,6 @@ async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id):
         }
     }
 
-    // 重新计算订单金额
-    let totals: (f64,) = sqlx::query_as(
-        "SELECT COALESCE(SUM(amount), 0) FROM sales_order_item WHERE order_id = ?"
-    )
-    .bind(id)
-    .fetch_one(pool())
-    .await
-    .unwrap_or((0.0,));
-
-    let new_total = totals.0;
     let discount_rate: f64 = sqlx::query_scalar(
         "SELECT COALESCE(discount_rate, 0) FROM sales_order WHERE id = ?"
     )
@@ -14175,21 +14180,13 @@ async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id):
     let discount_amount = new_total * (1.0 - discount_rate / 100.0);
     let new_final = discount_amount - amount_reduction;
 
-    let _ = sqlx::query(
-        "UPDATE sales_order SET total_amount = ?, final_amount = ? WHERE id = ?"
-    )
-    .bind(new_total)
-    .bind(new_final.max(0.0))
-    .bind(id)
-    .execute(pool())
-    .await;
-
-    let msg = if errors.is_empty() {
-        format!("更新成功，共更新 {} 项，合计金额 ¥{:.2}", items.len(), new_total)
-    } else {
-        format!("部分更新成功，共更新 {} 项，合计金额 ¥{:.2}；问题：{}", items.len(), new_total, errors.join("；"))
-    };
-    (StatusCode::OK, msg)
+    let resp = serde_json::json!({
+        "items": result_items,
+        "total_amount": new_total,
+        "final_amount": new_final.max(0.0),
+        "errors": errors,
+    });
+    (StatusCode::OK, serde_json::to_string(&resp).unwrap())
 }
 
 async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
