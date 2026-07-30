@@ -5257,6 +5257,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     }};
                     const nextInfo = JSON.parse(nextStatusMap[order.status] || '{{"text":"","status":""}}');
                     const nextBtn = nextInfo.text ? '<button onclick="event.stopPropagation(); updateOrderStatus(' + order.id + ', \'' + nextInfo.status + '\')" class="btn btn-primary btn-sm">' + nextInfo.text + '</button> ' : '';
+                    const reimburseBtn = order.is_reimburse ? '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-warning btn-sm">导出报销单</button> ' : '';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')"' + selected + '>' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
@@ -5269,7 +5270,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + statusBadge + '</td>' +
                         '<td>' +
                         nextBtn +
-                        '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-success btn-sm">导出验收单</button> ' +
+                        '<button onclick="event.stopPropagation(); exportRealExcel(' + order.id + ')" class="btn btn-success btn-sm">导出验收单</button> ' +
+                        reimburseBtn +
                         '<button onclick="event.stopPropagation(); generatePurchaseOrders(' + order.id + ')" class="btn btn-info btn-sm">生成采购订单</button> ' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
@@ -5372,6 +5374,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             
             function exportAcceptExcel(id) {{
                 window.location.href = '/api/sales_order/accept_excel/' + id;
+            }}
+
+            function exportRealExcel(id) {{
+                window.location.href = '/api/sales_order/real_excel/' + id;
             }}
             
             async function deleteOrder(id) {{
@@ -16828,7 +16834,8 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     let (sql, query_params) = if let Some(pid) = purchaser_id {
         (
             format!(
-                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name,
+                        (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
                  FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
                  WHERE so.purchaser_id = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)
                  ORDER BY {} LIMIT ? OFFSET ?",
@@ -16839,7 +16846,8 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     } else {
         (
             format!(
-                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name,
+                        (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
                  FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
                  WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
                  ORDER BY {} LIMIT ? OFFSET ?",
@@ -16871,6 +16879,7 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
             "status": row.get::<String, _>("status"),
             "remark": row.get::<Option<String>, _>("remark"),
             "purchaser_name": row.get::<String, _>("purchaser_name"),
+            "is_reimburse": row.get::<i64, _>("supplement_count") > 0,
         }))
         .collect();
     
@@ -19286,7 +19295,18 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
+// 导出报销单（报销口径）：合并分摊增项后的明细
 async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse {
+    build_accept_excel(id, true).await
+}
+
+// 导出验收单（真实口径）：真实账套明细，不合并分摊增项
+async fn api_sales_order_real_excel(Path(id): Path<i64>) -> impl IntoResponse {
+    build_accept_excel(id, false).await
+}
+
+// reimburse=true 报销口径（合并分摊增项）；false 真实口径（真实账套）
+async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
                 p.name as purchaser_name, p.address as purchaser_address
@@ -19325,19 +19345,24 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     .await
     .unwrap_or_default();
 
-    let supplement_rows = sqlx::query(
-        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
-                pc.name as category_name, pc2.name as parent_name
-         FROM order_supplement_item soi
-         LEFT JOIN product p ON soi.product_id = p.id
-         LEFT JOIN category pc ON p.category_id = pc.id
-         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
-         WHERE soi.target_order_id = ?"
-    )
-    .bind(id)
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+    // 真实口径不合并分摊增项，仅报销口径需要
+    let supplement_rows = if reimburse {
+        sqlx::query(
+            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+                    pc.name as category_name, pc2.name as parent_name
+             FROM order_supplement_item soi
+             LEFT JOIN product p ON soi.product_id = p.id
+             LEFT JOIN category pc ON p.category_id = pc.id
+             LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+             WHERE soi.target_order_id = ?"
+        )
+        .bind(id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     use std::collections::HashMap;
     let mut item_map: HashMap<i64, (i64, String, String, f64, f64, f64, String)> = HashMap::new();
@@ -19713,7 +19738,11 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
 
     match result {
         Ok(buf) => {
-            let filename = format!("验收单_{}.xlsx", order_no);
+            let filename = if reimburse {
+                format!("报销单_{}.xlsx", order_no)
+            } else {
+                format!("验收单_{}.xlsx", order_no)
+            };
             let content_disposition = format!("attachment; filename=\"{}\"", filename);
             (
                 StatusCode::OK,
@@ -21517,6 +21546,7 @@ fn build_router() -> Router {
         .route("/api/sales_order/import", post(api_sales_order_import))
         .route("/api/sales_order/accept/{id}", get(api_sales_order_accept))
         .route("/api/sales_order/accept_excel/{id}", get(api_sales_order_accept_excel))
+        .route("/api/sales_order/real_excel/{id}", get(api_sales_order_real_excel))
         .route("/api/supplement/create", post(api_supplement_create))
         .route("/api/supplement/list_by_target/{order_id}", get(api_supplement_list_by_target))
         .route("/api/supplement/adjusted_orders", get(api_adjusted_orders))
