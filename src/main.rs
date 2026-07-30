@@ -19654,7 +19654,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     let car_no = "湘A·NY360".to_string();
 
     let item_rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.category_id, pc.name as category_name, pc.parent_id, pc2.name as parent_name
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          LEFT JOIN category pc ON p.category_id = pc.id
@@ -19669,7 +19669,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     // 真实口径不合并分摊增项，仅报销口径需要
     let supplement_rows = if reimburse {
         sqlx::query(
-            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
                     pc.name as category_name, pc2.name as parent_name
              FROM order_supplement_item soi
              LEFT JOIN product p ON soi.product_id = p.id
@@ -19701,9 +19701,12 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             format!("{}({})", product_name, alias2)
         };
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
-        let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        if spec.is_empty() {
+            spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
+        }
         let original_remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
-        let remark = if spec.is_empty() { original_remark } else if original_remark.is_empty() { spec } else { format!("{}; {}", spec, original_remark) };
+        let remark = if spec.is_empty() { original_remark } else if original_remark.is_empty() { spec.clone() } else { format!("{}; {}", spec, original_remark) };
         let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
@@ -19756,13 +19759,16 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             let product_name = r.get::<String, _>("product_name");
             let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
             let unit = r.get::<String, _>("unit");
-            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            if spec.is_empty() {
+                spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
+            }
             let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
             let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
             let sort_key = get_category_sort_key(&category_name, &parent_name);
             let remark = if op_type == "replace_add" {
                 // 替换换入：按类别正常导出，不额外标记
-                spec
+                spec.clone()
             } else {
                 // 普通新增增项：保留标记
                 let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
