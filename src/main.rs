@@ -19669,7 +19669,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     // 真实口径不合并分摊增项，仅报销口径需要
     let supplement_rows = if reimburse {
         sqlx::query(
-            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
                     pc.name as category_name, pc2.name as parent_name
              FROM order_supplement_item soi
              LEFT JOIN product p ON soi.product_id = p.id
@@ -19758,7 +19758,12 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
             let product_name = r.get::<String, _>("product_name");
             let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
-            let unit = r.get::<String, _>("unit");
+            // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
+            // 优先取分摊增项的单位，为空时回退到商品表的基础单位
+            let unit = {
+                let u = r.get::<String, _>("unit");
+                if u.is_empty() { r.get::<Option<String>, _>("product_unit").unwrap_or_default() } else { u }
+            };
             let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
             if spec.is_empty() {
                 spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
@@ -19774,6 +19779,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
                 let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
                 if spec.is_empty() { format!("[增项] {}", source_remark) } else { format!("{}; [增项] {}", spec, source_remark) }
             };
+            // 规格列（C列）填单位（打印模板的"规格"列实际是单位列）
             item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
         }
     }
