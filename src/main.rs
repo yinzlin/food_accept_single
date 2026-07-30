@@ -123,7 +123,7 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/warehouse" | "/api/warehouse/create" | "/api/warehouse/update" | "/api/warehouse/delete" => Some("admin"),
         "/inventory" => Some("admin"),
         "/purchase" | "/api/purchase_order/create" | "/api/purchase_order/update" | "/api/purchase_order/delete" => Some("supplier"),
-        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
+        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/update_prices" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
         "/query/purchase_order" | "/query/purchase_document" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
         "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
         "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" | "/query/stock_summary_reimburse" => Some("admin"),
@@ -4648,6 +4648,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 <div class="mt-3 d-flex align-items-center flex-wrap" style="gap:8px;">
                     <button onclick="saveOrder()" class="btn btn-success" id="saveBtn">保存销售订单</button>
                     <button onclick="resetForm()" class="btn btn-secondary">新建订单</button>
+                    <button onclick="updatePrices()" class="btn btn-warning" id="updatePricesBtn" style="display:none">一键更新售价</button>
 
                     <input type="file" id="customerOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('customer')">
                     <button type="button" class="btn btn-outline-primary" onclick="document.getElementById('customerOrderImageInput').click()">📷 上传客户订单</button>
@@ -5402,6 +5403,27 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
                 renderItems();
                 loadOrders();
+                document.getElementById('updatePricesBtn').style.display = 'inline-block';
+            }}
+
+            async function updatePrices() {{
+                if (!currentOrderId) {{ alert('请先选择要编辑的订单'); return; }}
+                if (!confirm('确定要一键更新当前订单所有明细的售价为商品最新基础售价？\\n此操作将同步修改订单金额。')) return;
+                const btn = document.getElementById('updatePricesBtn');
+                btn.disabled = true;
+                btn.textContent = '更新中...';
+                try {{
+                    const res = await fetch('/api/sales_order/update_prices/' + currentOrderId, {{ method: 'POST' }});
+                    const msg = await res.text();
+                    alert(msg);
+                    // 重新加载订单数据
+                    await loadOrderDetail(currentOrderId);
+                }} catch (e) {{
+                    alert('更新失败：' + e.message);
+                }} finally {{
+                    btn.disabled = false;
+                    btn.textContent = '一键更新售价';
+                }}
             }}
 
             function printAccept(id) {{
@@ -14069,6 +14091,107 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     }
 }
 
+// 一键更新订单中所有明细的售价为商品最新 base_price
+async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/update_prices").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+
+    let items = sqlx::query(
+        "SELECT id, product_id, quantity, base_quantity FROM sales_order_item WHERE order_id = ?"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    if items.is_empty() {
+        return (StatusCode::NOT_FOUND, "订单不存在或无明细".to_string());
+    }
+
+    let mut errors = Vec::new();
+    for item in &items {
+        let item_id: i64 = item.get("id");
+        let product_id: i64 = item.get("product_id");
+        let quantity: f64 = item.get("quantity");
+
+        // 获取商品最新 base_price
+        let price_row: Option<(f64,)> = sqlx::query_as(
+            "SELECT COALESCE(base_price, 0) FROM product WHERE id = ?"
+        )
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+        match price_row {
+            Some((new_price,)) if new_price > 0.0 => {
+                let new_amount = new_price * quantity;
+                let _ = sqlx::query(
+                    "UPDATE sales_order_item SET unit_price = ?, amount = ? WHERE id = ?"
+                )
+                .bind(new_price)
+                .bind(new_amount)
+                .bind(item_id)
+                .execute(pool())
+                .await;
+            }
+            Some((_,)) => {
+                errors.push(format!("商品ID {} 售价为0，跳过", product_id));
+            }
+            None => {
+                errors.push(format!("商品ID {} 未找到", product_id));
+            }
+        }
+    }
+
+    // 重新计算订单金额
+    let totals: (f64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(amount), 0) FROM sales_order_item WHERE order_id = ?"
+    )
+    .bind(id)
+    .fetch_one(pool())
+    .await
+    .unwrap_or((0.0,));
+
+    let new_total = totals.0;
+    let discount_rate: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(discount_rate, 0) FROM sales_order WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+
+    let amount_reduction: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(amount_reduction, 0) FROM sales_order WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+
+    let discount_amount = new_total * (1.0 - discount_rate / 100.0);
+    let new_final = discount_amount - amount_reduction;
+
+    let _ = sqlx::query(
+        "UPDATE sales_order SET total_amount = ?, final_amount = ? WHERE id = ?"
+    )
+    .bind(new_total)
+    .bind(new_final.max(0.0))
+    .bind(id)
+    .execute(pool())
+    .await;
+
+    let msg = if errors.is_empty() {
+        format!("更新成功，共更新 {} 项，合计金额 ¥{:.2}", items.len(), new_total)
+    } else {
+        format!("部分更新成功，共更新 {} 项，合计金额 ¥{:.2}；问题：{}", items.len(), new_total, errors.join("；"))
+    };
+    (StatusCode::OK, msg)
+}
+
 async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
     match check_api_permission(&headers, "/api/sales_order/delete").await {
         Err(e) => return e,
@@ -21883,6 +22006,7 @@ fn build_router() -> Router {
         .route("/api/sales_order/by_purchaser/{purchaser_id}", get(api_sales_order_by_purchaser))
         .route("/api/sales_order/detail/{id}", get(api_sales_order_detail))
         .route("/api/sales_order/update", post(api_sales_order_update))
+        .route("/api/sales_order/update_prices/{id}", post(api_sales_order_update_prices))
         .route("/api/sales_order/upload_image", post(api_sales_order_upload_image))
         .route("/api/sales_order/delete_image", post(api_sales_order_delete_image))
         .route("/api/sales_order/delete/{id}", delete(api_sales_order_delete))
