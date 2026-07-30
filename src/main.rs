@@ -12,6 +12,42 @@ use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use chrono::Local;
 use axum::extract::Multipart;
 use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, XlsxError};
+
+// ===== 导出通用辅助 =====
+fn xlsx_header_format(color: u32) -> rust_xlsxwriter::Format {
+    rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(color))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin)
+}
+
+fn xlsx_response(buf: Vec<u8>, filename: &str) -> axum::response::Response {
+    let content_disposition = format!("attachment; filename*=UTF-8''{}", urlencode_filename(filename));
+    (
+        axum::http::StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, content_disposition),
+        ],
+        buf,
+    ).into_response()
+}
+
+fn urlencode_filename(name: &str) -> String {
+    let mut out = String::new();
+    for b in name.as_bytes() {
+        let c = *b;
+        if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_' {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{:02X}", c));
+        }
+    }
+    out
+}
+
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Row};
@@ -6194,6 +6230,7 @@ async fn page_query_purchase_price() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchPurchasePrice()" class="btn btn-primary">查询</button>
+            <a href="/api/query/purchase_price/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -6515,6 +6552,7 @@ async fn page_query_sales_summary(headers: axum::http::HeaderMap) -> Html<String
                 </div>
             </div>
             <button onclick="searchSalesSummary()" class="btn btn-primary">查询</button>
+            <a href="/api/query/sales_summary/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <h4>按采购单位汇总</h4>
@@ -6666,6 +6704,7 @@ async fn page_query_reimburse_summary(headers: axum::http::HeaderMap) -> Html<St
                 </div>
             </div>
             <button onclick="searchReimburse()" class="btn btn-primary">查询</button>
+            <a href="/api/query/reimburse_summary/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <h4>按采购单位汇总（报销口径）</h4>
@@ -7693,6 +7732,7 @@ async fn page_query_stock_warning() -> Html<String> {
         <div class="card p-4">
             <h3>库存上下限预警</h3>
             <button onclick="searchStockWarning()" class="btn btn-primary">查询</button>
+            <a href="/api/query/stock_warning/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4 border-danger">
             <h4>低于最低库存（缺货）</h4>
@@ -7791,6 +7831,7 @@ async fn page_query_income_expense() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchIncomeExpense()" class="btn btn-primary">查询</button>
+            <a href="/api/query/income_expense/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="row mt-4">
             <div class="col-md-6">
@@ -7849,6 +7890,7 @@ async fn page_query_profit_detail() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchProfitDetail()" class="btn btn-primary">查询</button>
+            <a href="/api/query/profit_detail/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -7924,6 +7966,7 @@ async fn page_query_document_summary() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchDocumentSummary()" class="btn btn-primary">查询</button>
+            <a href="/api/query/document_summary/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -16735,6 +16778,284 @@ async fn api_query_profit_detail(axum::extract::Query(params): axum::extract::Qu
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
+// ===== 导出函数 =====
+
+async fn api_query_purchase_price_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or(""); let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
+    let mut base_sql = String::from(" FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new();
+    if !product_name.is_empty() { base_sql.push_str(" AND poi.product_name LIKE ?"); binds.push(format!("%{}%", product_name)); }
+    if !supplier_id.is_empty() { base_sql.push_str(" AND po.supplier_id = ?"); binds.push(supplier_id.to_string()); }
+    let data_sql = format!("SELECT poi.product_name, poi.spec, poi.unit, poi.unit_price, poi.quantity, po.order_date, s.name as supplier_name {} ORDER BY po.order_date DESC", base_sql);
+    let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str())); for b in &binds { query = query.bind(b); }
+    let rows = query.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("采购价格").unwrap();
+    let hf = xlsx_header_format(0x4472C4);
+    for (col, h) in ["商品名称", "规格", "供应商", "采购单价", "采购日期", "采购数量"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws.set_column_width(0, 20).unwrap(); ws.set_column_width(1, 14).unwrap(); ws.set_column_width(2, 16).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap(); ws.set_column_width(5, 14).unwrap();
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("supplier_name")).unwrap(); ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购价格查询.xlsx")
+}
+
+async fn api_query_purchase_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut supplier_sql = String::from("SELECT s.name, SUM(poi.quantity) as quantity, SUM(poi.amount) as amount FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id WHERE 1=1");
+    let mut product_sql = String::from("SELECT poi.product_name, poi.spec, SUM(poi.quantity) as quantity, SUM(poi.amount) as amount FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { supplier_sql.push_str(" AND po.order_date >= ?"); product_sql.push_str(" AND po.order_date >= ?"); binds.push(start_date.to_string()); }
+    let mut binds2 = binds.clone(); if !end_date.is_empty() { supplier_sql.push_str(" AND po.order_date <= ?"); product_sql.push_str(" AND po.order_date <= ?"); binds.push(end_date.to_string()); binds2.push(end_date.to_string()); }
+    supplier_sql.push_str(" GROUP BY s.id ORDER BY amount DESC"); product_sql.push_str(" GROUP BY poi.product_name, poi.spec ORDER BY amount DESC");
+    let mut q1 = sqlx::query(AssertSqlSafe(supplier_sql.as_str())); for b in &binds { q1 = q1.bind(b); } let supplier_rows = q1.fetch_all(pool()).await.unwrap_or_default();
+    let mut q2 = sqlx::query(AssertSqlSafe(product_sql.as_str())); for b in &binds2 { q2 = q2.bind(b); } let product_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let hf = xlsx_header_format(0x4472C4);
+    let ws1 = workbook.add_worksheet(); ws1.set_name("按供应商汇总").unwrap();
+    for (col, h) in ["供应商", "采购数量", "采购金额", "平均成本"].iter().enumerate() { ws1.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws1.set_column_width(0, 18).unwrap(); ws1.set_column_width(1, 14).unwrap(); ws1.set_column_width(2, 14).unwrap(); ws1.set_column_width(3, 14).unwrap();
+    for (i, row) in supplier_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let amt: f64 = row.get("amount"); ws1.write(r, 0, row.get::<String, _>("name")).unwrap(); ws1.write(r, 1, qty).unwrap(); ws1.write(r, 2, amt).unwrap(); ws1.write(r, 3, if qty > 0.0 { amt / qty } else { 0.0 }).unwrap(); }
+    let ws2 = workbook.add_worksheet(); ws2.set_name("按商品汇总").unwrap();
+    for (col, h) in ["商品名称", "规格", "采购数量", "采购金额", "平均单价"].iter().enumerate() { ws2.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws2.set_column_width(0, 20).unwrap(); ws2.set_column_width(1, 14).unwrap(); ws2.set_column_width(2, 14).unwrap(); ws2.set_column_width(3, 14).unwrap(); ws2.set_column_width(4, 14).unwrap();
+    for (i, row) in product_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let amt: f64 = row.get("amount"); ws2.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws2.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws2.write(r, 2, qty).unwrap(); ws2.write(r, 3, amt).unwrap(); ws2.write(r, 4, if qty > 0.0 { amt / qty } else { 0.0 }).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购汇总统计.xlsx")
+}
+
+async fn api_query_sales_price_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or(""); let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
+    let mut base_sql = String::from(" FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new();
+    if !product_name.is_empty() { base_sql.push_str(" AND soi.product_name LIKE ?"); binds.push(format!("%{}%", product_name)); }
+    if !purchaser_id.is_empty() { base_sql.push_str(" AND so.purchaser_id = ?"); binds.push(purchaser_id.to_string()); }
+    let data_sql = format!("SELECT soi.product_name, soi.spec, soi.unit, soi.unit_price, soi.quantity, so.order_date, p.name as purchaser_name {} ORDER BY so.order_date DESC", base_sql);
+    let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str())); for b in &binds { query = query.bind(b); } let rows = query.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("销售价格").unwrap(); let hf = xlsx_header_format(0x70AD47);
+    for (col, h) in ["商品名称", "规格", "采购单位", "销售单价", "销售日期", "销售数量"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws.set_column_width(0, 20).unwrap(); ws.set_column_width(1, 14).unwrap(); ws.set_column_width(2, 16).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap(); ws.set_column_width(5, 14).unwrap();
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("purchaser_name")).unwrap(); ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "销售价格查询.xlsx")
+}
+
+async fn api_query_sales_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut purchaser_sql = String::from("SELECT p.name, SUM(soi.quantity) as quantity, SUM(soi.amount) as sales_amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1");
+    let mut product_sql = String::from("SELECT soi.product_name, soi.spec, SUM(soi.quantity) as quantity, SUM(soi.amount) as sales_amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { purchaser_sql.push_str(" AND so.order_date >= ?"); product_sql.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); }
+    let mut binds2 = binds.clone(); if !end_date.is_empty() { purchaser_sql.push_str(" AND so.order_date <= ?"); product_sql.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); binds2.push(end_date.to_string()); }
+    purchaser_sql.push_str(" GROUP BY p.id ORDER BY sales_amount DESC"); product_sql.push_str(" GROUP BY soi.product_name, soi.spec ORDER BY sales_amount DESC");
+    let mut q1 = sqlx::query(AssertSqlSafe(purchaser_sql.as_str())); for b in &binds { q1 = q1.bind(b); } let purchaser_rows = q1.fetch_all(pool()).await.unwrap_or_default();
+    let mut q2 = sqlx::query(AssertSqlSafe(product_sql.as_str())); for b in &binds2 { q2 = q2.bind(b); } let product_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let hf = xlsx_header_format(0x70AD47);
+    let ws1 = workbook.add_worksheet(); ws1.set_name("按采购单位汇总").unwrap();
+    for (col, h) in ["采购单位", "销售数量", "销售金额", "成本", "毛利", "毛利率"].iter().enumerate() { ws1.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws1.set_column_width(0, 18).unwrap(); ws1.set_column_width(1, 14).unwrap(); ws1.set_column_width(2, 14).unwrap(); ws1.set_column_width(3, 14).unwrap(); ws1.set_column_width(4, 14).unwrap(); ws1.set_column_width(5, 14).unwrap();
+    for (i, row) in purchaser_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let sales: f64 = row.get("sales_amount"); let cost = 0.0; let profit = sales - cost; let margin = if sales > 0.0 { profit / sales * 100.0 } else { 0.0 }; ws1.write(r, 0, row.get::<String, _>("name")).unwrap(); ws1.write(r, 1, qty).unwrap(); ws1.write(r, 2, sales).unwrap(); ws1.write(r, 3, cost).unwrap(); ws1.write(r, 4, profit).unwrap(); ws1.write(r, 5, margin).unwrap(); }
+    let ws2 = workbook.add_worksheet(); ws2.set_name("按商品汇总").unwrap();
+    for (col, h) in ["商品名称", "规格", "销售数量", "销售金额", "成本", "毛利"].iter().enumerate() { ws2.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws2.set_column_width(0, 20).unwrap(); ws2.set_column_width(1, 14).unwrap(); ws2.set_column_width(2, 14).unwrap(); ws2.set_column_width(3, 14).unwrap(); ws2.set_column_width(4, 14).unwrap(); ws2.set_column_width(5, 14).unwrap();
+    for (i, row) in product_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let sales: f64 = row.get("sales_amount"); let cost = 0.0; let profit = sales - cost; ws2.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws2.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws2.write(r, 2, qty).unwrap(); ws2.write(r, 3, sales).unwrap(); ws2.write(r, 4, cost).unwrap(); ws2.write(r, 5, profit).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "销售汇总报表.xlsx")
+}
+
+async fn api_query_product_rank_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut top_sql = String::from("SELECT soi.product_name, soi.spec, SUM(soi.quantity) as quantity, SUM(soi.amount) as amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { top_sql.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); } if !end_date.is_empty() { top_sql.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); }
+    top_sql.push_str(" GROUP BY soi.product_name, soi.spec ORDER BY quantity DESC LIMIT 10");
+    let mut query = sqlx::query(AssertSqlSafe(top_sql.as_str())); for b in &binds { query = query.bind(b); } let rows = query.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("畅销商品TOP10").unwrap(); let hf = xlsx_header_format(0x70AD47);
+    for (col, h) in ["排名", "商品名称", "规格", "销售数量", "销售金额"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws.set_column_width(0, 8).unwrap(); ws.set_column_width(1, 20).unwrap(); ws.set_column_width(2, 14).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap();
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, (i + 1) as i64).unwrap(); ws.write(r, 1, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 2, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 3, row.get::<f64, _>("quantity")).unwrap(); ws.write(r, 4, row.get::<f64, _>("amount")).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "畅销商品排名.xlsx")
+}
+
+async fn api_query_reimburse_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let source_ids: Vec<i64> = sqlx::query_scalar::<_, i64>("SELECT DISTINCT source_order_id FROM consumable_allocation").fetch_all(pool()).await.unwrap_or_default();
+    let source_set: std::collections::HashSet<i64> = source_ids.into_iter().collect();
+    let mut date_cond = String::from(""); let mut binds: Vec<String> = Vec::new();
+    if !start_date.is_empty() { date_cond.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); } if !end_date.is_empty() { date_cond.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); }
+    let real_sql = format!("SELECT so.purchaser_id, p.name, SUM(soi.amount) as amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1 {} GROUP BY so.purchaser_id", date_cond);
+    let mut q = sqlx::query(AssertSqlSafe(real_sql.as_str())); for b in &binds { q = q.bind(b); } let real_rows = q.fetch_all(pool()).await.unwrap_or_default();
+    use std::collections::HashMap; let mut pmap: HashMap<i64, (String, f64, f64)> = HashMap::new();
+    for r in &real_rows { let pid = r.get::<i64,_>("purchaser_id"); let name = r.get::<String,_>("name"); let a = r.get::<f64,_>("amount"); pmap.entry(pid).or_insert((name,0.0,0.0)).1 += a; }
+    let supp_sql = format!("SELECT so.purchaser_id, p.name, SUM(osi.amount) as supp_amount FROM order_supplement_item osi JOIN sales_order so ON osi.target_order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1 {} GROUP BY so.purchaser_id", date_cond);
+    let mut q2 = sqlx::query(AssertSqlSafe(supp_sql.as_str())); for b in &binds { q2 = q2.bind(b); }
+    for r in q2.fetch_all(pool()).await.unwrap_or_default() { let pid = r.get::<i64,_>("purchaser_id"); let name = r.get::<String,_>("name"); let sa = r.get::<f64,_>("supp_amount"); pmap.entry(pid).or_insert((name,0.0,0.0)).2 += sa; }
+    if !source_set.is_empty() {
+        let src_sql = format!("SELECT so.purchaser_id, p.name, so.id as oid, SUM(soi.amount) as amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1 {} GROUP BY so.id", date_cond);
+        let mut q3 = sqlx::query(AssertSqlSafe(src_sql.as_str())); for b in &binds { q3 = q3.bind(b); }
+        for r in q3.fetch_all(pool()).await.unwrap_or_default() { let oid = r.get::<i64,_>("oid"); if !source_set.contains(&oid) { continue; } let pid = r.get::<i64,_>("purchaser_id"); let name = r.get::<String,_>("name"); let a = r.get::<f64,_>("amount"); pmap.entry(pid).or_insert((name,0.0,0.0)).2 -= a; }
+    }
+    let mut by_purchaser: Vec<serde_json::Value> = pmap.values().map(|(n,r,s)| serde_json::json!({"name":n,"real_amount":r,"supplement_amount":s,"reimburse_amount":r+s})).collect();
+    by_purchaser.sort_by(|a,b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+    let mut prod_map: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    let pr = format!("SELECT soi.product_name, COALESCE(soi.spec,'') as spec, soi.order_id, soi.quantity, soi.amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id WHERE 1=1 {}", date_cond);
+    let mut q4 = sqlx::query(AssertSqlSafe(pr.as_str())); for b in &binds { q4 = q4.bind(b); }
+    for r in q4.fetch_all(pool()).await.unwrap_or_default() { let oid = r.get::<i64,_>("order_id"); if source_set.contains(&oid) { continue; } let nm = r.get::<String,_>("product_name"); let sp = r.get::<String,_>("spec"); let qty = r.get::<f64,_>("quantity"); let amt = r.get::<f64,_>("amount"); let e = prod_map.entry((nm,sp)).or_insert((0.0,0.0)); e.0 += qty; e.1 += amt; }
+    let ps = format!("SELECT osi.product_name, COALESCE(osi.spec,'') as spec, osi.quantity, osi.amount FROM order_supplement_item osi JOIN sales_order so ON osi.target_order_id = so.id WHERE 1=1 {}", date_cond);
+    let mut q5 = sqlx::query(AssertSqlSafe(ps.as_str())); for b in &binds { q5 = q5.bind(b); }
+    for r in q5.fetch_all(pool()).await.unwrap_or_default() { let nm = r.get::<String,_>("product_name"); let sp = r.get::<String,_>("spec"); let qty = r.get::<f64,_>("quantity"); let amt = r.get::<f64,_>("amount"); let e = prod_map.entry((nm,sp)).or_insert((0.0,0.0)); e.0 += qty; e.1 += amt; }
+    let mut by_product: Vec<serde_json::Value> = prod_map.iter().map(|((n,s),(q,a))| serde_json::json!({"product_name":n,"spec":s,"quantity":q,"reimburse_amount":a})).collect();
+    by_product.sort_by(|a,b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+    let mut workbook = Workbook::new(); let hf = xlsx_header_format(0x70AD47);
+    let ws1 = workbook.add_worksheet(); ws1.set_name("按采购单位汇总").unwrap();
+    for (c,h) in ["采购单位","真实金额","分摊增项净额","报销金额"].iter().enumerate() { ws1.write_with_format(0,c as u16,*h,&hf).unwrap(); }
+    ws1.set_column_width(0,18).unwrap(); ws1.set_column_width(1,14).unwrap(); ws1.set_column_width(2,16).unwrap(); ws1.set_column_width(3,14).unwrap();
+    for (i,item) in by_purchaser.iter().enumerate() { let r=(i+1)as u32; ws1.write(r,0,item.get("name").and_then(|v|v.as_str()).unwrap_or("")).unwrap(); ws1.write(r,1,item.get("real_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); ws1.write(r,2,item.get("supplement_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); ws1.write(r,3,item.get("reimburse_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); }
+    let ws2 = workbook.add_worksheet(); ws2.set_name("按商品汇总").unwrap();
+    for (c,h) in ["商品名称","规格","数量","报销金额"].iter().enumerate() { ws2.write_with_format(0,c as u16,*h,&hf).unwrap(); }
+    ws2.set_column_width(0,20).unwrap(); ws2.set_column_width(1,14).unwrap(); ws2.set_column_width(2,14).unwrap(); ws2.set_column_width(3,14).unwrap();
+    for (i,item) in by_product.iter().enumerate() { let r=(i+1)as u32; ws2.write(r,0,item.get("product_name").and_then(|v|v.as_str()).unwrap_or("")).unwrap(); ws2.write(r,1,item.get("spec").and_then(|v|v.as_str()).unwrap_or_default()).unwrap(); ws2.write(r,2,item.get("quantity").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); ws2.write(r,3,item.get("reimburse_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "报销口径汇总.xlsx")
+}
+
+async fn api_query_allocation_source_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut sql = String::from("SELECT ca.source_order_id, ca.total_amount, ca.allocated_amount, ca.remaining_balance, ca.status, so.order_no, so.order_date FROM consumable_allocation ca JOIN sales_order so ON ca.source_order_id = so.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { sql.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); } if !end_date.is_empty() { sql.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); }
+    sql.push_str(" ORDER BY so.order_date DESC"); let mut q = sqlx::query(AssertSqlSafe(sql.as_str())); for b in &binds { q = q.bind(b); } let rows = q.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("分摊来源").unwrap(); let hf = xlsx_header_format(0x70AD47);
+    for (c,h) in ["来源订单","日期","来源金额","已分摊","剩余","状态","分摊去向"].iter().enumerate() { ws.write_with_format(0,c as u16,*h,&hf).unwrap(); }
+    ws.set_column_width(0,18).unwrap(); ws.set_column_width(1,14).unwrap(); ws.set_column_width(2,14).unwrap(); ws.set_column_width(3,14).unwrap(); ws.set_column_width(4,14).unwrap(); ws.set_column_width(5,10).unwrap(); ws.set_column_width(6,30).unwrap();
+    let sm = ["未分摊","分摊中","已完成","已终止"];
+    for (i,row) in rows.iter().enumerate() { let r=(i+1)as u32; let src_id=row.get::<i64,_>("source_order_id"); let st:i64=row.get("status");
+        let tgts=sqlx::query("SELECT so.order_no, SUM(osi.amount) as amount FROM order_supplement_item osi JOIN sales_order so ON osi.target_order_id=so.id WHERE osi.source_order_id=? GROUP BY osi.target_order_id HAVING SUM(osi.amount)<>0 ORDER BY amount DESC").bind(src_id).fetch_all(pool()).await.unwrap_or_default();
+        let tstr:String=tgts.iter().map(|t| format!("{}(¥{:.2})",t.get::<String,_>("order_no"),t.get::<f64,_>("amount"))).collect::<Vec<_>>().join("、");
+        let ss=if(st as usize)<sm.len(){sm[st as usize]}else{"未知"}; ws.write(r,0,row.get::<String,_>("order_no")).unwrap(); ws.write(r,1,row.get::<String,_>("order_date")).unwrap(); ws.write(r,2,row.get::<f64,_>("total_amount")).unwrap(); ws.write(r,3,row.get::<f64,_>("allocated_amount")).unwrap(); ws.write(r,4,row.get::<f64,_>("remaining_balance")).unwrap(); ws.write(r,5,ss).unwrap(); ws.write(r,6,&tstr).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "分摊来源统计.xlsx")
+}
+
+async fn api_query_overview_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let month = params.get("month").map(|s| s.as_str()).unwrap_or("");
+    let purchase_total: f64 = sqlx::query_scalar("SELECT COALESCE(SUM(po.total_amount),0) FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=?").bind(month).fetch_one(pool()).await.unwrap_or(0.0);
+    let sales_total: f64 = sqlx::query_scalar("SELECT COALESCE(SUM(so.total_amount),0) FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=?").bind(month).fetch_one(pool()).await.unwrap_or(0.0);
+    let stock_total: f64 = sqlx::query_scalar("SELECT COALESCE(SUM(i.quantity*pr.selling_price),0) FROM inventory i JOIN product pr ON i.product_id=pr.id").fetch_one(pool()).await.unwrap_or(0.0);
+    let profit_total = sales_total - purchase_total;
+    let pur_rows = sqlx::query("SELECT s.name,COALESCE(SUM(poi.amount),0) as amount,COALESCE(SUM(poi.quantity),0) as quantity FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN supplier s ON po.supplier_id=s.id WHERE strftime('%Y-%m',po.order_date)=? GROUP BY s.id,s.name ORDER BY amount DESC").bind(month).fetch_all(pool()).await.unwrap_or_default();
+    let sal_rows = sqlx::query("SELECT p.name,COALESCE(SUM(soi.amount),0) as amount,COALESCE(SUM(soi.quantity),0) as quantity FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN purchaser p ON so.purchaser_id=p.id WHERE strftime('%Y-%m',so.order_date)=? GROUP BY p.id,p.name ORDER BY amount DESC").bind(month).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new(); let hf=xlsx_header_format(0x2E75B6);
+    let ws1=workbook.add_worksheet(); ws1.set_name("汇总").unwrap();
+    for (c,h) in ["指标","金额"].iter().enumerate(){ws1.write_with_format(0,c as u16,*h,&hf).unwrap();} ws1.set_column_width(0,16).unwrap(); ws1.set_column_width(1,16).unwrap();
+    ws1.write(1,0,"总进货").unwrap(); ws1.write(1,1,purchase_total).unwrap(); ws1.write(2,0,"总销售").unwrap(); ws1.write(2,1,sales_total).unwrap(); ws1.write(3,0,"库存").unwrap(); ws1.write(3,1,stock_total).unwrap(); ws1.write(4,0,"毛利").unwrap(); ws1.write(4,1,profit_total).unwrap();
+    let ws2=workbook.add_worksheet(); ws2.set_name("采购汇总").unwrap();
+    for (c,h) in ["供应商","采购金额","数量"].iter().enumerate(){ws2.write_with_format(0,c as u16,*h,&hf).unwrap();} ws2.set_column_width(0,18).unwrap(); ws2.set_column_width(1,14).unwrap(); ws2.set_column_width(2,14).unwrap();
+    for (i,row) in pur_rows.iter().enumerate(){let r=(i+1)as u32;ws2.write(r,0,row.get::<String,_>("name")).unwrap();ws2.write(r,1,row.get::<f64,_>("amount")).unwrap();ws2.write(r,2,row.get::<f64,_>("quantity")).unwrap();}
+    let ws3=workbook.add_worksheet(); ws3.set_name("销售汇总").unwrap();
+    for (c,h) in ["采购单位","销售金额","数量"].iter().enumerate(){ws3.write_with_format(0,c as u16,*h,&hf).unwrap();} ws3.set_column_width(0,18).unwrap(); ws3.set_column_width(1,14).unwrap(); ws3.set_column_width(2,14).unwrap();
+    for (i,row) in sal_rows.iter().enumerate(){let r=(i+1)as u32;ws3.write(r,0,row.get::<String,_>("name")).unwrap();ws3.write(r,1,row.get::<f64,_>("amount")).unwrap();ws3.write(r,2,row.get::<f64,_>("quantity")).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "进销存汇总报表.xlsx")
+}
+
+async fn api_query_stock_balance_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let category_id=params.get("category_id").map(|s|s.as_str()).unwrap_or("");
+    let sql=if category_id.is_empty(){"SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? ORDER BY p.name".to_string()}
+    else{format!("SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? AND p.category_id={} ORDER BY p.name",category_id)};
+    let pattern=format!("%{}%",product_name);
+    let rows=if category_id.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(pool()).await.unwrap_or_default()}else{let cid:i64=category_id.parse().unwrap_or(0);sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).bind(cid).fetch_all(pool()).await.unwrap_or_default()};
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存余额").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["商品名称","规格","单位","库存数量","库存金额","最低库存","最高库存"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,14).unwrap();ws.set_column_width(6,14).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("product_name")).unwrap();ws.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,3,row.try_get::<f64,_>("quantity").unwrap_or(0.0)).unwrap();ws.write(r,4,row.try_get::<f64,_>("amount").unwrap_or(0.0)).unwrap();ws.write(r,5,row.try_get::<f64,_>("min_stock").unwrap_or(0.0)).unwrap();ws.write(r,6,row.try_get::<f64,_>("max_stock").unwrap_or(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "库存余额查询.xlsx")
+}
+
+async fn api_query_stock_flow_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");let product_id=params.get("product_id").and_then(|s|s.parse::<i64>().ok());
+    let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");let mut swc=String::from("WHERE 1=1");
+    if let Some(pid)=product_id{wc.push_str(&format!(" AND p.id={}",pid));swc.push_str(&format!(" AND p.id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");swc.push_str(" AND p.name LIKE ?");}
+    if!start_date.is_empty(){wc.push_str(&format!(" AND po.order_date>='{}'",start_date));swc.push_str(&format!(" AND so.order_date>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND po.order_date<='{}'",end_date));swc.push_str(&format!(" AND so.order_date<='{}'",end_date));}
+    let sql=format!("SELECT po.order_date as create_time,'采购入库' as type,p.name as product_name,p.spec,poi.quantity as in_quantity,0 as out_quantity,poi.remark FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product p ON poi.product_id=p.id {} UNION ALL SELECT so.order_date as create_time,'销售出库' as type,p.name as product_name,p.spec,0 as in_quantity,soi.quantity as out_quantity,soi.remark FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product p ON soi.product_id=p.id {} ORDER BY create_time",wc,swc);
+    let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).bind(&pattern).fetch_all(pool()).await.unwrap_or_default()};
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["日期","类型","商品名称","规格","入库数量","出库数量","备注"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,14).unwrap();ws.set_column_width(6,20).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("create_time")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,4,row.try_get::<f64,_>("in_quantity").unwrap_or(0.0)).unwrap();ws.write(r,5,row.try_get::<f64,_>("out_quantity").unwrap_or(0.0)).unwrap();ws.write(r,6,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "库存流水查询.xlsx")
+}
+
+async fn api_query_stock_warning_export() -> impl IntoResponse {
+    let low_rows=sqlx::query("SELECT p.name as product_name,p.spec,p.unit,i.quantity as current_stock,i.min_stock FROM inventory i JOIN product p ON i.product_id=p.id WHERE i.quantity<i.min_stock ORDER BY (i.min_stock-i.quantity) DESC").fetch_all(pool()).await.unwrap_or_default();
+    let high_rows=sqlx::query("SELECT p.name as product_name,p.spec,p.unit,i.quantity as current_stock,i.max_stock FROM inventory i JOIN product p ON i.product_id=p.id WHERE i.quantity>i.max_stock ORDER BY (i.quantity-i.max_stock) DESC").fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let hf=xlsx_header_format(0x2E75B6);
+    let ws1=workbook.add_worksheet();ws1.set_name("低于最低库存").unwrap();
+    for(c,h)in["商品名称","规格","单位","当前库存","最低库存","缺货数量"].iter().enumerate(){ws1.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws1.set_column_width(0,20).unwrap();ws1.set_column_width(1,14).unwrap();ws1.set_column_width(2,10).unwrap();ws1.set_column_width(3,14).unwrap();ws1.set_column_width(4,14).unwrap();ws1.set_column_width(5,14).unwrap();
+    for(i,row)in low_rows.iter().enumerate(){let r=(i+1)as u32;let cur=row.try_get::<f64,_>("current_stock").unwrap_or(0.0);let min=row.try_get::<f64,_>("min_stock").unwrap_or(0.0);ws1.write(r,0,row.get::<String,_>("product_name")).unwrap();ws1.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws1.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws1.write(r,3,cur).unwrap();ws1.write(r,4,min).unwrap();ws1.write(r,5,(min-cur).max(0.0)).unwrap();}
+    let ws2=workbook.add_worksheet();ws2.set_name("高于最高库存").unwrap();
+    for(c,h)in["商品名称","规格","单位","当前库存","最高库存","积压数量"].iter().enumerate(){ws2.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws2.set_column_width(0,20).unwrap();ws2.set_column_width(1,14).unwrap();ws2.set_column_width(2,10).unwrap();ws2.set_column_width(3,14).unwrap();ws2.set_column_width(4,14).unwrap();ws2.set_column_width(5,14).unwrap();
+    for(i,row)in high_rows.iter().enumerate(){let r=(i+1)as u32;let cur=row.try_get::<f64,_>("current_stock").unwrap_or(0.0);let max=row.try_get::<f64,_>("max_stock").unwrap_or(0.0);ws2.write(r,0,row.get::<String,_>("product_name")).unwrap();ws2.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws2.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws2.write(r,3,cur).unwrap();ws2.write(r,4,max).unwrap();ws2.write(r,5,(cur-max).max(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "库存预警.xlsx")
+}
+
+async fn api_query_slow_stock_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let days:i64=params.get("days").and_then(|s|s.parse().ok()).unwrap_or(30);
+    let rows=sqlx::query("SELECT p.id,p.name as product_name,p.spec,p.unit,i.quantity as current_stock,i.quantity*p.base_price as amount,COALESCE(soi.last_sale_date,'无') as last_sale_date FROM inventory i JOIN product p ON i.product_id=p.id LEFT JOIN (SELECT soi.product_id,MAX(so.order_date) as last_sale_date FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id GROUP BY soi.product_id) soi ON i.product_id=soi.product_id WHERE soi.last_sale_date IS NULL OR julianday('now')-julianday(soi.last_sale_date)>? ORDER BY soi.last_sale_date ASC NULLS FIRST").bind(days).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("呆滞库存").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["商品名称","规格","单位","当前库存","库存金额","最后出库日期","呆滞天数"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,16).unwrap();ws.set_column_width(6,12).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;let cur=row.try_get::<f64,_>("current_stock").unwrap_or(0.0);let amt=row.try_get::<f64,_>("amount").unwrap_or(0.0);ws.write(r,0,row.get::<String,_>("product_name")).unwrap();ws.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,3,cur).unwrap();ws.write(r,4,amt).unwrap();ws.write(r,5,row.get::<String,_>("last_sale_date")).unwrap();ws.write(r,6,days).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "呆滞库存查询.xlsx")
+}
+
+async fn api_query_income_expense_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
+    let mut df=String::new();if!start_date.is_empty(){df.push_str(&format!(" AND order_date>='{}'",start_date));}if!end_date.is_empty(){df.push_str(&format!(" AND order_date<='{}'",end_date));}
+    let sql=format!("SELECT order_date,'销售订单' as type,CAST(total_amount AS REAL) as total_amount,CAST(final_amount AS REAL) as final_amount,'收入' as direction FROM sales_order WHERE status!='cancelled'{} UNION ALL SELECT order_date,'采购订单' as type,CAST(total_amount AS REAL) as total_amount,CAST(final_amount AS REAL) as final_amount,'支出' as direction FROM purchase_order WHERE status!='cancelled'{} ORDER BY order_date",df,df);
+    let rows=sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("收支流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["日期","类型","方向","订单金额","实付金额"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("order_date")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("direction")).unwrap();ws.write(r,3,row.try_get::<f64,_>("total_amount").unwrap_or(0.0)).unwrap();ws.write(r,4,row.try_get::<f64,_>("final_amount").unwrap_or(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "收支流水查询.xlsx")
+}
+
+async fn api_query_profit_detail_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
+    let mut df=String::new();if!start_date.is_empty(){df.push_str(&format!(" AND so.order_date>='{}'",start_date));}if!end_date.is_empty(){df.push_str(&format!(" AND so.order_date<='{}'",end_date));}
+    let sql=format!("SELECT so.order_no,so.order_date,soi.product_name,CAST(soi.quantity AS REAL) as quantity,CAST(soi.unit_price AS REAL) as sale_price,COALESCE(CAST(p.purchase_price AS REAL),0) as purchase_price,(CAST(soi.unit_price AS REAL)-COALESCE(CAST(p.purchase_price AS REAL),0))*CAST(soi.quantity AS REAL) as profit,CAST(soi.amount AS REAL) as sale_amount,COALESCE(CAST(p.purchase_price AS REAL),0)*CAST(soi.quantity AS REAL) as cost_amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id LEFT JOIN product p ON soi.product_id=p.id WHERE so.status!='cancelled'{} ORDER BY so.order_date,so.order_no",df);
+    let rows=sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("毛利明细").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["订单号","日期","商品名称","数量","销售单价","进货价","销售金额","成本金额","毛利","毛利率"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,10).unwrap();ws.set_column_width(4,12).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,14).unwrap();ws.set_column_width(7,14).unwrap();ws.set_column_width(8,14).unwrap();ws.set_column_width(9,10).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;let qty=row.try_get::<f64,_>("quantity").unwrap_or(0.0);let sp=row.try_get::<f64,_>("sale_price").unwrap_or(0.0);let pp=row.try_get::<f64,_>("purchase_price").unwrap_or(0.0);let sa=row.try_get::<f64,_>("sale_amount").unwrap_or(0.0);let ca=row.try_get::<f64,_>("cost_amount").unwrap_or(0.0);let pf=row.try_get::<f64,_>("profit").unwrap_or(0.0);let mg=if sa>0.0{pf/sa*100.0}else{0.0};ws.write(r,0,row.get::<String,_>("order_no")).unwrap();ws.write(r,1,row.get::<String,_>("order_date")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,qty).unwrap();ws.write(r,4,sp).unwrap();ws.write(r,5,pp).unwrap();ws.write(r,6,sa).unwrap();ws.write(r,7,ca).unwrap();ws.write(r,8,pf).unwrap();ws.write(r,9,mg).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "毛利明细查询.xlsx")
+}
+
+async fn api_query_category_stats_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
+    let rows=sqlx::query("SELECT pc.id,pc.name as category_name,COALESCE((SELECT SUM(poi.quantity) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product pr ON poi.product_id=pr.id WHERE pr.category_id=pc.id AND po.order_date>=? AND po.order_date<=?),0) as purchase_quantity,COALESCE((SELECT SUM(poi.amount) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product pr ON poi.product_id=pr.id WHERE pr.category_id=pc.id AND po.order_date>=? AND po.order_date<=?),0) as purchase_amount,COALESCE((SELECT SUM(soi.quantity) FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product pr ON soi.product_id=pr.id WHERE pr.category_id=pc.id AND so.order_date>=? AND so.order_date<=?),0) as sales_quantity,COALESCE((SELECT SUM(soi.amount) FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product pr ON soi.product_id=pr.id WHERE pr.category_id=pc.id AND so.order_date>=? AND so.order_date<=?),0) as sales_amount,COALESCE((SELECT SUM(i.quantity) FROM inventory i JOIN product pr ON i.product_id=pr.id WHERE pr.category_id=pc.id),0) as stock_quantity,COALESCE((SELECT SUM(i.quantity*pr.selling_price) FROM inventory i JOIN product pr ON i.product_id=pr.id WHERE pr.category_id=pc.id),0) as stock_amount FROM category pc WHERE pc.entity_type='product' AND pc.parent_id IS NULL ORDER BY pc.id")
+    .bind(start_date).bind(end_date).bind(start_date).bind(end_date).bind(start_date).bind(end_date).bind(start_date).bind(end_date).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("品类统计").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["品类名称","采购数量","采购金额","销售数量","销售金额","库存数量","库存金额","毛利"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,16).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,12).unwrap();ws.set_column_width(3,12).unwrap();ws.set_column_width(4,12).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,12).unwrap();ws.set_column_width(7,12).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;let pa:f64=row.get("purchase_amount");let sa:f64=row.get("sales_amount");let mg=sa-pa;ws.write(r,0,row.get::<String,_>("category_name")).unwrap();ws.write(r,1,row.get::<f64,_>("purchase_quantity")).unwrap();ws.write(r,2,pa).unwrap();ws.write(r,3,row.get::<f64,_>("sales_quantity")).unwrap();ws.write(r,4,sa).unwrap();ws.write(r,5,row.get::<f64,_>("stock_quantity")).unwrap();ws.write(r,6,row.get::<f64,_>("stock_amount")).unwrap();ws.write(r,7,mg).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "品类进销存统计.xlsx")
+}
+
+async fn api_query_document_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let month=params.get("month").map(|s|s.as_str()).unwrap_or("");
+    let rows=sqlx::query("SELECT strftime('%Y-%m',po.order_date) as month,COUNT(DISTINCT po.id) as purchase_count,COALESCE(SUM(po.total_amount),0) as purchase_amount,COALESCE((SELECT COUNT(DISTINCT so.id) FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=strftime('%Y-%m',po.order_date)),0) as sales_count,COALESCE((SELECT SUM(so.total_amount) FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=strftime('%Y-%m',po.order_date)),0) as sales_amount FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=? GROUP BY strftime('%Y-%m',po.order_date) UNION ALL SELECT strftime('%Y-%m',so.order_date) as month,COALESCE((SELECT COUNT(DISTINCT po.id) FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=strftime('%Y-%m',so.order_date)),0) as purchase_count,COALESCE((SELECT SUM(po.total_amount) FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=strftime('%Y-%m',so.order_date)),0) as purchase_amount,COUNT(DISTINCT so.id) as sales_count,COALESCE(SUM(so.total_amount),0) as sales_amount FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=? GROUP BY strftime('%Y-%m',so.order_date)").bind(month).bind(month).fetch_all(pool()).await.unwrap_or_default();
+    let mut mm:std::collections::HashMap<String,serde_json::Value>=std::collections::HashMap::new();
+    for row in &rows{let m=row.get::<String,_>("month");let pc:i64=row.get("purchase_count");let pa:f64=row.get("purchase_amount");let sc:i64=row.get("sales_count");let sa:f64=row.get("sales_amount");if let Some(e)=mm.get_mut(&m){e["purchase_count"]=serde_json::json!(std::cmp::max(e["purchase_count"].as_i64().unwrap_or(0),pc));e["purchase_amount"]=serde_json::json!(e["purchase_amount"].as_f64().unwrap_or(0.0).max(pa));e["sales_count"]=serde_json::json!(std::cmp::max(e["sales_count"].as_i64().unwrap_or(0),sc));e["sales_amount"]=serde_json::json!(e["sales_amount"].as_f64().unwrap_or(0.0).max(sa));}else{let mj=m.clone();mm.insert(mj,serde_json::json!({"month":m,"purchase_count":pc,"purchase_amount":pa,"sales_count":sc,"sales_amount":sa}));}}
+    let mut result:Vec<serde_json::Value>=mm.values().cloned().collect();result.sort_by(|a,b|a["month"].as_str().unwrap_or("").cmp(b["month"].as_str().unwrap_or("")));
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("单据汇总").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["月份","采购订单数","销售订单数","采购金额","销售金额"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,12).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,14).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();
+    for(i,item)in result.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,item.get("month").and_then(|v|v.as_str()).unwrap_or("")).unwrap();ws.write(r,1,item.get("purchase_count").and_then(|v|v.as_i64()).unwrap_or(0)).unwrap();ws.write(r,2,item.get("sales_count").and_then(|v|v.as_i64()).unwrap_or(0)).unwrap();ws.write(r,3,item.get("purchase_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap();ws.write(r,4,item.get("sales_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "单据汇总查询.xlsx")
+}
+
+async fn api_purchase_document_list_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let supplier_id=params.get("supplier_id").and_then(|s|s.parse::<i64>().ok());let document_date=params.get("document_date").map(|s|s.as_str()).unwrap_or("");
+    let mut sql="SELECT id,supplier_id,supplier_name,document_date,remark,create_at FROM purchase_document WHERE 1=1".to_string();
+    let rows=match(supplier_id,document_date.is_empty()){(Some(sid),false)=>{sql.push_str(" AND supplier_id=? AND document_date=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(sid).bind(document_date).fetch_all(pool()).await.unwrap_or_default()},(Some(sid),true)=>{sql.push_str(" AND supplier_id=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(sid).fetch_all(pool()).await.unwrap_or_default()},(None,false)=>{sql.push_str(" AND document_date=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(document_date).fetch_all(pool()).await.unwrap_or_default()},(None,true)=>{sql.push_str(" ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default()},};
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("采购单据").unwrap();let hf=xlsx_header_format(0x4472C4);
+    for(c,h)in["ID","供应商","单据日期","备注","创建时间"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,8).unwrap();ws.set_column_width(1,18).unwrap();ws.set_column_width(2,14).unwrap();ws.set_column_width(3,20).unwrap();ws.set_column_width(4,20).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<i64,_>("id")).unwrap();ws.write(r,1,row.get::<String,_>("supplier_name")).unwrap();ws.write(r,2,row.get::<String,_>("document_date")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();ws.write(r,4,row.get::<String,_>("create_at")).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购单据列表.xlsx")
+}
+
 async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
     let result = sqlx::query(
         "INSERT INTO sales_order(purchaser_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -21579,35 +21900,52 @@ fn build_router() -> Router {
         .route("/api/sales_order/sort_comprehensive_excel", get(api_sales_order_sort_comprehensive_excel))
         .route("/api/query/purchase_order", get(api_query_purchase_order))
         .route("/api/purchase_document/list", get(api_purchase_document_list))
+        .route("/api/purchase_document/list/export", get(api_purchase_document_list_export))
         .route("/api/purchase_document/upload", post(api_purchase_document_upload))
         .route("/api/purchase_document/delete/{id}", delete(api_purchase_document_delete))
         .route("/api/query/purchase_order/export", get(api_query_purchase_order_export))
         .route("/api/query/purchase_price", get(api_query_purchase_price))
+        .route("/api/query/purchase_price/export", get(api_query_purchase_price_export))
         .route("/api/query/purchase_summary", get(api_query_purchase_summary))
+        .route("/api/query/purchase_summary/export", get(api_query_purchase_summary_export))
         .route("/api/query/supplier_balance", get(api_query_supplier_balance))
         .route("/api/query/supplier_balance/export", get(api_query_supplier_balance_export))
         .route("/api/query/sales_order", get(api_query_sales_order))
         .route("/api/query/sales_order/export", get(api_query_sales_order_export))
         .route("/api/query/sales_price", get(api_query_sales_price))
+        .route("/api/query/sales_price/export", get(api_query_sales_price_export))
         .route("/api/query/sales_summary", get(api_query_sales_summary))
+        .route("/api/query/sales_summary/export", get(api_query_sales_summary_export))
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
         .route("/api/query/purchaser_balance/export", get(api_query_purchaser_balance_export))
         .route("/api/query/product_rank", get(api_query_product_rank))
+        .route("/api/query/product_rank/export", get(api_query_product_rank_export))
         .route("/api/query/reimburse_summary", get(api_query_reimburse_summary))
+        .route("/api/query/reimburse_summary/export", get(api_query_reimburse_summary_export))
         .route("/api/query/allocation_source", get(api_query_allocation_source))
+        .route("/api/query/allocation_source/export", get(api_query_allocation_source_export))
         .route("/api/query/stock_balance", get(api_query_stock_balance))
+        .route("/api/query/stock_balance/export", get(api_query_stock_balance_export))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
+        .route("/api/query/stock_flow/export", get(api_query_stock_flow_export))
         .route("/api/query/stock_summary", get(api_query_stock_summary))
         .route("/api/query/stock_summary/export", get(api_query_stock_summary_export))
         .route("/api/query/stock_summary_reimburse", get(api_query_stock_summary_reimburse))
         .route("/api/query/stock_summary_reimburse/export", get(api_query_stock_summary_reimburse_export))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
+        .route("/api/query/stock_warning/export", get(api_query_stock_warning_export))
         .route("/api/query/slow_stock", get(api_query_slow_stock))
+        .route("/api/query/slow_stock/export", get(api_query_slow_stock_export))
         .route("/api/query/income_expense", get(api_query_income_expense))
+        .route("/api/query/income_expense/export", get(api_query_income_expense_export))
         .route("/api/query/profit_detail", get(api_query_profit_detail))
+        .route("/api/query/profit_detail/export", get(api_query_profit_detail_export))
         .route("/api/query/overview", get(api_query_overview))
+        .route("/api/query/overview/export", get(api_query_overview_export))
         .route("/api/query/category_stats", get(api_query_category_stats))
+        .route("/api/query/category_stats/export", get(api_query_category_stats_export))
         .route("/api/query/document_summary", get(api_query_document_summary))
+        .route("/api/query/document_summary/export", get(api_query_document_summary_export))
         .route("/api/order/generate_no", get(api_order_generate_no))
         .route("/api/accept/create", post(api_accept_create))
         .route("/api/accept/list", get(api_accept_list))
