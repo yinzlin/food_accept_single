@@ -4667,6 +4667,36 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             </div>
         </div>
 
+        <!-- 售价变更提示弹窗 -->
+        <style>
+            #priceChangeModal {{ display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }}
+            #priceChangeModal .modal-dialog {{ margin: 80px auto; max-width: 600px; }}
+            #priceChangeModal .modal-content {{ background: #fff; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }}
+            #priceChangeModal .modal-header {{ padding: 12px 16px; border-bottom: 1px solid #dee2e6; display: flex; justify-content: space-between; align-items: center; }}
+            #priceChangeModal .modal-body {{ padding: 12px 16px; max-height: 400px; overflow-y: auto; }}
+            #priceChangeModal .modal-footer {{ padding: 12px 16px; border-top: 1px solid #dee2e6; text-align: right; }}
+            #priceChangeModal .close {{ border: none; background: none; font-size: 24px; cursor: pointer; }}
+        </style>
+        <div id="priceChangeModal" class="modal" style="display:none;">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">售价变更明细</h5>
+                        <button type="button" class="close" onclick="document.getElementById('priceChangeModal').style.display='none'">&times;</button>
+                    </div>
+                    <div class="modal-body" style="max-height:400px;overflow-y:auto;">
+                        <table class="table table-sm table-bordered">
+                            <thead><tr><th>商品名称</th><th>原售价</th><th>新售价</th><th>变动</th></tr></thead>
+                            <tbody id="priceChangeBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" onclick="document.getElementById('priceChangeModal').style.display='none'">关闭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <h4>销售订单列表</h4>
         <div class="mb-3">
             <input type="text" id="searchInput" class="form-control" placeholder="搜索订单号、采购单位、日期..." oninput="searchOrders()" style="width: 250px; display: inline-block;">
@@ -5418,20 +5448,46 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     if (data.errors && data.errors.length > 0) {{
                         alert('部分商品获取售价失败：\\n' + data.errors.join('\\n'));
                     }}
-                    // 更新表单中的 items 数据（不写入数据库）
+                    // 记录变动明细
+                    const changes = [];
                     const priceMap = {{}};
                     data.items.forEach(i => {{ priceMap[i.product_id] = i; }});
-                    let changed = 0;
                     items.forEach((item, idx) => {{
                         const newData = priceMap[item.product_id];
                         if (newData) {{
-                            item.unit_price = newData.unit_price;
+                            const oldPrice = item.unit_price;
+                            const newPrice = newData.unit_price;
+                            const diff = newPrice - oldPrice;
+                            if (Math.abs(diff) > 0.001) {{
+                                changes.push({{
+                                    name: item.product_name,
+                                    oldPrice: oldPrice,
+                                    newPrice: newPrice,
+                                    diff: diff,
+                                }});
+                            }}
+                            item.unit_price = newPrice;
                             item.amount = newData.amount;
-                            changed++;
                         }}
                     }});
                     renderItems();
-                    alert('已获取 ' + changed + ' 项商品最新售价，请核对后点击"保存修改"。');
+                    // 显示变动弹窗
+                    if (changes.length > 0) {{
+                        const tbody = document.getElementById('priceChangeBody');
+                        tbody.innerHTML = changes.map(c => {{
+                            const cls = c.diff > 0 ? 'text-success' : 'text-danger';
+                            const arrow = c.diff > 0 ? '↑' : '↓';
+                            return `<tr>
+                                <td>${{c.name}}</td>
+                                <td>¥${{c.oldPrice.toFixed(2)}}</td>
+                                <td>¥${{c.newPrice.toFixed(2)}}</td>
+                                <td class="${{cls}}">${{arrow}} ¥${{Math.abs(c.diff).toFixed(2)}}</td>
+                            </tr>`;
+                        }}).join('');
+                        document.getElementById('priceChangeModal').style.display = 'block';
+                    }} else {{
+                        alert('已获取 ' + data.items.length + ' 项商品最新售价，无变动。');
+                    }}
                 }} catch (e) {{
                     alert('获取失败：' + e.message);
                 }} finally {{
