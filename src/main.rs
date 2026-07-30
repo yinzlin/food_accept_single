@@ -19654,7 +19654,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     let car_no = "湘A·NY360".to_string();
 
     let item_rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.category_id, pc.name as category_name, pc.parent_id, pc2.name as parent_name
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          LEFT JOIN category pc ON p.category_id = pc.id
@@ -19669,7 +19669,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     // 真实口径不合并分摊增项，仅报销口径需要
     let supplement_rows = if reimburse {
         sqlx::query(
-            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
                     pc.name as category_name, pc2.name as parent_name
              FROM order_supplement_item soi
              LEFT JOIN product p ON soi.product_id = p.id
@@ -19701,6 +19701,13 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             format!("{}({})", product_name, alias2)
         };
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
+        // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
+        // 订单明细的 unit 为空时，回退到商品表的基础单位 base_unit
+        let unit_for_spec = if !unit.is_empty() {
+            unit
+        } else {
+            r.get::<Option<String>, _>("product_base_unit").unwrap_or_default()
+        };
         let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
         if spec.is_empty() {
             spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
@@ -19710,7 +19717,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
         let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
-        item_map.insert(rid, (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark));
+        item_map.insert(rid, (sort_key, food_name, unit_for_spec, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark));
     }
 
     for r in &supplement_rows {
@@ -19759,10 +19766,14 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             let product_name = r.get::<String, _>("product_name");
             let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
             // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
-            // 优先取分摊增项的单位，为空时回退到商品表的基础单位
+            // 优先取分摊增项的 unit，为空时回退到商品表的基础单位 base_unit
             let unit = {
                 let u = r.get::<String, _>("unit");
-                if u.is_empty() { r.get::<Option<String>, _>("product_unit").unwrap_or_default() } else { u }
+                if !u.is_empty() {
+                    u
+                } else {
+                    r.get::<Option<String>, _>("product_base_unit").unwrap_or_default()
+                }
             };
             let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
             if spec.is_empty() {
