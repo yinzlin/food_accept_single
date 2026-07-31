@@ -227,6 +227,81 @@ async fn serve_bootstrap_js() -> impl IntoResponse {
     )
 }
 
+// 修复常见数据库损坏
+async fn repair_db_corruption(pool: &SqlitePool) {
+    // 1. 先尝试 REINDEX + VACUUM
+    let _ = sqlx::query("REINDEX").execute(pool).await;
+    let _ = sqlx::query("VACUUM").execute(pool).await;
+    let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .unwrap_or_default();
+    if check == "ok" { return; }
+    eprintln!("REINDEX+VACUUM 后仍异常: {}", check);
+
+    // 2. 修复 NUMERIC value in ...status 类型错误
+    // 检查 purchase_order.status 是否有数值类型
+    if check.contains("NUMERIC value in purchase_order.status") {
+        let bad_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, CAST(status AS TEXT) as status FROM purchase_order WHERE typeof(status) != 'text'"
+        )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for (id, _) in &bad_rows {
+            let _ = sqlx::query("UPDATE purchase_order SET status = 'pending' WHERE id = ?")
+                .bind(id).execute(pool).await;
+            eprintln!("  修复 purchase_order.status: ID={}", id);
+        }
+    }
+    // 检查 sales_order.status 是否有数值类型
+    if check.contains("NUMERIC value in sales_order.status") {
+        let bad_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, CAST(status AS TEXT) as status FROM sales_order WHERE typeof(status) != 'text'"
+        )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for (id, _) in &bad_rows {
+            let _ = sqlx::query("UPDATE sales_order SET status = 'pending' WHERE id = ?")
+                .bind(id).execute(pool).await;
+            eprintln!("  修复 sales_order.status: ID={}", id);
+        }
+    }
+
+    // 3. 检查并修复重复 order_no
+    for table in &["sales_order", "purchase_order"] {
+        let dupes: Vec<(i64, String)> = {
+            let sql = format!("SELECT id, order_no FROM {} WHERE order_no IN (SELECT order_no FROM {} GROUP BY order_no HAVING COUNT(*) > 1) ORDER BY order_no, id", table, table);
+            sqlx::query_as::<_, (i64, String)>(AssertSqlSafe(sql))
+        }
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for (i, (id, order_no)) in dupes.iter().enumerate() {
+            let new_no = format!("{}-fix-{}", order_no, i);
+            let sql = format!("UPDATE {} SET order_no = ? WHERE id = ?", table);
+            let _ = sqlx::query(AssertSqlSafe(sql))
+                .bind(&new_no).bind(id).execute(pool).await;
+            eprintln!("  修复 {} 重复 order_no: ID={}, {} -> {}", table, id, order_no, new_no);
+        }
+    }
+
+    // 4. 再次 REINDEX + VACUUM
+    let _ = sqlx::query("REINDEX").execute(pool).await;
+    let _ = sqlx::query("VACUUM").execute(pool).await;
+
+    let final_check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .unwrap_or_default();
+    if final_check == "ok" {
+        eprintln!("repair_db_corruption 修复成功");
+    } else {
+        eprintln!("repair_db_corruption 修复后仍异常: {}", final_check);
+    }
+}
+
 async fn init_pool() {
     let pool = SqlitePoolOptions::new()
         .max_connections(16)
@@ -253,6 +328,29 @@ async fn init_pool() {
     let _ = sqlx::query("PRAGMA locking_mode = NORMAL").execute(&pool).await;
     let _ = sqlx::query("PRAGMA auto_vacuum = INCREMENTAL").execute(&pool).await;
     let _ = sqlx::query("PRAGMA page_size = 4096").execute(&pool).await;
+    
+    // 使用 integrity_check 检测数据库损坏
+    let integrity_check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_default();
+    if integrity_check != "ok" {
+        eprintln!("数据库损坏: {}", integrity_check);
+        // 尝试修复常见的损坏类型
+        repair_db_corruption(&pool).await;
+        // 最终检查
+        let final_check: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_default();
+        if final_check == "ok" {
+            eprintln!("数据库修复成功");
+        } else {
+            eprintln!("数据库修复失败: {}", final_check);
+        }
+    } else {
+        eprintln!("数据库完整性检查通过");
+    }
     
     init_tables(&pool).await.expect("初始化数据表失败");
     
@@ -5207,7 +5305,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         alert('订单保存成功');
                     }}
                 }} else {{
-                    alert('保存失败');
+                    const errText = await res.text();
+                    alert('保存失败: ' + (errText || res.statusText));
                 }}
             }}
 
@@ -14116,7 +14215,7 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     .bind(req.id)
     .execute(pool())
     .await;
-    
+
     match result {
         Ok(_) => {
             sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
@@ -14124,7 +14223,7 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                 .execute(pool())
                 .await
                 .ok();
-            
+
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
                     .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
@@ -14157,7 +14256,9 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
             }
             (StatusCode::OK, "更新成功".to_string())
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string()),
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e))
+        }
     }
 }
 

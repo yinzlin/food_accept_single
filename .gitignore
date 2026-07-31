@@ -9,3 +9,8 @@
 # 上传图片（商品/客户订单/签字验收单/采购单据），不计入版本控制
 uploads/
 
+# 调试日志文件
+server_*.log
+debug-*.log
+debug-*.md
+
