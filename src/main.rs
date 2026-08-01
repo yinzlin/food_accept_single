@@ -661,6 +661,10 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN ordered_quantity REAL NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS sales_order (
@@ -853,6 +857,10 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN supplier_name TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN pre_sale_quantity REAL NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
 
@@ -1217,6 +1225,7 @@ struct PurchaseOrderItemReq {
     quantity: f64,
     base_quantity: Option<f64>,
     amount: f64,
+    ordered_quantity: Option<f64>,
     remark: Option<String>,
 }
 
@@ -1248,6 +1257,7 @@ struct SalesOrderItemReq {
     quantity: f64,
     base_quantity: Option<f64>,
     amount: f64,
+    pre_sale_quantity: Option<f64>,
     supplier_id: i64,
     supplier_name: String,
     category_id: Option<i64>,
@@ -4041,7 +4051,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>备注</th><th>操作</th></tr>
+                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -4348,23 +4358,35 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 const orders = result.data || [];
                 const tbody = document.getElementById('orderListBody');
                 tbody.innerHTML = '';
+                let sumAmount = 0, sumDiscounted = 0, sumReduction = 0, sumFinal = 0;
                 orders.forEach(order => {{
+                    const amount = order.total_amount;
+                    const discounted = amount * (1 - (order.discount_rate || 0) / 100);
+                    const reduction = order.amount_reduction || 0;
+                    const finalAmt = order.final_amount || 0;
+                    sumAmount += amount;
+                    sumDiscounted += discounted;
+                    sumReduction += reduction;
+                    sumFinal += finalAmt;
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')" style="cursor: pointer;">' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
                         '<td>' + order.order_date + '</td>' +
                         '<td>' + order.supplier_name + '</td>' +
                         '<td>' + (order.warehouse_name || '') + '</td>' +
-                        '<td>' + order.total_amount.toFixed(2) + '</td>' +
-                        '<td>' + (order.total_amount * (1 - (order.discount_rate || 0) / 100)).toFixed(2) + '</td>' +
-                        '<td>' + (order.amount_reduction || 0).toFixed(2) + '</td>' +
-                        '<td>' + (order.final_amount || 0).toFixed(2) + '</td>' +
+                        '<td>' + amount.toFixed(2) + '</td>' +
+                        '<td>' + discounted.toFixed(2) + '</td>' +
+                        '<td>' + reduction.toFixed(2) + '</td>' +
+                        '<td>' + finalAmt.toFixed(2) + '</td>' +
                         '<td>' + order.status + '</td>' +
                         '<td>' +
                         '<button onclick="event.stopPropagation(); exportPurchaseOrder(' + order.id + ')" class="btn btn-info btn-sm me-1">导出采购单</button>' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
                 }});
+                if (orders.length > 0) {{
+                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                }}
                 renderPagination(result.page, result.total_pages, result.total);
             }}
 
@@ -4395,7 +4417,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             loadOrders();
 
             function addItem() {{
-                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ratio: 1, units: [] }});
+                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [] }});
                 renderItems();
             }}
 
@@ -4428,17 +4450,18 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
-                            <td>
+                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
+                            <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td>${{item.amount.toFixed(2)}}</td>
-                            <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
-                            <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
+                            <td style="width:85px"><input type="text" value="${{item.ordered_quantity != null && item.ordered_quantity > 0 ? item.ordered_quantity.toFixed(2) : ''}}" onchange="updateOrderedQty(${{index}}, this)" class="form-control-sm text-right" placeholder="订购数量"></td>
+                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:110px">${{item.amount.toFixed(2)}}</td>
+                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
+                            <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
                     `;
                 }});
@@ -4562,6 +4585,9 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
+            function updateOrderedQty(index, input) {{ 
+                items[index].ordered_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
+            }}
 
             function handleEnterKey(event, index, cellIndex) {{
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
@@ -4677,6 +4703,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         quantity: item.quantity || 0,
                         base_quantity: item.base_quantity || 0,
                         amount: item.amount || 0,
+                        ordered_quantity: item.ordered_quantity || 0,
                         remark: item.remark || '',
                         supplier_id: item.supplier_id || 0,
                         supplier_name: item.supplier_name || '',
@@ -4808,7 +4835,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>供应商</th><th>备注</th><th>操作</th></tr>
+                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">预售数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">供应商</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -5013,7 +5040,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             generateOrderNo('sales');
 
             function addItem() {{
-                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, quantity: 0, base_quantity: 0, amount: 0, ratio: 1, units: [], supplier_id: 0, supplier_name: '' }});
+                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, quantity: 0, base_quantity: 0, amount: 0, pre_sale_quantity: 0, ratio: 1, units: [], supplier_id: 0, supplier_name: '' }});
                 renderItems();
             }}
 
@@ -5050,16 +5077,17 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
-                            <td>
+                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
+                            <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td>${{item.amount.toFixed(2)}}</td>
-                            <td>
+                            <td style="width:85px"><input type="text" value="${{item.pre_sale_quantity != null && item.pre_sale_quantity > 0 ? item.pre_sale_quantity.toFixed(2) : ''}}" onchange="updatePreSaleQty(${{index}}, this)" class="form-control-sm text-right" placeholder="预售数量"></td>
+                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:110px">${{item.amount.toFixed(2)}}</td>
+                            <td style="width:120px">
                                 <div class="position-relative">
                                     <input type="text" value="${{item.supplier_name || ''}}" 
                                            onclick="showItemSupplierDropdown(${{index}}, '')"
@@ -5073,8 +5101,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="supplierDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
-                            <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
+                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
+                            <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
                     `;
                 }});
@@ -5195,6 +5223,14 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
                 items[index].base_quantity = Math.round(items[index].quantity * (items[index].ratio || 1) * 100) / 100;
                 items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
+                renderItems();
+            }}
+            function updatePreSaleQty(index, input) {{ 
+                items[index].pre_sale_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                if (parseFloat(input.value) > 0) {{
+                    items[index].quantity = items[index].pre_sale_quantity;
+                    items[index].amount = items[index].unit_price * items[index].quantity;
+                }}
                 renderItems();
             }}
 
@@ -5493,7 +5529,16 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 const orders = result.data || [];
                 const tbody = document.getElementById('orderListBody');
                 tbody.innerHTML = '';
+                let sumAmount = 0, sumDiscounted = 0, sumReduction = 0, sumFinal = 0;
                 orders.forEach(order => {{
+                    const amount = order.total_amount;
+                    const discounted = amount * (1 - (order.discount_rate || 0) / 100);
+                    const reduction = order.amount_reduction || 0;
+                    const finalAmt = order.final_amount || 0;
+                    sumAmount += amount;
+                    sumDiscounted += discounted;
+                    sumReduction += reduction;
+                    sumFinal += finalAmt;
                     const selected = currentOrderId === order.id ? ' style="cursor: pointer; background-color: #fff3cd;"' : ' style="cursor: pointer;"';
                     const statusMap = {{
                         'pending': '{{"text":"待分拣","class":"bg-secondary"}}',
@@ -5523,10 +5568,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + order.order_no + '</td>' +
                         '<td>' + order.order_date + '</td>' +
                         '<td>' + order.purchaser_name + '</td>' +
-                        '<td>' + order.total_amount.toFixed(2) + '</td>' +
-                        '<td>' + (order.total_amount * (1 - (order.discount_rate || 0) / 100)).toFixed(2) + '</td>' +
-                        '<td>' + (order.amount_reduction || 0).toFixed(2) + '</td>' +
-                        '<td>' + (order.final_amount || 0).toFixed(2) + '</td>' +
+                        '<td>' + amount.toFixed(2) + '</td>' +
+                        '<td>' + discounted.toFixed(2) + '</td>' +
+                        '<td>' + reduction.toFixed(2) + '</td>' +
+                        '<td>' + finalAmt.toFixed(2) + '</td>' +
                         '<td>' + statusBadge + '</td>' +
                         '<td>' +
                         nextBtn +
@@ -5536,6 +5581,9 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
                 }});
+                if (orders.length > 0) {{
+                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="4" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                }}
                 renderPagination(result.page, result.total_pages, result.total);
             }}
 
@@ -5593,6 +5641,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         quantity: item.quantity || 0,
                         base_quantity: item.base_quantity || 0,
                         amount: item.amount || 0,
+                        pre_sale_quantity: item.pre_sale_quantity || 0,
                         remark: item.remark || '',
                         supplier_id: item.supplier_id || 0,
                         supplier_name: item.supplier_name || '',
@@ -5870,7 +5919,7 @@ async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<Strin
                             </div>
                         </div>
                         <table class="table table-striped table-bordered">
-                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
+                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>订购数量</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
                             <tbody id="modalItems"></tbody>
                         </table>
                     </div>
@@ -5965,9 +6014,9 @@ async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<Strin
                 let itemTotal = 0;
                 data.items.forEach(item => {
                     itemTotal += item.amount || 0;
-                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
+                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.ordered_quantity || 0).toFixed(2) + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
                 });
-                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
+                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="6">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
 
                 const modal = new bootstrap.Modal(document.getElementById('detailModal'));
                 modal.show();
@@ -6207,7 +6256,7 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
                             </div>
                         </div>
                         <table class="table table-striped table-bordered">
-                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
+                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>预售数量</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
                             <tbody id="modalItems"></tbody>
                         </table>
                     </div>
@@ -6329,9 +6378,9 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
                 let itemTotal = 0;
                 data.items.forEach(item => {
                     itemTotal += item.amount || 0;
-                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
+                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.pre_sale_quantity || 0).toFixed(2) + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
                 });
-                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
+                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="6">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
 
                 const modal = new bootstrap.Modal(document.getElementById('detailModal'));
                 modal.show();
@@ -13786,10 +13835,10 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
             let order_id = res.last_insert_rowid();
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES {}",
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -13807,6 +13856,7 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.ordered_quantity.unwrap_or(0.0))
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
@@ -13937,7 +13987,7 @@ async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     let row = order_row.unwrap();
     
     let item_rows = sqlx::query(
-        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark FROM purchase_order_item WHERE order_id = ?"
+        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark FROM purchase_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
@@ -13958,6 +14008,7 @@ async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "base_quantity": r.get::<Option<f64>, _>("base_quantity"),
             "amount": r.get::<f64, _>("amount"),
+            "ordered_quantity": r.get::<Option<f64>, _>("ordered_quantity"),
             "remark": r.get::<Option<String>, _>("remark"),
         }))
         .collect();
@@ -14016,10 +14067,10 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
             
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES {}",
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -14038,6 +14089,7 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.ordered_quantity.unwrap_or(0.0))
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
@@ -14075,7 +14127,7 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
 async fn api_purchase_order_export() -> impl IntoResponse {
     let rows = sqlx::query(
         "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.final_amount, po.status, po.remark, s.name as supplier_name,
-                poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.unit_price, poi.quantity, poi.base_quantity, poi.amount, poi.remark as item_remark
+                poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.ordered_quantity, poi.quantity, poi.unit_price, poi.base_quantity, poi.amount, poi.remark as item_remark
          FROM purchase_order po 
          JOIN supplier s ON po.supplier_id = s.id
          LEFT JOIN purchase_order_item poi ON po.id = poi.order_id
@@ -14094,7 +14146,7 @@ async fn api_purchase_order_export() -> impl IntoResponse {
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
         
-        let headers = ["订单ID", "订单号", "订单日期", "供应商", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "数量", "单价", "基本数量", "金额", "商品备注"];
+        let headers = ["订单ID", "订单号", "订单日期", "供应商", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "订购数量", "数量", "单价", "基本数量", "金额", "商品备注"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
@@ -14115,11 +14167,12 @@ async fn api_purchase_order_export() -> impl IntoResponse {
             worksheet.write(row_idx, 11, row.get::<Option<String>, _>("alias2").unwrap_or_default())?;
             worksheet.write(row_idx, 12, row.get::<Option<String>, _>("spec").unwrap_or_default())?;
             worksheet.write(row_idx, 13, row.get::<Option<String>, _>("unit").unwrap_or_default())?;
-            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 18, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
+            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("ordered_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 18, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 19, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
             row_idx += 1;
         }
         
@@ -14130,18 +14183,19 @@ async fn api_purchase_order_export() -> impl IntoResponse {
         worksheet.set_column_width(4, 10)?;
         worksheet.set_column_width(5, 12)?;
         worksheet.set_column_width(6, 12)?;
-        worksheet.set_column_width(7, 8)?;
-        worksheet.set_column_width(8, 15)?;
+        worksheet.set_column_width(7, 10)?;
+        worksheet.set_column_width(8, 12)?;
         worksheet.set_column_width(9, 15)?;
         worksheet.set_column_width(10, 15)?;
         worksheet.set_column_width(11, 15)?;
         worksheet.set_column_width(12, 10)?;
         worksheet.set_column_width(13, 8)?;
-        worksheet.set_column_width(14, 8)?;
+        worksheet.set_column_width(14, 10)?;
         worksheet.set_column_width(15, 8)?;
-        worksheet.set_column_width(16, 10)?;
+        worksheet.set_column_width(16, 8)?;
         worksheet.set_column_width(17, 10)?;
-        worksheet.set_column_width(18, 15)?;
+        worksheet.set_column_width(18, 10)?;
+        worksheet.set_column_width(19, 15)?;
         
         workbook.save_to_buffer()
     })();
@@ -14571,7 +14625,7 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
                             .unwrap_or(0);
                         
                         sqlx::query(
-                            "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .bind(order_id)
                         .bind(product_id)
@@ -14584,6 +14638,7 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
                         .bind(quantity)
                         .bind(base_quantity)
                         .bind(amount)
+                        .bind(0.0f64)
                         .bind(item_remark)
                         .execute(pool())
                         .await
@@ -14633,7 +14688,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     };
     
     let item_rows = match sqlx::query(
-        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark FROM sales_order_item WHERE order_id = ?"
+        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark FROM sales_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
@@ -14658,6 +14713,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "base_quantity": r.get::<Option<f64>, _>("base_quantity"),
             "amount": r.get::<f64, _>("amount"),
+            "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity"),
             "supplier_id": r.get::<Option<i64>, _>("supplier_id"),
             "supplier_name": r.get::<Option<String>, _>("supplier_name"),
             "remark": r.get::<Option<String>, _>("remark"),
@@ -14721,10 +14777,10 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
 
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES {}",
+                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -14743,6 +14799,7 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.pre_sale_quantity.unwrap_or(0.0))
                         .bind(item.supplier_id)
                         .bind(&item.supplier_name)
                         .bind(&item.remark);
@@ -14891,7 +14948,7 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
 async fn api_sales_order_export() -> impl IntoResponse {
     let rows = sqlx::query(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name,
-                soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.base_quantity, soi.amount, soi.remark as item_remark
+                soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.pre_sale_quantity, soi.quantity, soi.unit_price, soi.base_quantity, soi.amount, soi.remark as item_remark
          FROM sales_order so 
          JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN sales_order_item soi ON so.id = soi.order_id
@@ -14910,7 +14967,7 @@ async fn api_sales_order_export() -> impl IntoResponse {
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
         
-        let headers = ["订单ID", "订单号", "订单日期", "采购单位", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "数量", "单价", "基本数量", "金额", "商品备注"];
+        let headers = ["订单ID", "订单号", "订单日期", "采购单位", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "预售数量", "数量", "单价", "基本数量", "金额", "商品备注"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
@@ -14931,11 +14988,12 @@ async fn api_sales_order_export() -> impl IntoResponse {
             worksheet.write(row_idx, 11, row.get::<Option<String>, _>("alias2").unwrap_or_default())?;
             worksheet.write(row_idx, 12, row.get::<Option<String>, _>("spec").unwrap_or_default())?;
             worksheet.write(row_idx, 13, row.get::<Option<String>, _>("unit").unwrap_or_default())?;
-            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 18, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
+            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 18, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 19, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
             row_idx += 1;
         }
         
@@ -14953,11 +15011,12 @@ async fn api_sales_order_export() -> impl IntoResponse {
         worksheet.set_column_width(11, 15)?;
         worksheet.set_column_width(12, 10)?;
         worksheet.set_column_width(13, 8)?;
-        worksheet.set_column_width(14, 8)?;
+        worksheet.set_column_width(14, 10)?;
         worksheet.set_column_width(15, 8)?;
-        worksheet.set_column_width(16, 10)?;
+        worksheet.set_column_width(16, 8)?;
         worksheet.set_column_width(17, 10)?;
-        worksheet.set_column_width(18, 15)?;
+        worksheet.set_column_width(18, 10)?;
+        worksheet.set_column_width(19, 15)?;
         
         workbook.save_to_buffer()
     })();
@@ -15120,7 +15179,7 @@ async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
                             .unwrap_or(0);
                         
                         sqlx::query(
-                            "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .bind(order_id)
                         .bind(product_id)
@@ -15133,6 +15192,7 @@ async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
                         .bind(quantity)
                         .bind(base_quantity)
                         .bind(amount)
+                        .bind(0.0f64)
                         .bind(item_remark)
                         .execute(pool())
                         .await
@@ -16218,7 +16278,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
     let warehouse_name = row.get::<Option<String>, _>("warehouse_name").unwrap_or_default();
     
     let item_rows = sqlx::query(
-        "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.supplier_id, soi.supplier_name, p.purchase_price, p.base_unit, p.base_price
+        "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.supplier_id, soi.supplier_name, p.purchase_price, p.base_unit, p.base_price
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          WHERE soi.order_id = ?"
     )
@@ -16227,7 +16287,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
     .await
     .unwrap_or_default();
     
-    let mut supplier_items: std::collections::HashMap<i64, Vec<(i64, String, String, String, String, String, f64, f64, String, f64)>> = std::collections::HashMap::new();
+    let mut supplier_items: std::collections::HashMap<i64, Vec<(i64, String, String, String, String, String, f64, f64, f64, String, f64)>> = std::collections::HashMap::new();
     
     for r in &item_rows {
         let supplier_id = r.get::<i64, _>("supplier_id");
@@ -16241,6 +16301,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
         let quantity = r.get::<f64, _>("quantity");
+        let pre_sale_quantity = r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0);
         let purchase_price = r.get::<f64, _>("purchase_price");
         let base_unit = r.get::<Option<String>, _>("base_unit").unwrap_or_default();
         let base_price = r.get::<f64, _>("base_price");
@@ -16248,7 +16309,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         let unit_price = if purchase_price > 0.0 { purchase_price } else { base_price };
         
         supplier_items.entry(supplier_id).or_insert_with(Vec::new).push(
-            (product_id, product_name, alias1, alias2, spec, unit, quantity, unit_price, base_unit, base_price)
+            (product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, base_unit, base_price)
         );
     }
     
@@ -16273,7 +16334,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         let order_no = generate_order_no("purchase", &order_date).await;
         
         let mut total_amount = 0.0;
-        for (_, _, _, _, _, _, qty, price, _, _) in &items {
+        for (_, _, _, _, _, _, qty, _, price, _, _) in &items {
             total_amount += qty * price;
         }
         
@@ -16295,11 +16356,11 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         
         if let Ok(res) = result {
             let po_id = res.last_insert_rowid();
-            for (product_id, product_name, alias1, alias2, spec, unit, quantity, unit_price, _base_unit, _base_price) in items {
+            for (product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, _base_unit, _base_price) in items {
                 let amount = quantity * unit_price;
                 let base_quantity = quantity;
                 sqlx::query(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 .bind(po_id)
                 .bind(product_id)
@@ -16312,6 +16373,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
                 .bind(quantity)
                 .bind(base_quantity)
                 .bind(amount)
+                .bind(pre_sale_quantity)
                 .bind(None::<String>)
                 .execute(pool())
                 .await
@@ -17850,10 +17912,10 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
             let order_id = res.last_insert_rowid();
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES {}",
+                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -17871,6 +17933,7 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.pre_sale_quantity.unwrap_or(0.0))
                         .bind(item.supplier_id)
                         .bind(&item.supplier_name)
                         .bind(&item.remark);
@@ -21325,6 +21388,8 @@ async fn api_sales_order_sort_items_by_category_excel() -> impl IntoResponse {
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "quantity": r.get::<f64, _>("quantity"),
+            "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
+            "amount": r.get::<Option<f64>, _>("amount").unwrap_or(0.0),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
         }));
@@ -21621,7 +21686,7 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
+        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
@@ -21651,6 +21716,8 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "quantity": r.get::<f64, _>("quantity"),
+            "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
+            "amount": r.get::<Option<f64>, _>("amount").unwrap_or(0.0),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
         }));
@@ -21681,12 +21748,6 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
 
     let excel_result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
-        let worksheet = workbook.add_worksheet();
-
-        worksheet.set_landscape();
-        worksheet.set_margins(0.2, 0.2, 0.2, 0.2, 0.2, 0.2);
-        worksheet.set_print_center_vertically(false);
-        worksheet.set_print_center_horizontally(true);
 
         let title_format = Format::new()
             .set_bold()
@@ -21714,13 +21775,11 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
             .set_align(FormatAlign::VerticalCenter)
             .set_border(FormatBorder::Thin);
 
-        let supplier_format = Format::new()
-            .set_bold()
-            .set_font_size(12)
-            .set_align(FormatAlign::Center)
+        let cell_right_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
             .set_align(FormatAlign::VerticalCenter)
-            .set_background_color("#10B981")
-            .set_font_color("#FFFFFF");
+            .set_border(FormatBorder::Thin);
 
         let purchaser_format = Format::new()
             .set_bold()
@@ -21730,60 +21789,167 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
             .set_background_color("#E5E7EB")
             .set_font_color("#374151");
 
-        let col_widths = [6.0, 18.0, 8.0, 10.0, 20.0, 20.0];
-        for (i, w) in col_widths.iter().enumerate() {
-            worksheet.set_column_width(i as u16, *w)?;
-        }
+        let col_widths = [6.0, 18.0, 8.0, 10.0, 10.0, 8.0, 10.0, 20.0];
+        let headers = ["序号", "商品名称", "单位", "订购数量", "实际数量", "单价", "金额", "备注"];
+        let today = Local::now().format("%Y-%m-%d").to_string();
 
-        let mut current_row = 0;
-        worksheet.merge_range(current_row, 0, current_row, 5, "采购分拣清单（按供应商）", &title_format)?;
-        worksheet.set_row_height(current_row, 28)?;
-        current_row += 2;
+        let date_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter);
 
-        let headers = ["序号", "商品名称", "单位", "数量", "备注", "采购单位"];
-        for (i, header) in headers.iter().enumerate() {
-            worksheet.write_with_format(current_row, i as u16, *header, &header_format)?;
-        }
-        current_row += 1;
+        let summary_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter);
 
-        for supplier in &result {
-            let mut seq = 1; // 序号在每个供应商内重新从 1 开始
-            let supplier_name = supplier["supplier_name"].as_str().unwrap_or("未分配供应商");
-            
-            let supplier_title = format!("【{}】", supplier_name);
-            worksheet.merge_range(current_row, 0, current_row, 5, supplier_title.as_str(), &supplier_format)?;
-            worksheet.set_row_height(current_row, 22)?;
-            current_row += 1;
+        let summary_right_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter);
 
-            if let Some(purchasers) = supplier["purchasers"].as_array() {
-                for purchaser in purchasers {
-                    let purchaser_name = purchaser["purchaser_name"].as_str().unwrap_or("");
-                    let purchaser_title = format!("├── {}", purchaser_name);
-                    worksheet.merge_range(current_row, 0, current_row, 5, purchaser_title.as_str(), &purchaser_format)?;
-                    worksheet.set_row_height(current_row, 20)?;
-                    current_row += 1;
+        let grand_total_format = Format::new()
+            .set_bold()
+            .set_font_size(11)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_background_color("#E5E7EB")
+            .set_font_color("#374151");
 
-                    if let Some(items) = purchaser["items"].as_array() {
-                        for item in items {
-                            let product_name = item["product_name"].as_str().unwrap_or("");
-                            let unit = item["unit"].as_str().unwrap_or("");
-                            let quantity = item["quantity"].as_f64().unwrap_or(0.0);
-                            let remark = item["remark"].as_str().unwrap_or("");
+        let grand_total_right_format = Format::new()
+            .set_bold()
+            .set_font_size(11)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_background_color("#E5E7EB")
+            .set_font_color("#374151");
 
-                            worksheet.write_with_format(current_row, 0, seq as f64, &cell_format)?;
-                            worksheet.write_with_format(current_row, 1, product_name, &cell_left_format)?;
-                            worksheet.write_with_format(current_row, 2, unit, &cell_format)?;
-                            worksheet.write_with_format(current_row, 3, quantity, &cell_format)?;
-                            worksheet.write_with_format(current_row, 4, remark, &cell_left_format)?;
-                            worksheet.write_with_format(current_row, 5, purchaser_name, &cell_left_format)?;
+        let max_col = 7u16;
+
+        if result.is_empty() {
+            let worksheet = workbook.add_worksheet();
+            worksheet.set_name("无数据")?;
+            worksheet.merge_range(0, 0, 0, max_col, "暂无分拣数据", &title_format)?;
+        } else {
+            for supplier in &result {
+                let supplier_name = supplier["supplier_name"].as_str().unwrap_or("未分配供应商");
+                // sheet 名称最多 31 个字符
+                let sheet_name = if supplier_name.len() > 31 {
+                    supplier_name[..31].to_string()
+                } else {
+                    supplier_name.to_string()
+                };
+                let worksheet = workbook.add_worksheet();
+                worksheet.set_name(sheet_name.as_str())?;
+
+                worksheet.set_landscape();
+                worksheet.set_margins(0.0, 0.0, 0.4, 0.0, 0.0, 0.0);
+                worksheet.set_print_center_vertically(false);
+                worksheet.set_print_center_horizontally(true);
+                worksheet.set_header("");
+                worksheet.set_footer("");
+
+                for (i, w) in col_widths.iter().enumerate() {
+                    worksheet.set_column_width(i as u16, *w)?;
+                }
+
+                let mut current_row = 0;
+                let title = format!("{} - 采购分拣清单", supplier_name);
+                worksheet.merge_range(current_row, 0, current_row, max_col, title.as_str(), &title_format)?;
+                worksheet.set_row_height(current_row, 28)?;
+                current_row += 1;
+
+                worksheet.merge_range(current_row, 4, current_row, max_col, today.as_str(), &date_format)?;
+                worksheet.set_row_height(current_row, 14)?;
+                current_row += 1;
+
+                for (i, header) in headers.iter().enumerate() {
+                    worksheet.write_with_format(current_row, i as u16, *header, &header_format)?;
+                }
+                current_row += 1;
+
+                let mut grand_total_items = 0i64;
+                let mut grand_total_amount = 0.0;
+
+                if let Some(purchasers) = supplier["purchasers"].as_array() {
+                    for purchaser in purchasers {
+                        let purchaser_name = purchaser["purchaser_name"].as_str().unwrap_or("");
+                        let purchaser_title = format!("├── {}", purchaser_name);
+                        worksheet.merge_range(current_row, 0, current_row, max_col, purchaser_title.as_str(), &purchaser_format)?;
+                        worksheet.set_row_height(current_row, 20)?;
+                        current_row += 1;
+
+                        if let Some(items) = purchaser["items"].as_array() {
+                            // 按单位分组（保持插入顺序）
+                            let mut unit_groups: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+                            for item in items {
+                                let unit = item["unit"].as_str().unwrap_or("").to_string();
+                                if let Some(pos) = unit_groups.iter().position(|(u, _)| u == &unit) {
+                                    unit_groups[pos].1.push(item);
+                                } else {
+                                    unit_groups.push((unit, vec![item]));
+                                }
+                            }
+
+                            let mut purchaser_total_items = 0i64;
+                            let mut purchaser_total_amount = 0.0;
+
+                            for (unit, group_items) in &unit_groups {
+                                let mut seq = 1;
+                                let mut unit_amount = 0.0;
+                                for item in group_items {
+                                    let product_name = item["product_name"].as_str().unwrap_or("");
+                                    let quantity = item["quantity"].as_f64().unwrap_or(0.0);
+                                    let pre_sale_quantity = item["pre_sale_quantity"].as_f64().unwrap_or(0.0);
+                                    let amount = item["amount"].as_f64().unwrap_or(0.0);
+                                    let remark = item["remark"].as_str().unwrap_or("");
+
+                                    unit_amount += amount;
+
+                                    worksheet.write_with_format(current_row, 0, seq as f64, &cell_format)?;
+                                    worksheet.write_with_format(current_row, 1, product_name, &cell_left_format)?;
+                                    worksheet.write_with_format(current_row, 2, unit.as_str(), &cell_format)?;
+                                    worksheet.write_with_format(current_row, 3, pre_sale_quantity, &cell_format)?;
+                                    worksheet.write_with_format(current_row, 4, quantity, &cell_format)?;
+                                    worksheet.write_with_format(current_row, 5, "", &cell_format)?;
+                                    worksheet.write_with_format(current_row, 6, amount, &cell_right_format)?;
+                                    worksheet.write_with_format(current_row, 7, remark, &cell_left_format)?;
+                                    current_row += 1;
+                                    seq += 1;
+                                }
+                                let unit_count = group_items.len();
+                                let unit_summary = format!("包装数量: {}", unit_count);
+                                worksheet.merge_range(current_row, 0, current_row, 5, unit_summary.as_str(), &summary_format)?;
+                                worksheet.write_with_format(current_row, 6, unit_amount, &summary_right_format)?;
+                                worksheet.set_row_height(current_row, 18)?;
+                                current_row += 1;
+
+                                purchaser_total_items += unit_count as i64;
+                                purchaser_total_amount += unit_amount;
+                            }
+
+                            // 采购单位小计
+                            let purchaser_total = format!("小计: 包装数量 {}", purchaser_total_items);
+                            worksheet.merge_range(current_row, 0, current_row, 5, purchaser_total.as_str(), &summary_format)?;
+                            worksheet.write_with_format(current_row, 6, purchaser_total_amount, &summary_right_format)?;
+                            worksheet.set_row_height(current_row, 18)?;
                             current_row += 1;
-                            seq += 1;
+
+                            grand_total_items += purchaser_total_items;
+                            grand_total_amount += purchaser_total_amount;
                         }
                     }
                 }
+
+                // 供应商总计
+                let grand_total = format!("总计: 包装数量 {}", grand_total_items);
+                worksheet.merge_range(current_row, 0, current_row, 5, grand_total.as_str(), &grand_total_format)?;
+                worksheet.write_with_format(current_row, 6, grand_total_amount, &grand_total_right_format)?;
+                worksheet.set_row_height(current_row, 22)?;
+                current_row += 1;
             }
-            
-            current_row += 1;
         }
 
         let buf = workbook.save_to_buffer()?;
