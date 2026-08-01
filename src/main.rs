@@ -358,7 +358,15 @@ async fn init_pool() {
     }
     
     init_tables(&pool).await.expect("初始化数据表失败");
-    
+
+    // 一次性修复：重算所有耗材分摊方案的 allocated_amount 与 remaining_balance
+    // 修复历史 bug（replace_remove 冲减负数未计入分摊金额）导致的数据偏差
+    // allocated_amount = SUM(对应 order_supplement_item.amount，含正负)
+    // remaining_balance = total_amount - allocated_amount
+    let _ = sqlx::query(
+        "UPDATE consumable_allocation SET allocated_amount = COALESCE((SELECT SUM(amount) FROM order_supplement_item WHERE source_order_id = consumable_allocation.source_order_id), 0), remaining_balance = total_amount - COALESCE((SELECT SUM(amount) FROM order_supplement_item WHERE source_order_id = consumable_allocation.source_order_id), 0)"
+    ).execute(&pool).await;
+
     // 清理所有孤儿数据（有商品名称的记录保留，用于客户开单备注场景）
     let _ = sqlx::query("DELETE FROM sales_order_item WHERE (unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0) AND (product_name IS NULL OR product_name = '')").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM purchase_order_item WHERE (unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0) AND (product_name IS NULL OR product_name = '')").execute(&pool).await;
@@ -7130,10 +7138,11 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                         </select>
                     </div>
                 </div>
-                <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
+                <div style="border:1px solid #eee;">
                     <table class="table table-sm table-bordered mb-0" id="adjustedOrdersTable">
                         <thead class="thead-light"><tr>
-                            <th>订单号</th><th>采购单位</th><th>订单日期</th>
+                            <th>订单号</th><th>采购单位</th>
+                            <th style="cursor:pointer;white-space:nowrap;" onclick="toggleAdjOrderSort()">订单日期 <span id="adjSortArrow"></span></th>
                             <th>真实金额</th><th>调整金额</th><th>调整后金额</th>
                             <th>调整条数</th><th>最近调整日</th><th>操作</th>
                         </tr></thead>
@@ -7662,6 +7671,13 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
             let adjOrdersPage = 1;
             const adjOrdersPageSize = 10;
             let adjOrderFilterTimer = null;
+            let adjOrderSortOrder = 'desc'; // 订单日期排序：desc 降序 / asc 升序 / 空串 默认(最近调整日)
+
+            function toggleAdjOrderSort() {
+                adjOrderSortOrder = adjOrderSortOrder === 'desc' ? 'asc' : 'desc';
+                adjOrdersPage = 1;
+                loadAdjustedOrders();
+            }
 
             function onAdjOrderFilter() {
                 adjOrdersPage = 1;
@@ -7688,12 +7704,14 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                 const keyword = document.getElementById('adjOrderKeyword').value.trim();
                 const purchaserId = document.getElementById('adjPurchaserFilter').value;
                 const res = await fetch('/api/supplement/adjusted_orders?page=' + adjOrdersPage + '&page_size=' + adjOrdersPageSize +
-                    '&keyword=' + encodeURIComponent(keyword) + '&purchaser_id=' + encodeURIComponent(purchaserId));
+                    '&keyword=' + encodeURIComponent(keyword) + '&purchaser_id=' + encodeURIComponent(purchaserId) +
+                    '&sort_order=' + adjOrderSortOrder);
                 const data = await res.json();
                 const list = data.items || [];
                 window._adjustedOrdersMap = {};
                 list.forEach(o => { window._adjustedOrdersMap[o.id] = o; });
                 document.getElementById('adjustedOrdersCount').textContent = data.total || 0;
+                document.getElementById('adjSortArrow').textContent = adjOrderSortOrder === 'asc' ? '▲' : '▼';
                 document.getElementById('adjSumReal').textContent = (data.total_real_amount || 0).toFixed(2);
                 document.getElementById('adjSumAdjust').textContent = (data.total_adjust_amount || 0).toFixed(2);
                 document.getElementById('adjSumAdjusted').textContent = (data.total_adjusted_amount || 0).toFixed(2);
@@ -9796,6 +9814,10 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         .filter-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
         .filter-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-size: 14px; }
         .filter-bar button.clear { background: #f3f4f6; color: #666; }
+        .history-bar { background: #ecfdf5; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .history-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .history-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #10b981; color: white; font-size: 14px; white-space: nowrap; }
+        .history-bar button.clear { background: #f3f4f6; color: #666; }
         .bottom-bar { background: white; padding: 6px 12px; position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 6px; box-shadow: 0 -2px 8px rgba(0,0,0,0.05); }
         .bottom-bar button { flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; }
         .btn-select-all { background: #f3f4f6; color: #333; }
@@ -9842,6 +9864,12 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         </div>
     </div>
     
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史分拣，留空显示当前待分拣">
+        <button onclick="loadItems()">检索历史分拣</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
     <div class="filter-bar">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
         <button class="clear" onclick="clearSearch()">清除</button>
@@ -9870,7 +9898,10 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
 
         async function loadItems() {
             try {
-                const res = await fetch('/api/sales_order/sort_items_by_supplier');
+                const date = document.getElementById('historyDate').value;
+                let url = '/api/sales_order/sort_items_by_supplier';
+                if (date) url += '?date=' + encodeURIComponent(date);
+                const res = await fetch(url);
                 suppliers = await res.json();
                 loadCheckedState();
                 loadCorrectedQuantities();
@@ -9879,6 +9910,11 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
             } catch (e) {
                 console.error('加载失败:', e);
             }
+        }
+
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
+            loadItems();
         }
 
         function loadCheckedState() {
@@ -10108,7 +10144,10 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         }
 
         function exportExcel() {
-            window.location.href = '/api/sales_order/sort_items_by_supplier_excel';
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/sales_order/sort_items_by_supplier_excel';
+            if (date) url += '?date=' + encodeURIComponent(date);
+            window.location.href = url;
         }
 
         loadItems();
@@ -19183,13 +19222,7 @@ async fn page_supplement() -> Html<String> {
                 if (pendingReplaceLines.length === 0) { alert('请至少添加一条替换商品'); return; }
 
                 const src = targetOrderDetails[idx];
-                const origAmount = src.amount;
-                const replaceTotal = pendingReplaceLines.reduce((s, l) => s + l.amount, 0);
-                const diff = replaceTotal - origAmount;
-                if (Math.abs(diff) > 5.0) {
-                    alert(`替换总金额 ${replaceTotal.toFixed(2)} 元与原明细 ${origAmount.toFixed(2)} 元差额 ${diff.toFixed(2)} 元，超过±5元限制`);
-                    return;
-                }
+                // 添加时不立即校验替换差额，允许组合多条后统一在"保存增项"时检查
 
                 const allocDate = document.getElementById('allocateDateInput').value;
                 const groupTag = 'RPL' + Date.now();
@@ -19209,7 +19242,7 @@ async fn page_supplement() -> Html<String> {
                     unit: src.unit || '',
                     unit_price: src.unit_price,
                     quantity: -src.quantity,
-                    amount: -origAmount,
+                    amount: -src.amount,
                     allocate_date: allocDate,
                     operation_type: 'replace_remove',
                     target_order_item_id: src.id,
@@ -19411,11 +19444,7 @@ async fn page_supplement() -> Html<String> {
                     targetItemId = item.id;
                 }
 
-                const currentAllocSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
-                if (amount > allocationSummary.remaining_balance - currentAllocSum + 5.0) {
-                    alert('增项金额不能超过未分摊余额（允许上浮 5 元尾差）');
-                    return;
-                }
+                // 添加时不立即校验金额，允许组合多条增项；统一在"保存增项"时校验差额（上下 5 元）
 
                 pendingSupplements.push({
                     id: null,
@@ -19445,12 +19474,19 @@ async fn page_supplement() -> Html<String> {
 
             function updateBalanceWarning() {
                 const pendingSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
-                const remaining = allocationSummary ? allocationSummary.remaining_balance - pendingSum : 0;
+                const total = allocationSummary ? allocationSummary.total_amount : 0;
+                const allocated = allocationSummary ? allocationSummary.allocated_amount : 0;
+                const remainingBalance = allocationSummary ? allocationSummary.remaining_balance : 0;
+                // 预计总分摊 = 已分摊(历史已保存) + 本次待保存净额(含正负)
+                const projected = allocated + pendingSum;
+                // 超额 = 预计总分摊 - 耗材总额（等价于 pendingSum - remaining_balance）
+                const over = projected - total;
                 const warn = document.getElementById('balanceWarning');
-                if (remaining < 0) {
-                    warn.textContent = `超出余额 ${Math.abs(remaining).toFixed(2)} 元`;
+                if (Math.abs(over) > 0.005) {
+                    warn.textContent = `耗材总额 ${total.toFixed(2)}｜已分摊 ${allocated.toFixed(2)}｜剩余 ${remainingBalance.toFixed(2)}｜本次 ${pendingSum.toFixed(2)}｜预计总分摊 ${projected.toFixed(2)}（${over > 0 ? '超额' : '结余'} ${Math.abs(over).toFixed(2)} 元，保存时校验）`;
+                    warn.className = 'text-muted ml-2';
                 } else {
-                    warn.textContent = `剩余可分摊: ${remaining.toFixed(2)} 元`;
+                    warn.textContent = `耗材总额 ${total.toFixed(2)}｜已分摊 ${allocated.toFixed(2)}｜本次 ${pendingSum.toFixed(2)}｜预计总分摊 ${projected.toFixed(2)}（平衡）`;
                     warn.className = 'text-success ml-2';
                 }
             }
@@ -19575,6 +19611,24 @@ async fn page_supplement() -> Html<String> {
                     alert('没有待保存的增项');
                     return;
                 }
+                // 保存前校验分摊总额（上下 5 元尾差）
+                const pendingSum = toSave.reduce((sum, s) => sum + s.amount, 0);
+                const total_amount = allocationSummary ? allocationSummary.total_amount : 0;
+                const allocated_amount = allocationSummary ? allocationSummary.allocated_amount : 0;
+                const remaining_balance = allocationSummary ? allocationSummary.remaining_balance : 0;
+                const projected = allocated_amount + pendingSum;  // 预计总分摊
+                const diff = projected - total_amount;            // 与耗材总额的差额
+                if (Math.abs(diff) > 5.0) {
+                    alert(`保存失败：预计总分摊金额超出耗材总额 ${diff.toFixed(2)} 元（超出±5元限制）。` +
+                          `\n\n耗材总额: ${total_amount.toFixed(2)} 元` +
+                          `\n已分摊: ${allocated_amount.toFixed(2)} 元` +
+                          `\n剩余余额: ${remaining_balance.toFixed(2)} 元` +
+                          `\n本次待保存: ${pendingSum.toFixed(2)} 元` +
+                          `\n预计总分摊: ${projected.toFixed(2)} 元` +
+                          `\n超额: ${diff.toFixed(2)} 元` +
+                          `\n\n请调整增项后再保存。`);
+                    return;
+                }
                 for (const item of toSave) {
                     await fetch('/api/supplement/create', {
                         method: 'POST',
@@ -19583,6 +19637,9 @@ async fn page_supplement() -> Html<String> {
                     });
                 }
                 alert('增项保存成功');
+                // 保存成功后立即清空 pending 列表，避免残留条目被重复计入或重复保存
+                pendingSupplements = [];
+                renderPendingSupplements();
                 if (selectedConsumableOrder) {
                     await loadAllocationSummary(selectedConsumableOrder.id);
                     await loadAllocationOrders(selectedConsumableOrder.id);
@@ -19591,6 +19648,8 @@ async fn page_supplement() -> Html<String> {
                     await loadCompareData(selectedTargetOrder.id);
                 }
                 await loadOrdersByPurchaser();
+                // 数据刷新后更新标签，显示保存后的整体分摊状态
+                updateBalanceWarning();
             }
 
             function resetOrderSelection() {
@@ -19988,25 +20047,25 @@ async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> impl 
 
     match result {
         Ok(res) => {
-            // replace_remove 是替换操作中的冲减记录（负数金额），不消耗分摊余额
-            if req.operation_type != "replace_remove" {
-                let _ = sqlx::query(
-                    "UPDATE consumable_allocation SET allocated_amount = allocated_amount + ?, remaining_balance = remaining_balance - ?, status = CASE WHEN remaining_balance - ? <= 0 THEN 2 ELSE 1 END WHERE source_order_id = ?"
-                )
-                .bind(req.amount)
-                .bind(req.amount)
-                .bind(req.amount)
-                .bind(req.source_order_id)
-                .execute(pool())
-                .await;
-                
-                let _ = sqlx::query(
-                    "UPDATE consumable_allocation SET completed_at = datetime('now') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
-                )
-                .bind(req.source_order_id)
-                .execute(pool())
-                .await;
-            }
+            // 所有操作类型（含 replace_remove 冲减负数）都更新分摊余额：
+            // 正数(换入/追加/新增)消耗余额，负数(冲减)释放余额，保证账目平衡
+            let _ = sqlx::query(
+                "UPDATE consumable_allocation SET allocated_amount = allocated_amount + ?, remaining_balance = remaining_balance - ?, status = CASE WHEN remaining_balance - ? <= 0 THEN 2 ELSE 1 END WHERE source_order_id = ?"
+            )
+            .bind(req.amount)
+            .bind(req.amount)
+            .bind(req.amount)
+            .bind(req.source_order_id)
+            .execute(pool())
+            .await;
+
+            // 冲减后若余额回升（remaining>0），需从"已完成"回退到"分摊中"并清空完结时间
+            let _ = sqlx::query(
+                "UPDATE consumable_allocation SET completed_at = datetime('now') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
+            )
+            .bind(req.source_order_id)
+            .execute(pool())
+            .await;
 
             (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "id": res.last_insert_rowid() })).unwrap())
         }
@@ -20056,6 +20115,7 @@ async fn api_adjusted_orders(axum::extract::Query(params): axum::extract::Query<
     let page_size = params.get("page_size").and_then(|v| v.parse::<i64>().ok()).unwrap_or(10).clamp(1, 100);
     let keyword = params.get("keyword").cloned().unwrap_or_default();
     let purchaser_id = params.get("purchaser_id").and_then(|v| v.parse::<i64>().ok());
+    let sort_order = params.get("sort_order").cloned().unwrap_or_default();
     let offset = (page - 1) * page_size;
 
     // 动态筛选条件（参数化绑定）
@@ -20103,6 +20163,13 @@ async fn api_adjusted_orders(axum::extract::Query(params): axum::extract::Query<
         Err(_) => (0.0, 0.0),
     };
 
+    // 排序：点击"订单日期"列头时按订单日期升/降序，否则默认按最近调整日
+    let sort_sql = if sort_order == "asc" || sort_order == "desc" {
+        format!("ORDER BY so.order_date {}, MAX(osi.allocate_date) DESC, so.order_no DESC", sort_order)
+    } else {
+        "ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC".to_string()
+    };
+
     // 分页列表
     let list_sql = format!(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount,
@@ -20115,8 +20182,8 @@ async fn api_adjusted_orders(axum::extract::Query(params): axum::extract::Query<
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          WHERE 1=1{}
          GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name, so.purchaser_id
-         ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC
-         LIMIT ? OFFSET ?", cond_sql
+         {}
+         LIMIT ? OFFSET ?", cond_sql, sort_sql
     );
     let mut list_q = sqlx::query(AssertSqlSafe(list_sql.as_str()));
     if let Some(kw) = &bind_kw { list_q = list_q.bind(kw); }
@@ -20214,34 +20281,34 @@ async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
     match result {
         Ok(res) => {
             if res.rows_affected() > 0 {
-                // replace_remove 记录删除时不回滚分摊金额（创建时也未计入）
-                if operation_type != "replace_remove" {
-                    let _ = sqlx::query(
-                        "UPDATE consumable_allocation SET allocated_amount = allocated_amount - ?, remaining_balance = remaining_balance + ?, status = CASE WHEN remaining_balance + ? < total_amount THEN 1 ELSE 0 END WHERE source_order_id = ? AND status != 3"
-                    )
-                    .bind(amount)
-                    .bind(amount)
-                    .bind(amount)
-                    .bind(source_order_id)
-                    .execute(pool())
-                    .await;
+                // 所有操作类型（含 replace_remove 冲减负数）都回滚分摊金额：
+                // 正数(换入/追加/新增)回滚时 allocated 减回、remaining 加回；
+                // 负数(冲减)回滚时 allocated 加回、remaining 减回（与创建时反向）
+                let _ = sqlx::query(
+                    "UPDATE consumable_allocation SET allocated_amount = allocated_amount - ?, remaining_balance = remaining_balance + ?, status = CASE WHEN remaining_balance + ? < total_amount THEN 1 ELSE 0 END WHERE source_order_id = ? AND status != 3"
+                )
+                .bind(amount)
+                .bind(amount)
+                .bind(amount)
+                .bind(source_order_id)
+                .execute(pool())
+                .await;
 
-                    let _ = sqlx::query(
-                        "UPDATE consumable_allocation SET completed_at = NULL WHERE source_order_id = ? AND status = 2 AND completed_at IS NOT NULL"
-                    )
-                    .bind(source_order_id)
-                    .execute(pool())
-                    .await;
+                let _ = sqlx::query(
+                    "UPDATE consumable_allocation SET completed_at = NULL WHERE source_order_id = ? AND status = 2 AND completed_at IS NOT NULL"
+                )
+                .bind(source_order_id)
+                .execute(pool())
+                .await;
 
-                    // 若已分摊金额已归零，则删除该分摊方案，回到"未分摊"初始态，
-                    // 允许重新勾选明细并再次初始化分摊
-                    let _ = sqlx::query(
-                        "DELETE FROM consumable_allocation WHERE source_order_id = ? AND status != 3 AND allocated_amount <= 0.0001"
-                    )
-                    .bind(source_order_id)
-                    .execute(pool())
-                    .await;
-                }
+                // 若已分摊金额已归零，则删除该分摊方案，回到"未分摊"初始态，
+                // 允许重新勾选明细并再次初始化分摊
+                let _ = sqlx::query(
+                    "DELETE FROM consumable_allocation WHERE source_order_id = ? AND status != 3 AND allocated_amount <= 0.0001"
+                )
+                .bind(source_order_id)
+                .execute(pool())
+                .await;
 
                 (StatusCode::OK, "回滚成功").into_response()
             } else {
@@ -21470,20 +21537,28 @@ async fn api_sales_order_sort_items_by_category_excel() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_sort_items_by_supplier() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 无日期：当前待分拣（pending/sorting）；有日期：检索该日期的历史分拣清单
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
         "SELECT soi.id as item_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY s.name, p.name, soi.product_name"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         {}
+         ORDER BY s.name, p.name, soi.product_name", where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut supplier_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
     
@@ -21536,20 +21611,28 @@ async fn api_sales_order_sort_items_by_supplier() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 无日期：当前待分拣（pending/sorting）；有日期：检索该日期的历史分拣清单
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
         "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY s.name, p.name, soi.product_name"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         {}
+         ORDER BY s.name, p.name, soi.product_name", where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut supplier_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
     
@@ -21663,8 +21746,8 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
         }
         current_row += 1;
 
-        let mut seq = 1;
         for supplier in &result {
+            let mut seq = 1; // 序号在每个供应商内重新从 1 开始
             let supplier_name = supplier["supplier_name"].as_str().unwrap_or("未分配供应商");
             
             let supplier_title = format!("【{}】", supplier_name);
@@ -21709,9 +21792,14 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
 
     match excel_result {
         Ok(buf) => {
+            let filename = if has_date {
+                format!("采购分拣清单_按供应商_{}.xlsx", date)
+            } else {
+                "采购分拣清单_按供应商.xlsx".to_string()
+            };
             let headers = [
                 ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-                ("Content-Disposition", "attachment; filename=\"采购分拣清单_按供应商.xlsx\""),
+                ("Content-Disposition", &format!("attachment; filename=\"{}\"", filename)),
             ];
             (StatusCode::OK, headers, buf).into_response()
         }
