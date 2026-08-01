@@ -162,7 +162,12 @@ fn check_api_route_permission(path: &str) -> Option<&str> {
     } else if path.starts_with("/api/query/stock") || path.starts_with("/api/query/income") || path.starts_with("/api/query/profit") || path.starts_with("/api/query/overview") || path.starts_with("/api/query/category") || path.starts_with("/api/query/document") {
         Some("admin")
     } else if path.starts_with("/api/user/") {
-        Some("super_admin")
+        if path == "/api/user/list" {
+            // 用户列表（用于采购单/销售单经手人选择），采购/销售/管理员均可访问
+            Some("query")
+        } else {
+            Some("super_admin")
+        }
     } else if path.starts_with("/api/system/") {
         Some("super_admin")
     } else if path.starts_with("/api/backup/") {
@@ -806,6 +811,19 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN user_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN handler_phone TEXT")
+        .execute(pool)
+        .await;
+
+    // 用户表增加联系方式字段（用于采购单/销售单打印）
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN phone TEXT")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN remark TEXT")
         .execute(pool)
         .await;
@@ -1173,6 +1191,8 @@ struct PurchaseOrderReq {
     final_amount: f64,
     warehouse_id: i64,
     warehouse_name: String,
+    user_id: Option<i64>,
+    handler_phone: Option<String>,
     items: Vec<PurchaseOrderItemReq>,
     remark: Option<String>,
 }
@@ -4002,6 +4022,13 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         <label>备注：</label>
                         <input type="text" id="remarkInput" class="form-control">
                     </div>
+                    <div class="col-md-3">
+                        <label>经手人：</label>
+                        <select id="handlerSelect" class="form-control" onchange="document.getElementById('handlerId').value = this.value">
+                            <option value="">请选择经手人</option>
+                        </select>
+                        <input type="hidden" id="handlerId" value="">
+                    </div>
                 </div>
 
                 <table class="table table-bordered">
@@ -4160,6 +4187,52 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 }}, 200);
             }});
 
+            // 加载用户列表
+            let users = [];
+            async function loadUsers() {{
+                try {{
+                    const res = await fetch('/api/user/list');
+                    if (res.ok) {{
+                        users = await res.json();
+                        const handlerSelect = document.getElementById('handlerSelect');
+                        if (handlerSelect) {{
+                            const currentVal = handlerSelect.value;
+                            handlerSelect.innerHTML = '<option value="">请选择经手人</option>';
+                            users.forEach(u => {{
+                                const name = u.nickname || u.username || '';
+                                if (name) {{
+                                    handlerSelect.innerHTML += '<option value="' + u.id + '">' + name + (u.phone ? ' (' + u.phone + ')' : '') + '</option>';
+                                }}
+                            }});
+                            if (currentVal) handlerSelect.value = currentVal;
+                        }}
+                    }}
+                }} catch (e) {{}}
+            }}
+            loadUsers();
+
+            // 导出采购单（打印模板样式）
+            async function exportPurchaseOrder(orderId) {{
+                if (users.length === 0) {{ await loadUsers(); }}
+                let uid = 0;
+                let opts = '0. 无经手人（使用订单已存）\\n';
+                users.forEach((u, idx) => {{
+                    const name = u.nickname || u.username || '';
+                    if (name) {{ opts += (idx+1) + '. ' + name + (u.phone ? ' (' + u.phone + ')' : '') + '\\n'; }}
+                }});
+                const input = prompt('请选择经手人编号：\\n' + opts, '0');
+                if (input === null) return;
+                const choice = parseInt(input);
+                if (isNaN(choice)) return;
+                if (choice === 0) {{
+                    uid = 0;
+                }} else if (choice > 0 && choice <= users.length) {{
+                    const selected = users[choice - 1];
+                    uid = selected ? (selected.id || 0) : 0;
+                }}
+                window.location = '/api/purchase_order/export_print/' + orderId + (uid > 0 ? '?user_id=' + uid : '');
+            }}
+
             function showSupplierDropdown(filter) {{
                 const dropdown = document.getElementById('supplierDropdown');
                 let list = suppliers;
@@ -4280,6 +4353,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + (order.final_amount || 0).toFixed(2) + '</td>' +
                         '<td>' + order.status + '</td>' +
                         '<td>' +
+                        '<button onclick="event.stopPropagation(); exportPurchaseOrder(' + order.id + ')" class="btn btn-info btn-sm me-1">导出采购单</button>' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
                 }});
@@ -4542,6 +4616,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
+                    user_id: parseInt(document.getElementById('handlerId').value) || null,
                     items: validItems,
                     remark: document.getElementById('remarkInput').value || null
                 }};
@@ -4569,6 +4644,17 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('remarkInput').value = order.remark || '';
                 document.getElementById('discountRateInput').value = order.discount_rate || 0;
                 document.getElementById('amountReductionInput').value = order.amount_reduction || 0;
+                // 回显经手人
+                const handlerSelect = document.getElementById('handlerSelect');
+                const handlerId = order.user_id || 0;
+                if (handlerSelect) {{
+                    if (!handlerSelect.querySelector('option[value=\"' + handlerId + '\"]') && handlerId > 0) {{
+                        // 用户列表可能还没加载好，先放默认
+                        await loadUsers();
+                    }}
+                    handlerSelect.value = String(handlerId);
+                    document.getElementById('handlerId').value = String(handlerId);
+                }}
                 
                 items = [];
                 for (const item of order.items) {{
@@ -10362,6 +10448,23 @@ async fn api_system_config(Json(data): Json<std::collections::HashMap<String, St
     (StatusCode::OK, "设置保存成功".to_string())
 }
 
+async fn api_user_list() -> impl IntoResponse {
+    let rows = sqlx::query("SELECT id, username, nickname, phone, role, status FROM user_account WHERE status = 1 ORDER BY id")
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    let list: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "username": r.get::<String, _>("username"),
+            "nickname": r.get::<Option<String>, _>("nickname").unwrap_or_default(),
+            "phone": r.get::<Option<String>, _>("phone").unwrap_or_default(),
+            "role": r.get::<String, _>("role"),
+        })
+    }).collect();
+    (StatusCode::OK, serde_json::to_string(&list).unwrap())
+}
+
 async fn api_user_get(Path(id): Path<i64>) -> impl IntoResponse {
     let rows = sqlx::query("SELECT id, username, nickname, role, status FROM user_account WHERE id = ?")
         .bind(id)
@@ -13540,7 +13643,7 @@ async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
 
 async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
     let result = sqlx::query(
-        "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, user_id, handler_phone, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -13551,6 +13654,8 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
     .bind(req.final_amount)
     .bind(req.warehouse_id)
     .bind(&req.warehouse_name)
+    .bind(req.user_id.unwrap_or(0))
+    .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
     .execute(pool())
     .await;
@@ -13696,7 +13801,7 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
 
 async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     let order_row = sqlx::query(
-        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name
+        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, s.name as supplier_name
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id WHERE po.id = ?"
     )
     .bind(id)
@@ -13762,7 +13867,7 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
         Ok(_) => {}
     }
     let result = sqlx::query(
-        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ? WHERE id = ?"
+        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ? WHERE id = ?"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -13773,6 +13878,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
     .bind(req.final_amount)
     .bind(req.warehouse_id)
     .bind(&req.warehouse_name)
+    .bind(req.user_id.unwrap_or(0))
+    .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
     .bind(req.id)
     .execute(pool())
@@ -13929,6 +14036,273 @@ async fn api_purchase_order_export() -> impl IntoResponse {
         ).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("导出失败: {}", e)).into_response(),
     }
+}
+
+// 导出采购单（打印模板样式）：单张采购单按打印模板格式导出
+async fn api_purchase_order_print_excel(
+    Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let (order, items) = match get_purchase_order_with_items(id).await {
+        Some(v) => v,
+        None => return (StatusCode::NOT_FOUND, "采购订单不存在".to_string()).into_response(),
+    };
+
+    // 如果传入了 user_id 则优先使用参数里的；否则使用订单里存的
+    let (mut handler_name, mut handler_phone) = (
+        order.user_name.clone().unwrap_or_default(),
+        order.handler_phone.clone().unwrap_or_default(),
+    );
+    if let Some(uid_str) = params.get("user_id").or(params.get("userId")) {
+        if let Ok(uid) = uid_str.parse::<i64>() {
+            if uid > 0 {
+                if let Some(u) = get_user_by_id(uid).await {
+                    handler_name = u.nickname;
+                    handler_phone = u.phone;
+                }
+            }
+        }
+    }
+    let export_filename = format!("采购单_{}.xlsx", order.order_no);
+
+    let title_format = Format::new()
+        .set_bold()
+        .set_font_size(16)
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter);
+    let header_format = Format::new()
+        .set_bold()
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    let cell_center = Format::new()
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    // 合并单元格左对齐格式
+    let info_left = Format::new()
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter);
+    let sum_left_noline = Format::new()
+        .set_bold()
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter);
+    // 货币格式（¥ 前缀，右对齐）
+    let currency_right = Format::new()
+        .set_num_format("¥#,##0.00")
+        .set_align(FormatAlign::Right)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    let cell_left = Format::new()
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    let cell_right = Format::new()
+        .set_align(FormatAlign::Right)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+
+    let result: Result<Vec<u8>, XlsxError> = (move || {
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.set_name("采购单")?;
+        // 页面设置：241-2S 两层两等份，0 页眉页脚，0 左右边距，水平居中，横向
+        ws.set_landscape();
+        ws.set_margins(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        ws.set_print_center_horizontally(true);
+
+        // 列宽：A(28:品名规格/标签+值) B(8)+C(10)+D(12)=30 E(12)+F(18)=30
+        ws.set_column_width(0, 20)?;
+        ws.set_column_width(1, 5)?;
+        ws.set_column_width(2, 6)?;
+        ws.set_column_width(3, 8)?;
+        ws.set_column_width(4, 10)?;
+        ws.set_column_width(5, 18)?;
+
+        // 行 0: 标题（采购单），合并 A-F
+        ws.merge_range(0, 0, 0, 5, "采购单", &title_format)?;
+        ws.set_row_height(0, 28)?;
+
+        // ---- 排版：B2+C2+D2 / B3+C3+D3 / B4+C4+D4 合并 ----
+        // A列="标签：值", B+C+D="标签：值", E+F="标签：值"
+        // ---- 241-2S 两层两等份，横向，0 边距，水平居中 ----
+        // ---------------------
+
+        let warehouse = order.warehouse_name.clone().unwrap_or_default();
+        let order_no = order.order_no.clone();
+        let order_date = order.order_date.clone();
+        let supplier_name = order.supplier_name.clone().unwrap_or_default();
+        let supplier_phone = order.supplier_phone.clone().unwrap_or_default();
+        let supplier_addr = order.supplier_address.clone().unwrap_or_default();
+        let remark_val = order.remark.clone().unwrap_or_default();
+
+        // 行 2: A="订单号：POxxx", B+C+D="日期：2026-08-01", E+F="仓库：仓库名"
+        let cell_a2 = format!("订单号：{}", order_no);
+        let cell_bcd2 = format!("日期：{}", order_date);
+        let cell_ef2 = format!("仓库：{}", warehouse);
+        ws.write_with_format(2, 0, cell_a2.as_str(), &info_left)?;
+        ws.merge_range(2, 1, 2, 3, cell_bcd2.as_str(), &info_left)?;
+        ws.merge_range(2, 4, 2, 5, cell_ef2.as_str(), &info_left)?;
+
+        // 行 3: A="供应商：马彪蔬果批发", B+C+D="联系：138xxxx", E+F="地址：xxx"
+        let cell_a3 = format!("供应商：{}", supplier_name);
+        let cell_bcd3 = format!("联系：{}", supplier_phone);
+        let cell_ef3 = format!("地址：{}", supplier_addr);
+        ws.write_with_format(3, 0, cell_a3.as_str(), &info_left)?;
+        ws.merge_range(3, 1, 3, 3, cell_bcd3.as_str(), &info_left)?;
+        ws.merge_range(3, 4, 3, 5, cell_ef3.as_str(), &info_left)?;
+
+        // 行 4: A="经手人：管理员", B+C+D="联系：xxx", E+F="备注：xxx"
+        let cell_a4 = format!("经手人：{}", handler_name);
+        let cell_bcd4 = format!("联系：{}", handler_phone);
+        let cell_ef4 = format!("备注：{}", remark_val);
+        ws.write_with_format(4, 0, cell_a4.as_str(), &info_left)?;
+        ws.merge_range(4, 1, 4, 3, cell_bcd4.as_str(), &info_left)?;
+        ws.merge_range(4, 4, 4, 5, cell_ef4.as_str(), &info_left)?;
+
+        // 行 5: 间隔行，行高 6
+        ws.set_row_height(5, 6)?;
+
+        // 行 6: 表头（与信息行间隔 1 行）
+        let header_row = 6u32;
+        let headers = ["品名规格", "单位", "数量", "单价", "金额", "备注"];
+        for (i, h) in headers.iter().enumerate() {
+            ws.write_with_format(header_row, i as u16, *h, &header_format)?;
+        }
+        ws.set_row_height(header_row, 22)?;
+
+        // 明细行（至少留 8 行空行便于填写）
+        let total_rows = if items.len() > 8 { items.len() } else { 8 };
+        let data_start = 7usize;
+        for i in 0..total_rows {
+            let row = data_start + i;
+            if i < items.len() {
+                let it = &items[i];
+                let name_spec = if let Some(spec) = it.spec.clone() {
+                    if spec.trim().is_empty() { it.product_name.clone() } else { format!("{} {}", it.product_name, spec) }
+                } else { it.product_name.clone() };
+                ws.write_with_format(row as u32, 0, name_spec, &cell_left)?;
+                ws.write_with_format(row as u32, 1, it.unit.clone().unwrap_or_default(), &cell_center)?;
+                ws.write_with_format(row as u32, 2, it.quantity, &cell_right)?;
+                ws.write_with_format(row as u32, 3, it.unit_price, &currency_right)?;
+                ws.write_with_format(row as u32, 4, it.amount, &currency_right)?;
+                ws.write_with_format(row as u32, 5, it.remark.clone().unwrap_or_default(), &cell_left)?;
+            } else {
+                for c in 0u16..6 {
+                    ws.write_with_format(row as u32, c, "", &cell_center)?;
+                }
+            }
+            ws.set_row_height(row as u32, 22)?;
+        }
+
+        let sum_row = (data_start + total_rows) as u32;
+
+        // ---- 合计排版（A*+B* | C*+D* | E*+F* 同一行，全部靠左）----
+        let cell_sum = format!("合计金额: ¥{:.2}", order.total_amount);
+        let cell_discount = format!("折减金额: ¥{:.2}", order.amount_reduction);
+        let cell_final = format!("最终合计: ¥{:.2}", order.final_amount);
+        ws.merge_range(sum_row, 0, sum_row, 1, cell_sum.as_str(), &sum_left_noline)?;
+        ws.merge_range(sum_row, 2, sum_row, 3, cell_discount.as_str(), &sum_left_noline)?;
+        ws.merge_range(sum_row, 4, sum_row, 5, cell_final.as_str(), &sum_left_noline)?;
+
+        wb.save_to_buffer()
+    })();
+
+    match result {
+        Ok(data) => xlsx_response(data, export_filename.as_str()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("导出失败: {}", e)).into_response(),
+    }
+}
+
+#[derive(Debug)]
+struct PurchaseOrderPrint {
+    order_no: String,
+    order_date: String,
+    total_amount: f64,
+    amount_reduction: f64,
+    final_amount: f64,
+    warehouse_name: Option<String>,
+    remark: Option<String>,
+    supplier_name: Option<String>,
+    supplier_phone: Option<String>,
+    supplier_address: Option<String>,
+    user_name: Option<String>,
+    handler_phone: Option<String>,
+}
+
+#[derive(Debug)]
+struct PurchaseOrderPrintItem {
+    product_name: String,
+    spec: Option<String>,
+    unit: Option<String>,
+    quantity: f64,
+    unit_price: f64,
+    amount: f64,
+    remark: Option<String>,
+}
+
+struct UserSimple { nickname: String, phone: String }
+
+async fn get_purchase_order_with_items(id: i64) -> Option<(PurchaseOrderPrint, Vec<PurchaseOrderPrintItem>)> {
+    let order = sqlx::query_as::<_, (
+        String, String, f64, f64, f64, Option<String>, Option<String>,
+        Option<String>, Option<String>, Option<String>, Option<String>, Option<String>,
+    )>(
+        "SELECT po.order_no, po.order_date, po.total_amount, po.amount_reduction, po.final_amount,
+                po.warehouse_name, po.remark,
+                s.name, s.phone, s.address,
+                u.nickname, po.handler_phone
+         FROM purchase_order po
+         JOIN supplier s ON po.supplier_id = s.id
+         LEFT JOIN user_account u ON po.user_id = u.id
+         WHERE po.id = ?"
+    )
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()?;
+
+    let (order_no, order_date, total_amount, amount_reduction, final_amount, warehouse_name, remark,
+         supplier_name, supplier_phone, supplier_address, user_name, handler_phone) = order;
+
+    let item_rows = sqlx::query_as::<_, (
+        String, Option<String>, Option<String>, f64, f64, f64, Option<String>
+    )>(
+        "SELECT product_name, spec, unit, quantity, unit_price, amount, remark FROM purchase_order_item WHERE order_id = ? ORDER BY id"
+    )
+        .bind(id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    let items: Vec<PurchaseOrderPrintItem> = item_rows
+        .into_iter()
+        .map(|(product_name, spec, unit, quantity, unit_price, amount, remark)| {
+            PurchaseOrderPrintItem { product_name, spec, unit, quantity, unit_price, amount, remark }
+        })
+        .collect();
+
+    Some((
+        PurchaseOrderPrint {
+            order_no, order_date, total_amount, amount_reduction, final_amount,
+            warehouse_name, remark, supplier_name, supplier_phone, supplier_address,
+            user_name, handler_phone,
+        },
+        items,
+    ))
+}
+
+async fn get_user_by_id(id: i64) -> Option<UserSimple> {
+    sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT nickname, COALESCE(NULLIF(phone, ''), '') as phone FROM user_account WHERE id = ?"
+    )
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()
+        .map(|(nickname, phone)| UserSimple { nickname, phone: phone.unwrap_or_default() })
 }
 
 async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
@@ -22089,6 +22463,7 @@ fn build_router() -> Router {
         .route("/backup", get(page_backup))
         .route("/restore", get(page_restore))
         .route("/api/system/config", post(api_system_config))
+        .route("/api/user/list", get(api_user_list))
         .route("/api/user/{id}", get(api_user_get))
         .route("/api/user", post(api_user_create))
         .route("/api/user/{id}", put(api_user_update))
@@ -22154,6 +22529,7 @@ fn build_router() -> Router {
         .route("/api/purchase_order/update", post(api_purchase_order_update))
         .route("/api/purchase_order/delete/{id}", delete(api_purchase_order_delete))
         .route("/api/purchase_order/export", get(api_purchase_order_export))
+        .route("/api/purchase_order/export_print/{id}", get(api_purchase_order_print_excel))
         .route("/api/purchase_order/import", post(api_purchase_order_import))
         .route("/api/sales_order/create", post(api_sales_order_create))
         .route("/api/sales_order/list", get(api_sales_order_list))
