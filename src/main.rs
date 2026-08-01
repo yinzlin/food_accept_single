@@ -7118,6 +7118,18 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                     <h6 class="mb-0">有变更的订单列表 <span class="badge badge-info" id="adjustedOrdersCount">0</span></h6>
                     <button class="btn btn-xs btn-outline-secondary" onclick="loadAdjustedOrders()">刷新</button>
                 </div>
+                <div class="row mb-2">
+                    <div class="col-md-4">
+                        <label class="small">订单号搜索：</label>
+                        <input type="text" id="adjOrderKeyword" class="form-control form-control-sm" placeholder="输入订单号搜索" oninput="onAdjOrderFilter()">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="small">采购单位筛选：</label>
+                        <select id="adjPurchaserFilter" class="form-control form-control-sm" onchange="onAdjOrderFilter()">
+                            <option value="">全部单位</option>
+                        </select>
+                    </div>
+                </div>
                 <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
                     <table class="table table-sm table-bordered mb-0" id="adjustedOrdersTable">
                         <thead class="thead-light"><tr>
@@ -7127,6 +7139,14 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                         </tr></thead>
                         <tbody><tr><td colspan="9" class="text-center text-muted small">暂无</td></tr></tbody>
                     </table>
+                </div>
+                <div class="d-flex justify-content-between align-items-center mt-2">
+                    <div class="small text-muted">
+                        合计：真实金额 <strong>¥<span id="adjSumReal">0.00</span></strong>
+                        ｜ 调整金额 <strong>¥<span id="adjSumAdjust">0.00</span></strong>
+                        ｜ 调整后金额 <strong>¥<span id="adjSumAdjusted">0.00</span></strong>
+                    </div>
+                    <nav><ul class="pagination pagination-sm mb-0" id="adjustedOrdersPager"></ul></nav>
                 </div>
             </div>
         </div>
@@ -7639,16 +7659,49 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                 }
             }
 
+            let adjOrdersPage = 1;
+            const adjOrdersPageSize = 10;
+            let adjOrderFilterTimer = null;
+
+            function onAdjOrderFilter() {
+                adjOrdersPage = 1;
+                clearTimeout(adjOrderFilterTimer);
+                adjOrderFilterTimer = setTimeout(loadAdjustedOrders, 300);
+            }
+
+            async function initAdjPurchaserFilter() {
+                try {
+                    const res = await fetch('/api/purchaser/list');
+                    const list = await res.json();
+                    const sel = document.getElementById('adjPurchaserFilter');
+                    sel.innerHTML = '<option value="">全部单位</option>';
+                    (list || []).forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p.id;
+                        opt.textContent = p.name;
+                        sel.appendChild(opt);
+                    });
+                } catch (e) { console.error('加载采购单位失败', e); }
+            }
+
             async function loadAdjustedOrders() {
-                const res = await fetch('/api/supplement/adjusted_orders');
-                const list = await res.json();
+                const keyword = document.getElementById('adjOrderKeyword').value.trim();
+                const purchaserId = document.getElementById('adjPurchaserFilter').value;
+                const res = await fetch('/api/supplement/adjusted_orders?page=' + adjOrdersPage + '&page_size=' + adjOrdersPageSize +
+                    '&keyword=' + encodeURIComponent(keyword) + '&purchaser_id=' + encodeURIComponent(purchaserId));
+                const data = await res.json();
+                const list = data.items || [];
                 window._adjustedOrdersMap = {};
                 list.forEach(o => { window._adjustedOrdersMap[o.id] = o; });
+                document.getElementById('adjustedOrdersCount').textContent = data.total || 0;
+                document.getElementById('adjSumReal').textContent = (data.total_real_amount || 0).toFixed(2);
+                document.getElementById('adjSumAdjust').textContent = (data.total_adjust_amount || 0).toFixed(2);
+                document.getElementById('adjSumAdjusted').textContent = (data.total_adjusted_amount || 0).toFixed(2);
                 const tbody = document.querySelector('#adjustedOrdersTable tbody');
-                document.getElementById('adjustedOrdersCount').textContent = list.length;
                 tbody.innerHTML = '';
                 if (!list.length) {
                     tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted small">暂无</td></tr>';
+                    renderAdjustedPager(data.total || 0);
                     return;
                 }
                 list.forEach(o => {
@@ -7668,6 +7721,34 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td><button class="btn btn-xs btn-outline-primary" onclick="selectAdjOrderById(' + o.id + ')">查看</button></td>';
                     tbody.appendChild(tr);
                 });
+                renderAdjustedPager(data.total || 0);
+            }
+
+            function renderAdjustedPager(total) {
+                const pages = Math.max(1, Math.ceil(total / adjOrdersPageSize));
+                const ul = document.getElementById('adjustedOrdersPager');
+                ul.innerHTML = '';
+                const prevLi = document.createElement('li');
+                prevLi.className = 'page-item' + (adjOrdersPage <= 1 ? ' disabled' : '');
+                prevLi.innerHTML = '<a class="page-link" href="javascript:void(0)">上一页</a>';
+                prevLi.onclick = () => { if (adjOrdersPage > 1) { adjOrdersPage--; loadAdjustedOrders(); } };
+                ul.appendChild(prevLi);
+                const maxShow = 5;
+                let start = Math.max(1, adjOrdersPage - Math.floor(maxShow / 2));
+                let end = Math.min(pages, start + maxShow - 1);
+                start = Math.max(1, end - maxShow + 1);
+                for (let p = start; p <= end; p++) {
+                    const li = document.createElement('li');
+                    li.className = 'page-item' + (p === adjOrdersPage ? ' active' : '');
+                    li.innerHTML = '<a class="page-link" href="javascript:void(0)">' + p + '</a>';
+                    li.onclick = (() => { const pp = p; return () => { adjOrdersPage = pp; loadAdjustedOrders(); }; })();
+                    ul.appendChild(li);
+                }
+                const nextLi = document.createElement('li');
+                nextLi.className = 'page-item' + (adjOrdersPage >= pages ? ' disabled' : '');
+                nextLi.innerHTML = '<a class="page-link" href="javascript:void(0)">下一页</a>';
+                nextLi.onclick = () => { if (adjOrdersPage < pages) { adjOrdersPage++; loadAdjustedOrders(); } };
+                ul.appendChild(nextLi);
             }
 
             function selectAdjOrderById(id) {
@@ -7675,7 +7756,8 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                 if (o) selectAdjOrder(o);
             }
 
-            // 页面初始载入变更订单列表
+            // 页面初始载入采购单位列表与变更订单列表
+            initAdjPurchaserFilter();
             loadAdjustedOrders();
         </script>
     "####;
@@ -19968,23 +20050,78 @@ async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoRe
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
-async fn api_adjusted_orders() -> impl IntoResponse {
+async fn api_adjusted_orders(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     // 列出所有收到分摊增项/调整的目标订单（target_order_id 指向该订单即视为有变更）
-    let rows = sqlx::query(
+    let page = params.get("page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).max(1);
+    let page_size = params.get("page_size").and_then(|v| v.parse::<i64>().ok()).unwrap_or(10).clamp(1, 100);
+    let keyword = params.get("keyword").cloned().unwrap_or_default();
+    let purchaser_id = params.get("purchaser_id").and_then(|v| v.parse::<i64>().ok());
+    let offset = (page - 1) * page_size;
+
+    // 动态筛选条件（参数化绑定）
+    let mut conds: Vec<String> = Vec::new();
+    let mut bind_kw: Option<String> = None;
+    let mut bind_pid: Option<i64> = None;
+    if !keyword.trim().is_empty() {
+        bind_kw = Some(format!("%{}%", keyword.trim()));
+        conds.push("so.order_no LIKE ?".to_string());
+    }
+    if let Some(pid) = purchaser_id {
+        bind_pid = Some(pid);
+        conds.push("so.purchaser_id = ?".to_string());
+    }
+    let cond_sql = if conds.is_empty() { String::new() } else { format!(" AND {}", conds.join(" AND ")) };
+
+    // 总数
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM (
+            SELECT so.id FROM sales_order so
+            INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
+            WHERE 1=1{} GROUP BY so.id
+        ) t", cond_sql
+    );
+    let mut count_q = sqlx::query(AssertSqlSafe(count_sql.as_str()));
+    if let Some(kw) = &bind_kw { count_q = count_q.bind(kw); }
+    if let Some(pid) = bind_pid { count_q = count_q.bind(pid); }
+    let total: i64 = count_q.fetch_one(pool()).await.map(|r| r.get::<i64, _>(0)).unwrap_or(0);
+
+    // 合计（所有匹配订单）
+    let sum_sql = format!(
+        "SELECT COALESCE(SUM(sub.total_amount), 0), COALESCE(SUM(sub.adjust_amount), 0)
+         FROM (
+            SELECT so.id, so.total_amount, COALESCE(SUM(osi.amount), 0) as adjust_amount
+            FROM sales_order so
+            INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
+            WHERE 1=1{} GROUP BY so.id, so.total_amount
+         ) sub", cond_sql
+    );
+    let mut sum_q = sqlx::query(AssertSqlSafe(sum_sql.as_str()));
+    if let Some(kw) = &bind_kw { sum_q = sum_q.bind(kw); }
+    if let Some(pid) = bind_pid { sum_q = sum_q.bind(pid); }
+    let (sum_real, sum_adjust) = match sum_q.fetch_one(pool()).await {
+        Ok(r) => (r.get::<f64, _>(0), r.get::<f64, _>(1)),
+        Err(_) => (0.0, 0.0),
+    };
+
+    // 分页列表
+    let list_sql = format!(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount,
-                p.name as purchaser_name,
+                p.name as purchaser_name, so.purchaser_id,
                 COALESCE(SUM(osi.amount), 0) as adjust_amount,
                 COUNT(osi.id) as adjust_count,
                 MAX(osi.allocate_date) as last_adjust_date
          FROM sales_order so
          INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
-         GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name
-         ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         WHERE 1=1{}
+         GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name, so.purchaser_id
+         ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC
+         LIMIT ? OFFSET ?", cond_sql
+    );
+    let mut list_q = sqlx::query(AssertSqlSafe(list_sql.as_str()));
+    if let Some(kw) = &bind_kw { list_q = list_q.bind(kw); }
+    if let Some(pid) = bind_pid { list_q = list_q.bind(pid); }
+    let rows = list_q.bind(page_size).bind(offset).fetch_all(pool()).await.unwrap_or_default();
 
     let items: Vec<serde_json::Value> = rows.iter().map(|row| {
         let total: f64 = row.get::<f64, _>("total_amount");
@@ -19994,6 +20131,7 @@ async fn api_adjusted_orders() -> impl IntoResponse {
             "order_no": row.get::<String, _>("order_no"),
             "order_date": row.get::<String, _>("order_date"),
             "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "purchaser_id": row.get::<i64, _>("purchaser_id"),
             "total_amount": total,
             "adjust_amount": adjust,
             "adjusted_total": total + adjust,
@@ -20002,7 +20140,17 @@ async fn api_adjusted_orders() -> impl IntoResponse {
         })
     }).collect();
 
-    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+    let resp = serde_json::json!({
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_real_amount": sum_real,
+        "total_adjust_amount": sum_adjust,
+        "total_adjusted_amount": sum_real + sum_adjust,
+        "items": items,
+    });
+
+    (StatusCode::OK, resp.to_string())
 }
 
 async fn api_supplement_list_by_source(Path(order_id): Path<i64>) -> impl IntoResponse {
@@ -20349,7 +20497,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
         let food_name = if alias2.is_empty() {
             product_name
         } else {
-            format!("{}({})", product_name, alias2)
+            alias2
         };
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
         // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
@@ -20415,7 +20563,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             // new_item 或 replace_add：作为新明细导出，按商品类别归类排序
             let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
             let product_name = r.get::<String, _>("product_name");
-            let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
+            let food_name = if alias2.is_empty() { product_name } else { alias2 };
             // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
             // 优先取分摊增项的 unit，为空时回退到商品表的基础单位 base_unit
             let unit = {
@@ -20485,7 +20633,9 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             .set_font_size(10)
             .set_align(FormatAlign::Left)
             .set_align(FormatAlign::VerticalCenter)
-            .set_border(FormatBorder::Thin);
+            .set_border(FormatBorder::Thin)
+            // .set_text_wrap();// 自动换行
+            .set_shrink();// 自动缩放
 
         let cell_right_format = Format::new()
             .set_font_size(10)
@@ -20522,16 +20672,16 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             .set_align(FormatAlign::Left)
             .set_align(FormatAlign::VerticalCenter);
 
-        let col_widths = [4.0, 14.0, 7.0, 7.0, 7.0, 8.0, 10.0, 7.0, 11.0, 11.0, 11.0, 14.0, 10.0];
+        let col_widths = [4.0, 20.0, 4.0, 6.0, 8.0, 10.0, 10.0, 6.0, 10.0, 10.0, 10.0, 15.0, 10.0];
         for (i, w) in col_widths.iter().enumerate() {
             worksheet.set_column_width(i as u16, *w)?;
         }
 
         let headers = [
-            "序号".to_string(), "食材名称".to_string(), "规格".to_string(), "数量".to_string(), "单价".to_string(), "总价".to_string(),
-            "生产日期/批号".to_string(), "保质期".to_string(), "是否有蔬菜农残检测报告单".to_string(),
-            "是否有肉类检疫合格证".to_string(), "是否异常(异味、异色)".to_string(),
-            "检验情况是否合格".to_string(), "备注".to_string(),
+            "序号".to_string(), "品名规格".to_string(), "单位".to_string(), "数量".to_string(), "单价".to_string(), "总价".to_string(),
+            "生产日期\n/批号".to_string(), "保质期".to_string(), "是否有蔬\n菜农残检\n测报告单".to_string(),
+            "是否有肉\n类检疫合\n格证".to_string(), "是否异常\n(异味异色)".to_string(),
+            "检验情况\n是否合格".to_string(), "备注".to_string(),
         ];
 
         let items_per_page = 20;
@@ -20570,10 +20720,10 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
                 worksheet.write_with_format(current_row, 5, *amount, &money_format)?;
                 worksheet.write_with_format(current_row, 6, "", &cell_format)?;
                 worksheet.write_with_format(current_row, 7, "", &cell_format)?;
-                worksheet.write_with_format(current_row, 8, "□有  □无", &cell_format)?;
-                worksheet.write_with_format(current_row, 9, "□有  □无", &cell_format)?;
-                worksheet.write_with_format(current_row, 10, "□有  □无", &cell_format)?;
-                worksheet.write_with_format(current_row, 11, "□合格  □不合格", &cell_format)?;
+                worksheet.write_with_format(current_row, 8, "□有 □无", &cell_format)?;
+                worksheet.write_with_format(current_row, 9, "□有 □无", &cell_format)?;
+                worksheet.write_with_format(current_row, 10, "□有 □无", &cell_format)?;
+                worksheet.write_with_format(current_row, 11, "□合格 □不合格", &cell_format)?;
                 worksheet.write_with_format(current_row, 12, remark, &cell_left_format)?;
 
                 current_row += 1;
