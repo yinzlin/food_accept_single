@@ -4454,17 +4454,17 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
+                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm"></td>
                             <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td style="width:85px"><input type="text" value="${{item.ordered_quantity != null && item.ordered_quantity > 0 ? item.ordered_quantity.toFixed(2) : ''}}" onchange="updateOrderedQty(${{index}}, this)" class="form-control-sm text-right" placeholder="订购数量"></td>
-                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{item.ordered_quantity != null && item.ordered_quantity > 0 ? item.ordered_quantity.toFixed(2) : ''}}" onchange="updateOrderedQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'ordered_quantity')" class="form-control-sm text-right" placeholder="订购数量" enterkeyhint="next"></td>
+                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'quantity')" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'unit_price')" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td style="width:110px">${{item.amount.toFixed(2)}}</td>
-                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
+                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'remark')" class="form-control-sm" placeholder="单品备注" enterkeyhint="next"></td>
                             <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
                     `;
@@ -4593,33 +4593,41 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].ordered_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
             }}
 
-            function handleEnterKey(event, index, cellIndex) {{
+            function handleEnterKey(event, index, field) {{
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
                 if (enterKeys.includes(event.key) || event.keyCode === 13) {{
                     event.preventDefault();
-                    
+
                     const input = event.target;
-                    if (cellIndex === 3) {{
+                    // renderItems 会重建 DOM，先捕获当前列索引用于回车后同列下移
+                    const td = input.closest('td');
+                    const cellIndex = td ? td.cellIndex : -1;
+                    // 回车时同步当前输入值（与 onchange 一致），避免 renderItems 覆盖未提交的值
+                    if (field === 'quantity') {{
                         items[index].quantity = parseFloat(input.value) || 0;
                         items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
                         items[index].amount = items[index].unit_price * items[index].quantity;
-                    }} else if (cellIndex === 4) {{
+                    }} else if (field === 'unit_price') {{
                         items[index].unit_price = parseFloat(input.value) || 0;
                         items[index].amount = items[index].unit_price * items[index].quantity;
+                    }} else if (field === 'ordered_quantity') {{
+                        items[index].ordered_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                    }} else if (field === 'spec') {{
+                        items[index].spec = input.value;
+                    }} else if (field === 'remark') {{
+                        items[index].remark = input.value.trim();
                     }}
                     renderItems();
-                    
+
+                    // WPS 风格：回车同列下一行
                     const nextIndex = index + 1;
-                    if (nextIndex < items.length) {{
-                        const table = document.getElementById('itemsTable');
-                        if (table && table.rows[nextIndex]) {{
-                            const nextRow = table.rows[nextIndex];
-                            if (nextRow.cells[cellIndex]) {{
-                                const targetInput = nextRow.cells[cellIndex].querySelector('input');
-                                if (targetInput) {{
-                                    targetInput.focus();
-                                    try {{ targetInput.select(); }} catch(e) {{}}
-                                }}
+                    if (cellIndex >= 0 && nextIndex < items.length) {{
+                        const tbody = document.getElementById('itemsTable');
+                        if (tbody && tbody.rows[nextIndex] && tbody.rows[nextIndex].cells[cellIndex]) {{
+                            const targetInput = tbody.rows[nextIndex].cells[cellIndex].querySelector('input, select');
+                            if (targetInput) {{
+                                targetInput.focus();
+                                try {{ targetInput.select(); }} catch(e) {{}}
                             }}
                         }}
                     }}
@@ -5081,15 +5089,15 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
+                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm"></td>
                             <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td style="width:85px"><input type="text" value="${{item.pre_sale_quantity != null && item.pre_sale_quantity > 0 ? item.pre_sale_quantity.toFixed(2) : ''}}" onchange="updatePreSaleQty(${{index}}, this)" class="form-control-sm text-right" placeholder="预售数量"></td>
-                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{item.pre_sale_quantity != null && item.pre_sale_quantity > 0 ? item.pre_sale_quantity.toFixed(2) : ''}}" onchange="updatePreSaleQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'pre_sale_quantity')" class="form-control-sm text-right" placeholder="预售数量" enterkeyhint="next"></td>
+                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'quantity')" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'unit_price')" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td style="width:110px">${{item.amount.toFixed(2)}}</td>
                             <td style="width:120px">
                                 <div class="position-relative">
@@ -5105,7 +5113,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="supplierDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
+                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'remark')" class="form-control-sm" placeholder="单品备注" enterkeyhint="next"></td>
                             <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
                     `;
@@ -5238,33 +5246,45 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 renderItems();
             }}
 
-            function handleEnterKey(event, index, cellIndex) {{
+            function handleEnterKey(event, index, field) {{
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
                 if (enterKeys.includes(event.key) || event.keyCode === 13) {{
                     event.preventDefault();
-                    
+
                     const input = event.target;
-                    if (cellIndex === 3) {{
+                    // renderItems 会重建 DOM，先捕获当前列索引用于回车后同列下移
+                    const td = input.closest('td');
+                    const cellIndex = td ? td.cellIndex : -1;
+                    // 回车时同步当前输入值（与 onchange 一致），避免 renderItems 覆盖未提交的值
+                    if (field === 'quantity') {{
                         items[index].quantity = parseFloat(input.value) || 0;
                         items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
                         items[index].amount = items[index].unit_price * items[index].quantity;
-                    }} else if (cellIndex === 4) {{
+                    }} else if (field === 'unit_price') {{
                         items[index].unit_price = parseFloat(input.value) || 0;
                         items[index].amount = items[index].unit_price * items[index].quantity;
+                    }} else if (field === 'pre_sale_quantity') {{
+                        items[index].pre_sale_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                        if (items[index].pre_sale_quantity > 0) {{
+                            items[index].quantity = items[index].pre_sale_quantity;
+                            items[index].amount = items[index].unit_price * items[index].quantity;
+                        }}
+                    }} else if (field === 'spec') {{
+                        items[index].spec = input.value;
+                    }} else if (field === 'remark') {{
+                        items[index].remark = input.value.trim();
                     }}
                     renderItems();
-                    
+
+                    // WPS 风格：回车同列下一行
                     const nextIndex = index + 1;
-                    if (nextIndex < items.length) {{
-                        const table = document.getElementById('itemsTable');
-                        if (table && table.rows[nextIndex]) {{
-                            const nextRow = table.rows[nextIndex];
-                            if (nextRow.cells[cellIndex]) {{
-                                const targetInput = nextRow.cells[cellIndex].querySelector('input');
-                                if (targetInput) {{
-                                    targetInput.focus();
-                                    try {{ targetInput.select(); }} catch(e) {{}}
-                                }}
+                    if (cellIndex >= 0 && nextIndex < items.length) {{
+                        const tbody = document.getElementById('itemsTable');
+                        if (tbody && tbody.rows[nextIndex] && tbody.rows[nextIndex].cells[cellIndex]) {{
+                            const targetInput = tbody.rows[nextIndex].cells[cellIndex].querySelector('input, select');
+                            if (targetInput) {{
+                                targetInput.focus();
+                                try {{ targetInput.select(); }} catch(e) {{}}
                             }}
                         }}
                     }}
