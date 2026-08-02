@@ -840,6 +840,10 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN source_sales_order_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN alias1 TEXT")
         .execute(pool)
         .await;
@@ -5785,14 +5789,37 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
-            async function generatePurchaseOrders(id) {{
-                const res = await fetch('/api/sales_order/generate_purchase/' + id, {{ method: 'POST' }});
-                const data = await res.json();
+            async function generatePurchaseOrders(id, force) {{
+                const f = force ? 1 : 0;
+                const res = await fetch('/api/sales_order/generate_purchase/' + id + '?force=' + f, {{ method: 'POST' }});
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {{
+                    const data = await res.json();
+                    // 已处理的采购订单：不允许重新生成，直接提示
+                    if (data.error) {{
+                        alert(data.message);
+                        return;
+                    }}
+                    // pending 状态的重复：提示确认后删除旧单重新生成
+                    if (data.warning) {{
+                        if (confirm(data.message)) {{
+                            generatePurchaseOrders(id, true);
+                        }}
+                        return;
+                    }}
+                    if (res.ok) {{
+                        alert('成功生成 ' + data.count + ' 张采购订单');
+                        loadOrders();
+                    }} else {{
+                        alert('生成失败：' + (data.message || '未知错误'));
+                    }}
+                    return;
+                }}
                 if (res.ok) {{
-                    alert('成功生成 ' + data.count + ' 张采购订单');
+                    alert('生成成功');
                     loadOrders();
                 }} else {{
-                    alert('生成失败：' + (data.message || '未知错误'));
+                    alert('生成失败：未知错误');
                 }}
             }}
 
@@ -7911,7 +7938,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
     let content = r#"
         <div class="card p-4">
             <h3>真实出入库统计</h3>
-            <p class="text-muted small">真实账套口径：按日汇总采购入库金额与销售出库金额，净额 = 入库金额 - 出库金额。出库金额取自销售订单真实明细，不含分摊增项。</p>
+            <p class="text-muted small">真实账套口径：按日汇总采购入库金额与销售出库金额，下浮后出库金额 = 出库金额 × (1 - 销售订单下浮率/100)，毛利 = 下浮后出库金额 - 入库金额。</p>
             <div class="row mb-3">
                 <div class="col-md-3">
                     <label>开始日期：</label>
@@ -7933,7 +7960,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
             </div>
         </div>
         <div class="row mt-3">
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
                         <div class="small text-muted">合计入库金额</div>
@@ -7941,7 +7968,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                     </div>
                 </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
                         <div class="small text-muted">合计出库金额</div>
@@ -7949,11 +7976,19 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                     </div>
                 </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
-                        <div class="small text-muted">合计净额（入-出）</div>
-                        <div class="h4 mb-0" id="totalNet">0.00</div>
+                        <div class="small text-muted">下浮后合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalDiscountedOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计毛利</div>
+                        <div class="h4 mb-0" id="totalGrossProfit">0.00</div>
                     </div>
                 </div>
             </div>
@@ -7968,9 +8003,10 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                         <th class="text-center">入库单数</th>
                         <th class="text-center">入库条数</th>
                         <th class="text-right">出库金额</th>
+                        <th class="text-right">下浮后出库金额</th>
                         <th class="text-center">出库单数</th>
                         <th class="text-center">出库条数</th>
-                        <th class="text-right">净额</th>
+                        <th class="text-right">毛利</th>
                     </tr>
                 </thead>
                 <tbody id="resultTable"></tbody>
@@ -7998,14 +8034,12 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (!data.rows || data.rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
                 } else {
                     let prevDay = null;
                     data.rows.forEach(it => {
-                        const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
-                        // 汇总行加粗背景
+                        const profitCls = (it.gross_profit || 0) >= 0 ? 'text-success' : 'text-danger';
                         const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
-                        // 如果日期变化，加一个可视分隔
                         const dayDisplay = it.day !== prevDay ? it.day : '';
                         prevDay = it.day;
                         tbody.innerHTML += '<tr style="' + rowStyle + '">' +
@@ -8015,18 +8049,20 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                             '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
                             '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.discounted_out_amount || 0).toFixed(2) + '</td>' +
                             '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
-                            '<td class="text-right ' + netCls + '">' + (it.net_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right ' + profitCls + '">' + (it.gross_profit || 0).toFixed(2) + '</td>' +
                             '</tr>';
                     });
                 }
                 document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
                 document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
-                const net = data.total_net_amount || 0;
-                const netEl = document.getElementById('totalNet');
-                netEl.textContent = net.toFixed(2);
-                netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+                document.getElementById('totalDiscountedOut').textContent = (data.total_discounted_out_amount || 0).toFixed(2);
+                const profit = data.total_gross_profit || 0;
+                const profitEl = document.getElementById('totalGrossProfit');
+                profitEl.textContent = profit.toFixed(2);
+                profitEl.className = 'h4 mb-0 ' + (profit >= 0 ? 'text-success' : 'text-danger');
             }
 
             function exportStockSummary() {
@@ -8049,7 +8085,7 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
     let content = r#"
         <div class="card p-4">
             <h3>报销出入库统计</h3>
-            <p class="text-muted small">报销账套口径：出库金额 = 真实出库 + 分摊增项净额（目标单收到的分摊 − 来源耗材单金额）。入库金额与真实账套一致。</p>
+            <p class="text-muted small">报销账套口径：出库金额 = 真实出库 + 分摊增项净额（目标单收到的分摊 − 来源耗材单金额）。入库金额与真实账套一致。下浮后出库金额按各销售订单的下浮率计算，毛利 = 下浮后出库金额 - 入库金额。</p>
             <div class="row mb-3">
                 <div class="col-md-3">
                     <label>开始日期：</label>
@@ -8071,7 +8107,7 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
             </div>
         </div>
         <div class="row mt-3">
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
                         <div class="small text-muted">合计入库金额</div>
@@ -8079,7 +8115,7 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
                     </div>
                 </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
                         <div class="small text-muted">合计出库金额</div>
@@ -8087,11 +8123,19 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
                     </div>
                 </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
-                        <div class="small text-muted">合计净额（入-出）</div>
-                        <div class="h4 mb-0" id="totalNet">0.00</div>
+                        <div class="small text-muted">下浮后合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalDiscountedOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计毛利</div>
+                        <div class="h4 mb-0" id="totalGrossProfit">0.00</div>
                     </div>
                 </div>
             </div>
@@ -8106,9 +8150,10 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
                         <th class="text-center">入库单数</th>
                         <th class="text-center">入库条数</th>
                         <th class="text-right">出库金额</th>
+                        <th class="text-right">下浮后出库金额</th>
                         <th class="text-center">出库单数</th>
                         <th class="text-center">出库条数</th>
-                        <th class="text-right">净额</th>
+                        <th class="text-right">毛利</th>
                     </tr>
                 </thead>
                 <tbody id="resultTable"></tbody>
@@ -8136,11 +8181,11 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (!data.rows || data.rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
                 } else {
                     let prevDay = null;
                     data.rows.forEach(it => {
-                        const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
+                        const profitCls = (it.gross_profit || 0) >= 0 ? 'text-success' : 'text-danger';
                         const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
                         const dayDisplay = it.day !== prevDay ? it.day : '';
                         prevDay = it.day;
@@ -8151,18 +8196,20 @@ async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> H
                             '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
                             '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.discounted_out_amount || 0).toFixed(2) + '</td>' +
                             '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
-                            '<td class="text-right ' + netCls + '">' + (it.net_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right ' + profitCls + '">' + (it.gross_profit || 0).toFixed(2) + '</td>' +
                             '</tr>';
                     });
                 }
                 document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
                 document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
-                const net = data.total_net_amount || 0;
-                const netEl = document.getElementById('totalNet');
-                netEl.textContent = net.toFixed(2);
-                netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+                document.getElementById('totalDiscountedOut').textContent = (data.total_discounted_out_amount || 0).toFixed(2);
+                const profit = data.total_gross_profit || 0;
+                const profitEl = document.getElementById('totalGrossProfit');
+                profitEl.textContent = profit.toFixed(2);
+                profitEl.className = 'h4 mb-0 ' + (profit >= 0 ? 'text-success' : 'text-danger');
             }
 
             function exportStockSummary() {
@@ -16282,7 +16329,12 @@ async fn api_query_purchaser_balance_export() -> impl IntoResponse {
     ).into_response()
 }
 
-async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResponse {
+async fn api_sales_order_generate_purchase(
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = params.get("force").map(|s| s == "1").unwrap_or(false);
+
     let order_row = sqlx::query(
         "SELECT so.id, so.order_date, so.warehouse_id, so.warehouse_name
          FROM sales_order so WHERE so.id = ?"
@@ -16291,15 +16343,97 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
     .fetch_optional(pool())
     .await
     .unwrap_or(None);
-    
+
     if order_row.is_none() {
         return (StatusCode::NOT_FOUND, serde_json::json!({ "message": "销售订单不存在" }).to_string()).into_response();
     }
-    
+
     let row = order_row.unwrap();
     let order_date = row.get::<String, _>("order_date");
     let warehouse_id = row.get::<i64, _>("warehouse_id");
     let warehouse_name = row.get::<Option<String>, _>("warehouse_name").unwrap_or_default();
+
+    // 重复生成检查：是否已存在源自该销售订单的采购订单
+    // 已处理（非 pending）的采购订单受保护，不允许覆盖；
+    // pending 状态的采购订单在用户确认后会先删除再重新生成，避免重复
+    let existed: Vec<(i64, String, String, String)> = sqlx::query(
+        "SELECT po.id, po.order_no, po.status, COALESCE(s.name, '未知供应商') as supplier_name
+         FROM purchase_order po LEFT JOIN supplier s ON po.supplier_id = s.id
+         WHERE po.source_sales_order_id = ? ORDER BY po.id"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| (
+        r.get::<i64, _>("id"),
+        r.get::<String, _>("order_no"),
+        r.get::<String, _>("status"),
+        r.get::<String, _>("supplier_name"),
+    ))
+    .collect();
+
+    if !existed.is_empty() {
+        // 区分可重建（pending）与已处理（非 pending）的采购订单
+        let status_text = |s: &str| match s {
+            "pending" => "待分拣",
+            "sorting" => "分拣中",
+            "sorted" => "已分拣",
+            "delivering" => "配送中",
+            "delivered" => "已送达",
+            "accepted" => "已验收",
+            "settled" => "已结算",
+            _ => "未知",
+        };
+        let pending: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 == "pending").collect();
+        let processed: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 != "pending").collect();
+
+        // 存在已处理的采购订单：不允许重新生成，避免覆盖已发生的业务数据
+        if !processed.is_empty() {
+            let detail = processed.iter()
+                .map(|x| format!("{}（{}，状态：{}）", x.1, x.3, status_text(&x.2)))
+                .collect::<Vec<_>>().join("、");
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                serde_json::json!({
+                    "error": true,
+                    "message": format!("该销售订单已生成过采购订单，其中 {} 张已处理（{}），不能重新生成。\n如需调整，请到采购订单页面手动处理对应单据。", processed.len(), detail)
+                }).to_string(),
+            ).into_response();
+        }
+
+        // 全部为 pending 状态：提示用户确认后删除旧的再重新生成
+        if !force {
+            let detail = pending.iter()
+                .map(|x| format!("{}（{}）", x.1, x.3))
+                .collect::<Vec<_>>().join("、");
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                serde_json::json!({
+                    "warning": true,
+                    "count": pending.len(),
+                    "message": format!("该销售订单已生成过 {} 张采购订单（均为待分拣状态）：{}\n重新生成将删除旧单并按最新销售订单重新生成，是否继续？", pending.len(), detail)
+                }).to_string(),
+            ).into_response();
+        }
+
+        // force=true：删除所有 pending 状态的旧采购订单及其明细
+        for x in &pending {
+            sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
+                .bind(x.0)
+                .execute(pool())
+                .await
+                .ok();
+            sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+                .bind(x.0)
+                .execute(pool())
+                .await
+                .ok();
+        }
+    }
     
     let item_rows = sqlx::query(
         "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.supplier_id, soi.supplier_name, p.purchase_price, p.base_unit, p.base_price
@@ -16363,7 +16497,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         }
         
         let result = sqlx::query(
-            "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(supplier_id)
         .bind(&order_no)
@@ -16375,6 +16509,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         .bind(warehouse_id)
         .bind(&warehouse_name)
         .bind(None::<String>)
+        .bind(id)
         .execute(pool())
         .await;
         
@@ -16860,10 +16995,11 @@ struct StockSummaryRow {
     out_amount: f64,
     out_item_count: i64,
     out_order_count: i64,
-    net_amount: f64,
+    discounted_out_amount: f64, // 下浮后出库金额 = 出库金额 × (1 - 下浮率/100)
+    gross_profit: f64,          // 毛利 = 下浮后出库金额 - 入库金额
 }
 
-async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64) {
+async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
     // 采购入库按日+仓库汇总
     let mut purchase_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
@@ -16890,7 +17026,7 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         .await
         .unwrap_or_default();
 
-    // 销售出库按日+仓库汇总
+    // 销售出库按明细行返回，含订单下浮率，在 Rust 端按明细计算下浮后金额
     let mut sales_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
         sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date));
@@ -16902,13 +17038,12 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
                 COALESCE(so.warehouse_name, '未指定') as warehouse_name,
-                COALESCE(SUM(soi.amount), 0) as out_amount,
-                COUNT(soi.id) as out_item_count,
-                COUNT(DISTINCT so.id) as out_order_count
+                soi.amount as out_amount,
+                so.id as order_id,
+                COALESCE(so.discount_rate, 0) as discount_rate
          FROM sales_order so
          JOIN sales_order_item soi ON soi.order_id = so.id
-         {}
-         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+         {}",
         sales_where
     );
     let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
@@ -16918,8 +17053,8 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
 
     use std::collections::{BTreeMap, HashMap};
 
-    // Key: (day, warehouse_id) -> (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name)
-    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String)>> = HashMap::new();
+    // Key: (day, warehouse_id) -> (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name, discounted_out)
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String, f64)>> = HashMap::new();
 
     // 先收集所有仓库名称用于排序
     let mut warehouse_names: BTreeMap<i64, String> = BTreeMap::new();
@@ -16935,27 +17070,35 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         warehouse_names.insert(wh_id, wh_name.clone());
 
         let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
         e.0 += amount;
         e.1 += items;
         e.2 += orders;
     }
 
+    // 按明细行汇总：out_amount 累加原值，discounted_out 累加下浮后金额
+    // 下浮后金额 = amount × (1 - discount_rate/100)
+    // 订单数与条数通过 Set 去重统计
+    let mut seen_orders: std::collections::HashSet<(String, i64, i64)> = std::collections::HashSet::new();
     for row in &sales_rows {
         let day: String = row.get("day");
         let wh_id: i64 = row.get::<i64, _>("warehouse_id");
         let wh_name: String = row.get::<String, _>("warehouse_name");
         let amount: f64 = row.get::<f64, _>("out_amount");
-        let items: i64 = row.get::<i64, _>("out_item_count");
-        let orders: i64 = row.get::<i64, _>("out_order_count");
+        let order_id: i64 = row.get::<i64, _>("order_id");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
 
         warehouse_names.insert(wh_id, wh_name.clone());
 
-        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        let wh_map = day_wh_map.entry(day.clone()).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
         e.3 += amount;
-        e.4 += items;
-        e.5 += orders;
+        e.4 += 1; // 条数
+        e.7 += discounted;
+        if seen_orders.insert((day, wh_id, order_id)) {
+            e.5 += 1; // 单数（去重）
+        }
     }
 
     // 按日期倒序，每天输出仓库明细行 + 汇总行
@@ -16965,11 +17108,13 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
     let mut rows: Vec<StockSummaryRow> = Vec::new();
     let mut total_in = 0.0;
     let mut total_out = 0.0;
+    let mut total_discounted_out = 0.0;
 
     for day in &days {
         if let Some(wh_map) = day_wh_map.get(day) {
             let mut day_in = 0.0;
             let mut day_out = 0.0;
+            let mut day_discounted_out = 0.0;
             let mut day_in_items = 0;
             let mut day_out_items = 0;
             let mut day_in_orders = 0;
@@ -16979,6 +17124,7 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
             for (wh_id, v) in wh_map {
                 day_in += v.0;
                 day_out += v.3;
+                day_discounted_out += v.7;
                 day_in_items += v.1;
                 day_out_items += v.4;
                 day_in_orders += v.2;
@@ -16995,7 +17141,8 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
                     out_amount: v.3,
                     out_item_count: v.4,
                     out_order_count: v.5,
-                    net_amount: v.0 - v.3,
+                    discounted_out_amount: v.7,
+                    gross_profit: v.7 - v.0,
                 });
             }
 
@@ -17011,18 +17158,20 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
                 out_amount: day_out,
                 out_item_count: day_out_items,
                 out_order_count: day_out_orders,
-                net_amount: day_in - day_out,
+                discounted_out_amount: day_discounted_out,
+                gross_profit: day_discounted_out - day_in,
             });
 
             total_in += day_in;
             total_out += day_out;
+            total_discounted_out += day_discounted_out;
         }
     }
 
-    (rows, total_in, total_out)
+    (rows, total_in, total_out, total_discounted_out)
 }
 
-async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64) {
+async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
     // 入库：与真实账套一致
     let mut purchase_where = String::from("WHERE 1=1");
     if !start_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date)); }
@@ -17045,7 +17194,7 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         .await
         .unwrap_or_default();
 
-    // 真实出库
+    // 真实出库（按明细行返回，含订单下浮率）
     let mut sales_where = String::from("WHERE 1=1");
     if !start_date.is_empty() { sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date)); }
     if !end_date.is_empty() { sales_where.push_str(&format!(" AND so.order_date <= '{}'", end_date)); }
@@ -17053,13 +17202,12 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
                 COALESCE(so.warehouse_name, '未指定') as warehouse_name,
-                COALESCE(SUM(soi.amount), 0) as out_amount,
-                COUNT(soi.id) as out_item_count,
-                COUNT(DISTINCT so.id) as out_order_count
+                soi.amount as out_amount,
+                so.id as order_id,
+                COALESCE(so.discount_rate, 0) as discount_rate
          FROM sales_order so
          JOIN sales_order_item soi ON soi.order_id = so.id
-         {}
-         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+         {}",
         sales_where
     );
     let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
@@ -17067,17 +17215,16 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         .await
         .unwrap_or_default();
 
-    // 分摊调整1：目标单收到的增项金额（+出库），按目标单日期+仓库
-    // 注意：sales_where 本身已含 "WHERE 1=1 AND ..."，此处直接拼接，避免重复 WHERE 导致 SQL 失败
+    // 分摊调整1：目标单收到的增项金额（+出库），按明细行返回，含目标单下浮率
     let adj1_sql = format!(
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
                 COALESCE(so.warehouse_name, '未指定') as warehouse_name,
-                SUM(osi.amount) as out_amount
+                osi.amount as out_amount,
+                COALESCE(so.discount_rate, 0) as discount_rate
          FROM order_supplement_item osi
          JOIN sales_order so ON osi.target_order_id = so.id
-         {}
-         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+         {}",
         sales_where
     );
     let adj1_rows = sqlx::query(AssertSqlSafe(adj1_sql.as_str()))
@@ -17085,17 +17232,17 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         .await
         .unwrap_or_default();
 
-    // 分摊调整2：来源耗材单真实金额（−出库），按来源单日期+仓库
-    // 来源集合与「报销口径汇总」保持一致，统一使用 consumable_allocation.source_order_id
+    // 分摊调整2：来源耗材单真实金额（−出库），按明细行返回，含来源单下浮率
     let adj2_sql = format!(
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
                 COALESCE(so.warehouse_name, '未指定') as warehouse_name,
-                SUM(soi.amount) as out_amount
+                soi.amount as out_amount,
+                so.id as order_id,
+                COALESCE(so.discount_rate, 0) as discount_rate
          FROM sales_order so
          JOIN sales_order_item soi ON soi.order_id = so.id
-         {} AND so.id IN (SELECT DISTINCT source_order_id FROM consumable_allocation)
-         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+         {} AND so.id IN (SELECT DISTINCT source_order_id FROM consumable_allocation)",
         sales_where
     );
     let adj2_rows = sqlx::query(AssertSqlSafe(adj2_sql.as_str()))
@@ -17104,7 +17251,8 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         .unwrap_or_default();
 
     use std::collections::{BTreeMap, HashMap};
-    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String)>> = HashMap::new();
+    // 元组: (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name, discounted_out)
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String, f64)>> = HashMap::new();
 
     for row in &purchase_rows {
         let day: String = row.get("day");
@@ -17114,42 +17262,50 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
         let items: i64 = row.get::<i64, _>("in_item_count");
         let orders: i64 = row.get::<i64, _>("in_order_count");
         let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
         e.0 += amount; e.1 += items; e.2 += orders;
     }
 
+    // 真实出库：累加原值与下浮后金额，订单数去重
+    let mut seen_orders: std::collections::HashSet<(String, i64, i64)> = std::collections::HashSet::new();
     for row in &sales_rows {
         let day: String = row.get("day");
         let wh_id: i64 = row.get::<i64, _>("warehouse_id");
         let wh_name: String = row.get::<String, _>("warehouse_name");
         let amount: f64 = row.get::<f64, _>("out_amount");
-        let items: i64 = row.get::<i64, _>("out_item_count");
-        let orders: i64 = row.get::<i64, _>("out_order_count");
-        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
-        e.3 += amount; e.4 += items; e.5 += orders;
+        let order_id: i64 = row.get::<i64, _>("order_id");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
+        let wh_map = day_wh_map.entry(day.clone()).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.3 += amount; e.4 += 1; e.7 += discounted;
+        if seen_orders.insert((day, wh_id, order_id)) { e.5 += 1; }
     }
 
-    // 加目标单分摊增项
+    // 加目标单分摊增项（含下浮）
     for row in &adj1_rows {
         let day: String = row.get("day");
         let wh_id: i64 = row.get::<i64, _>("warehouse_id");
         let wh_name: String = row.get::<String, _>("warehouse_name");
         let amount: f64 = row.get::<f64, _>("out_amount");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
         let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
-        e.3 += amount;
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.3 += amount; e.7 += discounted;
     }
 
-    // 减来源单真实金额
+    // 减来源单真实金额（含下浮）
     for row in &adj2_rows {
         let day: String = row.get("day");
         let wh_id: i64 = row.get::<i64, _>("warehouse_id");
         let wh_name: String = row.get::<String, _>("warehouse_name");
         let amount: f64 = row.get::<f64, _>("out_amount");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
         let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
-        e.3 -= amount;
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.3 -= amount; e.7 -= discounted;
     }
 
     let mut days: Vec<String> = day_wh_map.keys().cloned().collect();
@@ -17158,18 +17314,20 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
     let mut rows: Vec<StockSummaryRow> = Vec::new();
     let mut total_in = 0.0;
     let mut total_out = 0.0;
+    let mut total_discounted_out = 0.0;
 
     for day in &days {
         if let Some(wh_map) = day_wh_map.get(day) {
             let mut day_in = 0.0;
             let mut day_out = 0.0;
+            let mut day_discounted_out = 0.0;
             let mut day_in_items = 0;
             let mut day_out_items = 0;
             let mut day_in_orders = 0;
             let mut day_out_orders = 0;
 
             for (wh_id, v) in wh_map {
-                day_in += v.0; day_out += v.3;
+                day_in += v.0; day_out += v.3; day_discounted_out += v.7;
                 day_in_items += v.1; day_out_items += v.4;
                 day_in_orders += v.2; day_out_orders += v.5;
 
@@ -17184,7 +17342,8 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
                     out_amount: v.3,
                     out_item_count: v.4,
                     out_order_count: v.5,
-                    net_amount: v.0 - v.3,
+                    discounted_out_amount: v.7,
+                    gross_profit: v.7 - v.0,
                 });
             }
 
@@ -17193,18 +17352,19 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
                 is_summary: true,
                 in_amount: day_in, in_item_count: day_in_items, in_order_count: day_in_orders,
                 out_amount: day_out, out_item_count: day_out_items, out_order_count: day_out_orders,
-                net_amount: day_in - day_out,
+                discounted_out_amount: day_discounted_out,
+                gross_profit: day_discounted_out - day_in,
             });
-            total_in += day_in; total_out += day_out;
+            total_in += day_in; total_out += day_out; total_discounted_out += day_discounted_out;
         }
     }
-    (rows, total_in, total_out)
+    (rows, total_in, total_out, total_discounted_out)
 }
 
 async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary(start_date, end_date).await;
 
     // 收集所有仓库列表（保持原有兼容性，虽然导出不再需要）
     use std::collections::BTreeMap;
@@ -17231,7 +17391,8 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
             "out_amount": r.out_amount,
             "out_item_count": r.out_item_count,
             "out_order_count": r.out_order_count,
-            "net_amount": r.net_amount,
+            "discounted_out_amount": r.discounted_out_amount,
+            "gross_profit": r.gross_profit,
         })
     }).collect();
 
@@ -17240,7 +17401,8 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
         "warehouses": warehouse_list,
         "total_in_amount": total_in,
         "total_out_amount": total_out,
-        "total_net_amount": total_in - total_out,
+        "total_discounted_out_amount": total_discounted_out,
+        "total_gross_profit": total_discounted_out - total_in,
     });
 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
@@ -17249,7 +17411,7 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
 async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary(start_date, end_date).await;
 
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -17277,7 +17439,8 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
         .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
         .set_align(rust_xlsxwriter::FormatAlign::Right);
 
-    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "出库单数", "出库条数", "净额"];
+    // 列顺序：日期、仓库、入库金额、入库单数、入库条数、出库金额、下浮后出库金额、出库单数、出库条数、毛利
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "下浮后出库金额", "出库单数", "出库条数", "毛利"];
     for (col, header) in headers.iter().enumerate() {
         worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
     }
@@ -17285,13 +17448,14 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
     // 设置列宽
     worksheet.set_column_width(0, 14).unwrap(); // 日期
     worksheet.set_column_width(1, 16).unwrap(); // 仓库
-    worksheet.set_column_width_pixels(2, 90).unwrap(); // 金额列统一
-    worksheet.set_column_width_pixels(3, 70).unwrap();
-    worksheet.set_column_width_pixels(4, 70).unwrap();
-    worksheet.set_column_width_pixels(5, 90).unwrap();
-    worksheet.set_column_width_pixels(6, 70).unwrap();
-    worksheet.set_column_width_pixels(7, 70).unwrap();
-    worksheet.set_column_width_pixels(8, 90).unwrap();
+    worksheet.set_column_width_pixels(2, 90).unwrap();  // 入库金额
+    worksheet.set_column_width_pixels(3, 70).unwrap();  // 入库单数
+    worksheet.set_column_width_pixels(4, 70).unwrap();  // 入库条数
+    worksheet.set_column_width_pixels(5, 90).unwrap();  // 出库金额
+    worksheet.set_column_width_pixels(6, 90).unwrap();  // 下浮后出库金额
+    worksheet.set_column_width_pixels(7, 70).unwrap();  // 出库单数
+    worksheet.set_column_width_pixels(8, 70).unwrap();  // 出库条数
+    worksheet.set_column_width_pixels(9, 90).unwrap();  // 毛利
 
     let mut prev_day = String::new();
     for (row_idx, row) in rows.iter().enumerate() {
@@ -17307,9 +17471,10 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
             worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
             worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
             worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
-            worksheet.write_with_format(sheet_row, 6, row.out_order_count, &summary_format).unwrap();
-            worksheet.write_with_format(sheet_row, 7, row.out_item_count, &summary_format).unwrap();
-            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format_sum).unwrap();
         } else {
             worksheet.write(sheet_row, 0, day_display).unwrap();
             worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
@@ -17317,9 +17482,10 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
             worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
             worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
             worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
-            worksheet.write(sheet_row, 6, row.out_order_count).unwrap();
-            worksheet.write(sheet_row, 7, row.out_item_count).unwrap();
-            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 7, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 8, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format).unwrap();
         }
     }
 
@@ -17328,7 +17494,8 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
     worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
     worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
     worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
-    worksheet.write_with_format(total_row, 8, total_in - total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 6, total_discounted_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 9, total_discounted_out - total_in, &num_format_sum).unwrap();
 
     let buf = workbook.save_to_buffer().unwrap();
     (
@@ -17343,7 +17510,7 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
 async fn api_query_stock_summary_reimburse(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let (rows, total_in, total_out) = compute_stock_summary_reimburse(start_date, end_date).await;
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary_reimburse(start_date, end_date).await;
 
     let items: Vec<serde_json::Value> = rows.iter().map(|r| {
         serde_json::json!({
@@ -17357,7 +17524,8 @@ async fn api_query_stock_summary_reimburse(axum::extract::Query(params): axum::e
             "out_amount": r.out_amount,
             "out_item_count": r.out_item_count,
             "out_order_count": r.out_order_count,
-            "net_amount": r.net_amount,
+            "discounted_out_amount": r.discounted_out_amount,
+            "gross_profit": r.gross_profit,
         })
     }).collect();
 
@@ -17365,7 +17533,8 @@ async fn api_query_stock_summary_reimburse(axum::extract::Query(params): axum::e
         "rows": items,
         "total_in_amount": total_in,
         "total_out_amount": total_out,
-        "total_net_amount": total_in - total_out,
+        "total_discounted_out_amount": total_discounted_out,
+        "total_gross_profit": total_discounted_out - total_in,
     });
 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
@@ -17374,7 +17543,7 @@ async fn api_query_stock_summary_reimburse(axum::extract::Query(params): axum::e
 async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let (rows, total_in, total_out) = compute_stock_summary_reimburse(start_date, end_date).await;
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary_reimburse(start_date, end_date).await;
 
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -17399,7 +17568,8 @@ async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): 
         .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
         .set_align(rust_xlsxwriter::FormatAlign::Right);
 
-    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "出库单数", "出库条数", "净额"];
+    // 列顺序：日期、仓库、入库金额、入库单数、入库条数、出库金额、下浮后出库金额、出库单数、出库条数、毛利
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "下浮后出库金额", "出库单数", "出库条数", "毛利"];
     for (col, header) in headers.iter().enumerate() {
         worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
     }
@@ -17409,9 +17579,10 @@ async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): 
     worksheet.set_column_width_pixels(3, 70).unwrap();
     worksheet.set_column_width_pixels(4, 70).unwrap();
     worksheet.set_column_width_pixels(5, 90).unwrap();
-    worksheet.set_column_width_pixels(6, 70).unwrap();
+    worksheet.set_column_width_pixels(6, 90).unwrap();
     worksheet.set_column_width_pixels(7, 70).unwrap();
-    worksheet.set_column_width_pixels(8, 90).unwrap();
+    worksheet.set_column_width_pixels(8, 70).unwrap();
+    worksheet.set_column_width_pixels(9, 90).unwrap();
 
     let mut prev_day = String::new();
     for (row_idx, row) in rows.iter().enumerate() {
@@ -17425,9 +17596,10 @@ async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): 
             worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
             worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
             worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
-            worksheet.write_with_format(sheet_row, 6, row.out_order_count, &summary_format).unwrap();
-            worksheet.write_with_format(sheet_row, 7, row.out_item_count, &summary_format).unwrap();
-            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format_sum).unwrap();
         } else {
             worksheet.write(sheet_row, 0, day_display).unwrap();
             worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
@@ -17435,9 +17607,10 @@ async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): 
             worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
             worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
             worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
-            worksheet.write(sheet_row, 6, row.out_order_count).unwrap();
-            worksheet.write(sheet_row, 7, row.out_item_count).unwrap();
-            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 7, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 8, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format).unwrap();
         }
     }
 
@@ -17445,7 +17618,8 @@ async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): 
     worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
     worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
     worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
-    worksheet.write_with_format(total_row, 8, total_in - total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 6, total_discounted_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 9, total_discounted_out - total_in, &num_format_sum).unwrap();
 
     let buf = workbook.save_to_buffer().unwrap();
     (
