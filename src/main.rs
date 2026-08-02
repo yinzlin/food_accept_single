@@ -10009,6 +10009,7 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         <button class="btn-clear-all" onclick="clearCorrections()">清除修正</button>
         <button class="btn-print" onclick="saveCorrectionsToServer()">保存修正</button>
         <button class="btn-export" onclick="exportExcel()">导出XLSX</button>
+        <button class="btn-export" onclick="exportExcel(true)">导出(含数值)</button>
     </div>
 
     <script>
@@ -10263,10 +10264,13 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
             container.innerHTML = html;
         }
 
-        function exportExcel() {
+        function exportExcel(withValues) {
             const date = document.getElementById('historyDate').value;
             let url = '/api/sales_order/sort_items_by_supplier_excel';
-            if (date) url += '?date=' + encodeURIComponent(date);
+            let params = [];
+            if (date) params.push('date=' + encodeURIComponent(date));
+            if (withValues) params.push('print_values=1');
+            if (params.length) url += '?' + params.join('&');
             window.location.href = url;
         }
 
@@ -21899,6 +21903,11 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
     // 无日期：当前待分拣（pending/sorting）；有日期：检索该日期的历史分拣清单
     let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
     let has_date = !date.is_empty();
+    // 可选：是否输出实量/单价/金额数值。不传或非 1/true 时为打印手填模式（三列留空）
+    let print_values = matches!(
+        params.get("print_values").map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
     let where_sql = if has_date {
         "WHERE so.order_date = ?"
     } else {
@@ -22008,8 +22017,8 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
             .set_background_color("#E5E7EB")
             .set_font_color("#374151");
 
-        let col_widths = [6.0, 18.0, 8.0, 10.0, 10.0, 8.0, 10.0, 20.0];
-        let headers = ["序号", "商品名称", "单位", "订购数量", "实际数量", "单价", "金额", "备注"];
+        let col_widths = [4, 15, 4, 6, 6, 8, 8, 10];
+        let headers = ["序号", "品名规格", "单位", "订量", "实量", "单价", "金额", "备注"];
         let today = Local::now().format("%Y-%m-%d").to_string();
 
         let date_format = Format::new()
@@ -22114,9 +22123,9 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
 
                             let mut purchaser_total_items = 0i64;
                             let mut purchaser_total_amount = 0.0;
+                            let mut purchaser_seq = 1;
 
                             for (unit, group_items) in &unit_groups {
-                                let mut seq = 1;
                                 let mut unit_amount = 0.0;
                                 for item in group_items {
                                     let product_name = item["product_name"].as_str().unwrap_or("");
@@ -22127,24 +22136,25 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
 
                                     unit_amount += amount;
 
-                                    worksheet.write_with_format(current_row, 0, seq as f64, &cell_format)?;
+                                    worksheet.write_with_format(current_row, 0, purchaser_seq as f64, &cell_format)?;
                                     worksheet.write_with_format(current_row, 1, product_name, &cell_left_format)?;
                                     worksheet.write_with_format(current_row, 2, unit.as_str(), &cell_format)?;
                                     worksheet.write_with_format(current_row, 3, pre_sale_quantity, &cell_format)?;
-                                    worksheet.write_with_format(current_row, 4, quantity, &cell_format)?;
-                                    worksheet.write_with_format(current_row, 5, "", &cell_format)?;
-                                    worksheet.write_with_format(current_row, 6, amount, &cell_right_format)?;
+                                    if print_values {
+                                        worksheet.write_with_format(current_row, 4, quantity, &cell_format)?;
+                                        let unit_price = if quantity != 0.0 { amount / quantity } else { 0.0 };
+                                        worksheet.write_with_format(current_row, 5, unit_price, &cell_format)?;
+                                        worksheet.write_with_format(current_row, 6, amount, &cell_right_format)?;
+                                    } else {
+                                        worksheet.write_with_format(current_row, 4, "", &cell_format)?;
+                                        worksheet.write_with_format(current_row, 5, "", &cell_format)?;
+                                        worksheet.write_with_format(current_row, 6, "", &cell_right_format)?;
+                                    }
                                     worksheet.write_with_format(current_row, 7, remark, &cell_left_format)?;
                                     current_row += 1;
-                                    seq += 1;
+                                    purchaser_seq += 1;
                                 }
                                 let unit_count = group_items.len();
-                                let unit_summary = format!("包装数量: {}", unit_count);
-                                worksheet.merge_range(current_row, 0, current_row, 5, unit_summary.as_str(), &summary_format)?;
-                                worksheet.write_with_format(current_row, 6, unit_amount, &summary_right_format)?;
-                                worksheet.set_row_height(current_row, 18)?;
-                                current_row += 1;
-
                                 purchaser_total_items += unit_count as i64;
                                 purchaser_total_amount += unit_amount;
                             }
@@ -22152,7 +22162,11 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
                             // 采购单位小计
                             let purchaser_total = format!("小计: 包装数量 {}", purchaser_total_items);
                             worksheet.merge_range(current_row, 0, current_row, 5, purchaser_total.as_str(), &summary_format)?;
-                            worksheet.write_with_format(current_row, 6, purchaser_total_amount, &summary_right_format)?;
+                            if print_values {
+                                worksheet.write_with_format(current_row, 6, purchaser_total_amount, &summary_right_format)?;
+                            } else {
+                                worksheet.write_with_format(current_row, 6, "", &summary_right_format)?;
+                            }
                             worksheet.set_row_height(current_row, 18)?;
                             current_row += 1;
 
@@ -22165,7 +22179,11 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
                 // 供应商总计
                 let grand_total = format!("总计: 包装数量 {}", grand_total_items);
                 worksheet.merge_range(current_row, 0, current_row, 5, grand_total.as_str(), &grand_total_format)?;
-                worksheet.write_with_format(current_row, 6, grand_total_amount, &grand_total_right_format)?;
+                if print_values {
+                    worksheet.write_with_format(current_row, 6, grand_total_amount, &grand_total_right_format)?;
+                } else {
+                    worksheet.write_with_format(current_row, 6, "", &grand_total_right_format)?;
+                }
                 worksheet.set_row_height(current_row, 22)?;
             }
         }
