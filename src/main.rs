@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use axum::{
-    extract::{Json, Path},
+    extract::{Json, Path, Query},
     http::{header, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, post, put},
@@ -1948,7 +1948,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -2154,7 +2154,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteSupplierCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -2360,7 +2360,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeletePurchaserCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -4233,12 +4233,12 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             async function exportPurchaseOrder(orderId) {{
                 if (users.length === 0) {{ await loadUsers(); }}
                 let uid = 0;
-                let opts = '0. 无经手人（使用订单已存）\\n';
+                let opts = '0. 无经手人（使用订单已存）\n';
                 users.forEach((u, idx) => {{
                     const name = u.nickname || u.username || '';
-                    if (name) {{ opts += (idx+1) + '. ' + name + (u.phone ? ' (' + u.phone + ')' : '') + '\\n'; }}
+                    if (name) {{ opts += (idx+1) + '. ' + name + (u.phone ? ' (' + u.phone + ')' : '') + '\n'; }}
                 }});
-                const input = prompt('请选择经手人编号：\\n' + opts, '0');
+                const input = prompt('请选择经手人编号：\n' + opts, '0');
                 if (input === null) return;
                 const choice = parseInt(input);
                 if (isNaN(choice)) return;
@@ -5680,7 +5680,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
             async function updatePrices() {{
                 if (!currentOrderId) {{ alert('请先选择要编辑的订单'); return; }}
-                if (!confirm('将自动填入商品最新基础售价，请核对后手动保存修改。\\n确定继续？')) return;
+                if (!confirm('将自动填入商品最新基础售价，请核对后手动保存修改。\n确定继续？')) return;
                 const btn = document.getElementById('updatePricesBtn');
                 btn.disabled = true;
                 btn.textContent = '获取中...';
@@ -5688,7 +5688,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const res = await fetch('/api/sales_order/update_prices/' + currentOrderId, {{ method: 'POST' }});
                     const data = await res.json();
                     if (data.errors && data.errors.length > 0) {{
-                        alert('部分商品获取售价失败：\\n' + data.errors.join('\\n'));
+                        alert('部分商品获取售价失败：\n' + data.errors.join('\n'));
                     }}
                     // 记录变动明细
                     const changes = [];
@@ -5742,12 +5742,36 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 window.open('/accept?order_id=' + id, '_blank');
             }}
             
-            function exportAcceptExcel(id) {{
-                window.location.href = '/api/sales_order/accept_excel/' + id;
+            async function downloadExcel(url, id, force) {{
+                const f = force ? 1 : 0;
+                const res = await fetch(url + id + '?force=' + f);
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {{
+                    const data = await res.json();
+                    if (data.warning) {{
+                        if (confirm(data.message + '\n\n确定导出？')) {{
+                            downloadExcel(url, id, true);
+                        }}
+                    }}
+                    return;
+                }}
+                const blob = await res.blob();
+                const disposition = res.headers.get('content-disposition') || '';
+                const match = disposition.match(/filename\*?=(?:UTF-8''|"?)([^;"]+)/);
+                const filename = match ? decodeURIComponent(match[1]) : 'export.xlsx';
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(link.href);
             }}
-
+            function exportAcceptExcel(id) {{
+                downloadExcel('/api/sales_order/accept_excel/', id, false);
+            }}
             function exportRealExcel(id) {{
-                window.location.href = '/api/sales_order/real_excel/' + id;
+                downloadExcel('/api/sales_order/real_excel/', id, false);
             }}
             
             async function deleteOrder(id) {{
@@ -6452,9 +6476,9 @@ async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<String
                 const url = '/api/query/stock_flow?product_id=' + productId;
                 const res = await fetch(url);
                 const data = await res.json();
-                let detail = '库存流水:\\n';
+                let detail = '库存流水:\n';
                 data.forEach(flow => {
-                    detail += flow.type + ' ' + flow.quantity.toFixed(2) + ' ' + flow.create_time + '\\n';
+                    detail += flow.type + ' ' + flow.quantity.toFixed(2) + ' ' + flow.create_time + '\n';
                 });
                 alert(detail);
             }
@@ -20334,7 +20358,7 @@ async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
     let r = row.unwrap();
     let source_order_id: i64 = r.get("source_order_id");
     let amount: f64 = r.get("amount");
-    let operation_type: String = r.get("operation_type");
+    let _operation_type: String = r.get("operation_type");
 
     let result = sqlx::query("DELETE FROM order_supplement_item WHERE id = ?")
         .bind(id)
@@ -20546,17 +20570,25 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
 }
 
 // 导出报销单（报销口径）：合并分摊增项后的明细
-async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse {
-    build_accept_excel(id, true).await
+async fn api_sales_order_accept_excel(
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = params.get("force").map(|s| s == "1").unwrap_or(false);
+    build_accept_excel(id, true, force).await
 }
 
 // 导出验收单（真实口径）：真实账套明细，不合并分摊增项
-async fn api_sales_order_real_excel(Path(id): Path<i64>) -> impl IntoResponse {
-    build_accept_excel(id, false).await
+async fn api_sales_order_real_excel(
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = params.get("force").map(|s| s == "1").unwrap_or(false);
+    build_accept_excel(id, false, force).await
 }
 
 // reimburse=true 报销口径（合并分摊增项）；false 真实口径（真实账套）
-async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
+async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoResponse {
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
                 p.name as purchaser_name, p.address as purchaser_address
@@ -20594,6 +20626,27 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
     .fetch_all(pool())
     .await
     .unwrap_or_default();
+
+    // 检查是否有金额为零的明细
+    if !force {
+        let zero_amount_items: Vec<_> = item_rows.iter()
+            .filter(|r| {
+                let amount: f64 = r.get("amount");
+                amount.abs() < 0.001
+            })
+            .collect();
+        if !zero_amount_items.is_empty() {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                serde_json::to_string(&serde_json::json!({
+                    "warning": true,
+                    "count": zero_amount_items.len(),
+                    "message": format!("订单中有 {} 条明细金额为零，确认后仍可导出", zero_amount_items.len())
+                })).unwrap(),
+            ).into_response();
+        }
+    }
 
     // 真实口径不合并分摊增项，仅报销口径需要
     let supplement_rows = if reimburse {
@@ -21018,15 +21071,7 @@ async fn build_accept_excel(id: i64, reimburse: bool) -> impl IntoResponse {
             } else {
                 format!("验收单_{}.xlsx", order_no)
             };
-            let content_disposition = format!("attachment; filename=\"{}\"", filename);
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-                    (header::CONTENT_DISPOSITION, content_disposition.as_str()),
-                ],
-                buf,
-            ).into_response()
+            xlsx_response(buf, &filename)
         }
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("生成Excel失败: {}", e)).into_response()
@@ -21948,7 +21993,6 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
                 worksheet.merge_range(current_row, 0, current_row, 5, grand_total.as_str(), &grand_total_format)?;
                 worksheet.write_with_format(current_row, 6, grand_total_amount, &grand_total_right_format)?;
                 worksheet.set_row_height(current_row, 22)?;
-                current_row += 1;
             }
         }
 
