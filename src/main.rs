@@ -22039,7 +22039,11 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
 
         let col_widths = [4, 15, 4, 6, 6, 8, 8, 10];
         let headers = ["序号", "品名规格", "单位", "订量", "实量", "单价", "金额", "备注"];
-        let today = Local::now().format("%Y-%m-%d").to_string();
+        let display_date = if has_date {
+            date.clone()
+        } else {
+            Local::now().format("%Y-%m-%d").to_string()
+        };
 
         let date_format = Format::new()
             .set_font_size(10)
@@ -22093,11 +22097,14 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
                 worksheet.set_name(sheet_name.as_str())?;
 
                 worksheet.set_landscape();
-                worksheet.set_margins(0.0, 0.0, 0.4, 0.0, 0.0, 0.0);
+                // 上边距1cm，下边距1.27cm留出页脚间隙，页脚1cm，左右为0
+                worksheet.set_margins(0.0, 0.0, 0.4, 0.5, 0.0, 0.2);
                 worksheet.set_print_center_vertically(false);
                 worksheet.set_print_center_horizontally(true);
                 worksheet.set_header("");
-                worksheet.set_footer("");
+                worksheet.set_footer("&C第 &P 页，共 &N 页");
+                // 每页重复打印标题、日期、表头(行0-2)，保证多页时每页都有页头和日期
+                worksheet.set_repeat_rows(0, 2)?;
 
                 for (i, w) in col_widths.iter().enumerate() {
                     worksheet.set_column_width(i as u16, *w)?;
@@ -22109,7 +22116,7 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
                 worksheet.set_row_height(current_row, 28)?;
                 current_row += 1;
 
-                worksheet.merge_range(current_row, 4, current_row, max_col, today.as_str(), &date_format)?;
+                worksheet.merge_range(current_row, 4, current_row, max_col, display_date.as_str(), &date_format)?;
                 worksheet.set_row_height(current_row, 14)?;
                 current_row += 1;
 
