@@ -4594,6 +4594,13 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             function handleEnterKey(event, index, field) {{
+                // Enter: 同列下一行 (WPS 风格)
+                // Tab:   同行下一格，行末换到下一行第一格 (WPS 风格)
+                if (event.key === 'Tab') {{
+                    event.preventDefault();
+                    handleCellNavigation(event.target, 'next-in-row', index, field);
+                    return;
+                }}
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
                 if (enterKeys.includes(event.key) || event.keyCode === 13) {{
                     event.preventDefault();
@@ -4630,6 +4637,39 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                 try {{ targetInput.select(); }} catch(e) {{}}
                             }}
                         }}
+                    }}
+                }}
+            }}
+
+            // WPS 风格 Tab 同行导航：同 row 从左到右，行末换下一行第一个 input
+            // 跳过 select（单位/供应商等下拉），用户用方向键展开
+            function handleCellNavigation(currentInput, direction, index, field) {{
+                const tr = currentInput.closest('tr');
+                if (!tr) return;
+                const tbody = tr.parentElement;
+                if (!tbody) return;
+                const cells = Array.from(tr.cells);
+                const currentCell = currentInput.closest('td');
+                if (!currentCell) return;
+                const currentCellIndex = cells.indexOf(currentCell);
+
+                // 同行下一个可聚焦的 input（跳过 select）
+                for (let i = currentCellIndex + 1; i < cells.length; i++) {{
+                    const inputs = cells[i].querySelectorAll('input');
+                    if (inputs.length > 0) {{
+                        inputs[0].focus();
+                        try {{ inputs[0].select(); }} catch(e) {{}}
+                        return;
+                    }}
+                }}
+
+                // 同行无更多 input，换到下一行第一个 input
+                const nextRow = tbody.rows[index + 1];
+                if (nextRow) {{
+                    const firstInput = nextRow.querySelector('input');
+                    if (firstInput) {{
+                        firstInput.focus();
+                        try {{ firstInput.select(); }} catch(e) {{}}
                     }}
                 }}
             }}
@@ -5247,6 +5287,13 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             function handleEnterKey(event, index, field) {{
+                // Enter: 同列下一行 (WPS 风格)
+                // Tab:   同行下一格，行末换到下一行第一格 (WPS 风格)
+                if (event.key === 'Tab') {{
+                    event.preventDefault();
+                    handleCellNavigation(event.target, 'next-in-row', index, field);
+                    return;
+                }}
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
                 if (enterKeys.includes(event.key) || event.keyCode === 13) {{
                     event.preventDefault();
@@ -5287,6 +5334,39 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                 try {{ targetInput.select(); }} catch(e) {{}}
                             }}
                         }}
+                    }}
+                }}
+            }}
+
+            // WPS 风格 Tab 同行导航：同 row 从左到右，行末换下一行第一个 input
+            // 跳过 select（单位/供应商等下拉），用户用方向键展开
+            function handleCellNavigation(currentInput, direction, index, field) {{
+                const tr = currentInput.closest('tr');
+                if (!tr) return;
+                const tbody = tr.parentElement;
+                if (!tbody) return;
+                const cells = Array.from(tr.cells);
+                const currentCell = currentInput.closest('td');
+                if (!currentCell) return;
+                const currentCellIndex = cells.indexOf(currentCell);
+
+                // 同行下一个可聚焦的 input（跳过 select）
+                for (let i = currentCellIndex + 1; i < cells.length; i++) {{
+                    const inputs = cells[i].querySelectorAll('input');
+                    if (inputs.length > 0) {{
+                        inputs[0].focus();
+                        try {{ inputs[0].select(); }} catch(e) {{}}
+                        return;
+                    }}
+                }}
+
+                // 同行无更多 input，换到下一行第一个 input
+                const nextRow = tbody.rows[index + 1];
+                if (nextRow) {{
+                    const firstInput = nextRow.querySelector('input');
+                    if (firstInput) {{
+                        firstInput.focus();
+                        try {{ firstInput.select(); }} catch(e) {{}}
                     }}
                 }}
             }}
