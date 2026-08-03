@@ -22017,7 +22017,7 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
             .set_background_color("#E5E7EB")
             .set_font_color("#374151");
 
-        let col_widths = [4, 15, 4, 6, 6, 8, 8, 10];
+        let col_widths = [4, 16, 4, 6, 6, 6, 8, 8];
         let headers = ["序号", "品名规格", "单位", "订量", "实量", "单价", "金额", "备注"];
         let today = Local::now().format("%Y-%m-%d").to_string();
 
@@ -22151,6 +22151,7 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
                                         worksheet.write_with_format(current_row, 6, "", &cell_right_format)?;
                                     }
                                     worksheet.write_with_format(current_row, 7, remark, &cell_left_format)?;
+                                    worksheet.set_row_height(current_row, 20.0)?;//设置供应商分拣页面的导出xlsx的行高
                                     current_row += 1;
                                     purchaser_seq += 1;
                                 }
