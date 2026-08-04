@@ -61,6 +61,7 @@ static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 
 const BOOTSTRAP_CSS: &str = include_str!("../static/bootstrap.min.css");
 const BOOTSTRAP_JS: &str = include_str!("../static/bootstrap.bundle.min.js");
+const CHART_JS: &str = include_str!("../static/chart.umd.min.js");
 
 async fn get_user_role(headers: &axum::http::HeaderMap) -> String {
     let session_token = headers.get("cookie")
@@ -229,6 +230,14 @@ async fn serve_bootstrap_js() -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
         BOOTSTRAP_JS,
+    )
+}
+
+async fn serve_chart_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        CHART_JS,
     )
 }
 
@@ -7032,7 +7041,7 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
                 <canvas id="trendChart"></canvas>
             </div>
         </div>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+        <script src="/static/chart.umd.min.js"></script>
         <script>
             let currentPage = 1;
             let trendChartObj = null;
@@ -24194,6 +24203,7 @@ fn build_router() -> Router {
     Router::new()
         .route("/static/bootstrap.min.css", get(serve_bootstrap_css))
         .route("/static/bootstrap.bundle.min.js", get(serve_bootstrap_js))
+        .route("/static/chart.umd.min.js", get(serve_chart_js))
         .route("/", get(page_index))
         .route("/supplier", get(page_supplier))
         .route("/purchaser", get(page_purchaser))
