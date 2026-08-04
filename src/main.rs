@@ -1899,6 +1899,11 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         .search-results li:hover {{
             background: #f0f5ff;
         }}
+        .search-results li.active {{
+            background: #d9e6ff;
+            border-left: 3px solid #2E75B6;
+            padding-left: 9px;
+        }}
         .search-results li:last-child {{
             border-bottom: none;
         }}
@@ -4856,8 +4861,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     <input type="text" value="${{item.product_name || ''}}" 
                                            oninput="handleProductSearch(${{index}}, this)" 
                                            onclick="handleProductSearch(${{index}}, this)"
+                                           onkeydown="handleProductNameKeydown(event, ${{index}}, this)"
                                            class="form-control-sm product-search-input" 
-                                           placeholder="输入商品名称搜索">
+                                           placeholder="输入商品名称搜索"
+                                           enterkeyhint="next">
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
@@ -4881,6 +4888,73 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             let searchTimeout = null;
+            let productSearchActiveIndex = -1;
+
+            // WPS 风格键盘录入：商品名称输入框
+            // - 有模糊搜索下拉时：↑/↓ 移动高亮，Enter 选中，Esc 关闭
+            // - 无下拉时：Enter 跳到下一行商品名称，最后一行则新增明细并聚焦
+            function handleProductNameKeydown(event, index, input) {{
+                const dropdown = document.getElementById('searchDropdown_' + index);
+                const lis = dropdown ? dropdown.querySelectorAll('li') : [];
+                const dropdownVisible = dropdown && dropdown.style.display !== 'none' && lis.length > 0;
+
+                if (event.key === 'ArrowDown') {{
+                    if (dropdownVisible) {{
+                        event.preventDefault();
+                        if (productSearchActiveIndex >= 0) lis[productSearchActiveIndex].classList.remove('active');
+                        productSearchActiveIndex = (productSearchActiveIndex + 1) % lis.length;
+                        lis[productSearchActiveIndex].classList.add('active');
+                        lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }}
+                    return;
+                }}
+                if (event.key === 'ArrowUp') {{
+                    if (dropdownVisible) {{
+                        event.preventDefault();
+                        if (productSearchActiveIndex >= 0) lis[productSearchActiveIndex].classList.remove('active');
+                        productSearchActiveIndex = (productSearchActiveIndex - 1 + lis.length) % lis.length;
+                        lis[productSearchActiveIndex].classList.add('active');
+                        lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }}
+                    return;
+                }}
+                if (event.key === 'Escape') {{
+                    if (dropdownVisible) {{
+                        event.preventDefault();
+                        dropdown.style.display = 'none';
+                        productSearchActiveIndex = -1;
+                    }}
+                    return;
+                }}
+                if (event.key === 'Enter' || event.keyCode === 13) {{
+                    event.preventDefault();
+                    if (dropdownVisible) {{
+                        // 下拉可见：选中当前高亮项，未高亮时默认选第一项
+                        const li = productSearchActiveIndex >= 0 ? lis[productSearchActiveIndex] : lis[0];
+                        productSearchActiveIndex = -1;
+                        selectProduct(index, li);
+                        return;
+                    }}
+                    // 无下拉：回车跳下一行商品名称（WPS 风格）
+                    const nextIndex = index + 1;
+                    const tbody = document.getElementById('itemsTable');
+                    if (tbody && nextIndex < items.length && tbody.rows[nextIndex]) {{
+                        const targetInput = tbody.rows[nextIndex].querySelector('.product-search-input');
+                        if (targetInput) {{
+                            targetInput.focus();
+                            try {{ targetInput.select(); }} catch(e) {{}}
+                            return;
+                        }}
+                    }}
+                    // 最后一行：新增明细，焦点留在新增行的商品名称
+                    addItem();
+                    const newTbody = document.getElementById('itemsTable');
+                    if (newTbody && newTbody.rows[items.length - 1]) {{
+                        const newInput = newTbody.rows[items.length - 1].querySelector('.product-search-input');
+                        if (newInput) newInput.focus();
+                    }}
+                }}
+            }}
 
             async function handleProductSearch(index, input) {{
                 const keyword = input.value.trim();
@@ -4913,12 +4987,43 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         }});
                         html += '</ul>';
                         dropdown.innerHTML = html;
+                        productSearchActiveIndex = -1;
                         dropdown.style.display = 'block';
                     }} else {{
                         dropdown.innerHTML = '';
                         dropdown.style.display = 'none';
                     }}
                 }}, 300);
+            }}
+
+            // 拉取商品最近采购价并在选中商品后做同基础单位对比提示
+            // kind = 'purchase'：采购价对比最近采购价
+            // kind = 'sales'：销售零售价对比最近采购价
+            async function checkPriceAfterSelect(productId, currentBaseUnit, currentPrice, kind, productName) {{
+                try {{
+                    const res = await fetch('/api/product/last_purchase_price?product_id=' + productId);
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    const lastPrice = parseFloat(data.purchase_price) || 0;
+                    const lastUnit = data.base_unit || '';
+                    if (lastPrice <= 0) return;
+                    if (lastUnit !== currentBaseUnit) {{
+                        return;
+                    }}
+                    if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
+                        const diff = currentPrice - lastPrice;
+                        const sign = diff > 0 ? '上涨' : '下降';
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                        }}
+                    }} else if (kind === 'sales' && currentPrice < lastPrice) {{
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                        }}
+                    }}
+                }} catch(e) {{
+                    console.error('价格比较失败:', e);
+                }}
             }}
 
             function selectProduct(index, li) {{
@@ -5584,8 +5689,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <input type="text" value="${{item.product_name || ''}}" 
                                            oninput="handleProductSearch(${{index}}, this)" 
                                            onclick="handleProductSearch(${{index}}, this)"
+                                           onkeydown="handleProductNameKeydown(event, ${{index}}, this)"
                                            class="form-control-sm product-search-input" 
-                                           placeholder="输入商品名称搜索">
+                                           placeholder="输入商品名称搜索"
+                                           enterkeyhint="next">
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
@@ -5623,6 +5730,73 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             let searchTimeout = null;
+            let productSearchActiveIndex = -1;
+
+            // WPS 风格键盘录入：商品名称输入框
+            // - 有模糊搜索下拉时：↑/↓ 移动高亮，Enter 选中，Esc 关闭
+            // - 无下拉时：Enter 跳到下一行商品名称，最后一行则新增明细并聚焦
+            function handleProductNameKeydown(event, index, input) {{
+                const dropdown = document.getElementById('searchDropdown_' + index);
+                const lis = dropdown ? dropdown.querySelectorAll('li') : [];
+                const dropdownVisible = dropdown && dropdown.style.display !== 'none' && lis.length > 0;
+
+                if (event.key === 'ArrowDown') {{
+                    if (dropdownVisible) {{
+                        event.preventDefault();
+                        if (productSearchActiveIndex >= 0) lis[productSearchActiveIndex].classList.remove('active');
+                        productSearchActiveIndex = (productSearchActiveIndex + 1) % lis.length;
+                        lis[productSearchActiveIndex].classList.add('active');
+                        lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }}
+                    return;
+                }}
+                if (event.key === 'ArrowUp') {{
+                    if (dropdownVisible) {{
+                        event.preventDefault();
+                        if (productSearchActiveIndex >= 0) lis[productSearchActiveIndex].classList.remove('active');
+                        productSearchActiveIndex = (productSearchActiveIndex - 1 + lis.length) % lis.length;
+                        lis[productSearchActiveIndex].classList.add('active');
+                        lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }}
+                    return;
+                }}
+                if (event.key === 'Escape') {{
+                    if (dropdownVisible) {{
+                        event.preventDefault();
+                        dropdown.style.display = 'none';
+                        productSearchActiveIndex = -1;
+                    }}
+                    return;
+                }}
+                if (event.key === 'Enter' || event.keyCode === 13) {{
+                    event.preventDefault();
+                    if (dropdownVisible) {{
+                        // 下拉可见：选中当前高亮项，未高亮时默认选第一项
+                        const li = productSearchActiveIndex >= 0 ? lis[productSearchActiveIndex] : lis[0];
+                        productSearchActiveIndex = -1;
+                        selectProduct(index, li);
+                        return;
+                    }}
+                    // 无下拉：回车跳下一行商品名称（WPS 风格）
+                    const nextIndex = index + 1;
+                    const tbody = document.getElementById('itemsTable');
+                    if (tbody && nextIndex < items.length && tbody.rows[nextIndex]) {{
+                        const targetInput = tbody.rows[nextIndex].querySelector('.product-search-input');
+                        if (targetInput) {{
+                            targetInput.focus();
+                            try {{ targetInput.select(); }} catch(e) {{}}
+                            return;
+                        }}
+                    }}
+                    // 最后一行：新增明细，焦点留在新增行的商品名称
+                    addItem();
+                    const newTbody = document.getElementById('itemsTable');
+                    if (newTbody && newTbody.rows[items.length - 1]) {{
+                        const newInput = newTbody.rows[items.length - 1].querySelector('.product-search-input');
+                        if (newInput) newInput.focus();
+                    }}
+                }}
+            }}
 
             async function handleProductSearch(index, input) {{
                 const keyword = input.value.trim();
@@ -5655,12 +5829,43 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         }});
                         html += '</ul>';
                         dropdown.innerHTML = html;
+                        productSearchActiveIndex = -1;
                         dropdown.style.display = 'block';
                     }} else {{
                         dropdown.innerHTML = '';
                         dropdown.style.display = 'none';
                     }}
                 }}, 300);
+            }}
+
+            // 拉取商品最近采购价并在选中商品后做同基础单位对比提示
+            // kind = 'purchase'：采购价对比最近采购价
+            // kind = 'sales'：销售零售价对比最近采购价
+            async function checkPriceAfterSelect(productId, currentBaseUnit, currentPrice, kind, productName) {{
+                try {{
+                    const res = await fetch('/api/product/last_purchase_price?product_id=' + productId);
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    const lastPrice = parseFloat(data.purchase_price) || 0;
+                    const lastUnit = data.base_unit || '';
+                    if (lastPrice <= 0) return;
+                    if (lastUnit !== currentBaseUnit) {{
+                        return;
+                    }}
+                    if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
+                        const diff = currentPrice - lastPrice;
+                        const sign = diff > 0 ? '上涨' : '下降';
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                        }}
+                    }} else if (kind === 'sales' && currentPrice < lastPrice) {{
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                        }}
+                    }}
+                }} catch(e) {{
+                    console.error('价格比较失败:', e);
+                }}
             }}
 
             function selectProduct(index, li) {{
