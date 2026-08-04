@@ -495,6 +495,40 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 加成率（毛利率）：base_price = purchase_price * (1 + markup_rate)
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN markup_rate REAL DEFAULT 0.5")
+        .execute(pool)
+        .await;
+
+    // 是否启用售价自动更新（true=按加成率自动算；false=人工维护 base_price）
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN auto_update_price INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // 价格变更日志表：记录每次进价/售价变更，便于审计和对账
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS product_price_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            price_type TEXT NOT NULL,
+            old_price REAL DEFAULT 0,
+            new_price REAL DEFAULT 0,
+            source TEXT,
+            ref_id INTEGER,
+            remark TEXT,
+            changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(product_id) REFERENCES product(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_price_log_product ON product_price_log(product_id, changed_at)")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE product ADD COLUMN min_purchase_price REAL DEFAULT 0")
         .execute(pool)
         .await;
@@ -3060,6 +3094,8 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
                     <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
                     <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
+                    <button class="btn btn-sm btn-success" onclick="batchSetAutoUpdate(1)">全部开启自动更新售价</button>
+                    <button class="btn btn-sm btn-secondary" onclick="batchSetAutoUpdate(0)">全部关闭自动更新售价</button>
                     <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
                     <button class="btn btn-sm btn-warning" onclick="importProducts()">导入</button>
                     <input type="file" id="productFileInput" style="display:none" accept=".xlsx,.csv" onchange="handleProductFile(this)">
@@ -3129,11 +3165,22 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <label class="form-label">分类</label>
                                     <select name="category_id" class="form-control">{0}</select>
                                 </div>
-                                <div class="col-md-4">
+                                <div class="col-md-2">
+                                    <label class="form-label">加成率（毛利率）</label>
+                                    <input type="number" step="0.01" min="0" max="5" name="markup_rate" class="form-control" oninput="onMarkupRateChange()">
+                                </div>
+                                <div class="col-md-2">
+                                    <label class="form-label">售价自动更新</label>
+                                    <select name="auto_update_price" class="form-control">
+                                        <option value="0">关闭</option>
+                                        <option value="1">开启</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-2">
                                     <label class="form-label">历史最高进价（自动）</label>
                                     <input type="number" step="0.01" name="max_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
-                                <div class="col-md-4">
+                                <div class="col-md-2">
                                     <label class="form-label">历史最低进价（自动）</label>
                                     <input type="number" step="0.01" name="min_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
@@ -3342,8 +3389,11 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     let statusBadge = p.status === 1 ? '<span class="badge bg-success">启用</span>' : '<span class="badge bg-secondary">停用</span>';
                     let toggleBtnClass = p.status === 1 ? 'btn-outline-warning' : 'btn-outline-success';
                     let toggleBtnText = p.status === 1 ? '停用' : '启用';
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + '</td>';
-                    html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
+                    let autoBadge = (p.auto_update_price === 1) ? '<span class="badge bg-info" title="开启自动更新售价">自动</span>' : '<span class="badge bg-light text-dark" title="人工维护售价">人工</span>';
+                    let autoBtnClass = (p.auto_update_price === 1) ? 'btn-outline-secondary' : 'btn-outline-info';
+                    let autoBtnText = (p.auto_update_price === 1) ? '关闭自动' : '开启自动';
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
+                    html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
             }}
@@ -3379,7 +3429,123 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                         sellingPrice = parseFloat(form.base_price.value) || 0;
                     }}
                 }}
-                form.selling_price.value = sellingPrice.toFixed(2);
+                // 应用统一尾数规则
+                form.selling_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+            }}
+
+            // 加成率变更时的客户端预览（仅在自动更新开启且有进价时）
+            function onMarkupRateChange() {{
+                const form = document.getElementById('editForm');
+                const auto = parseInt(form.auto_update_price.value);
+                if (auto !== 1) return;
+                const purchase = parseFloat(form.purchase_price.value) || 0;
+                const markup = parseFloat(form.markup_rate.value) || 0;
+                if (purchase > 0) {{
+                    const raw = purchase * (1 + markup);
+                    const preview = roundToAllowedLastDigit(raw);
+                    form.selling_price.value = preview.toFixed(2);
+                }}
+            }}
+
+            // 客户端取整（与后端 round_to_allowed_last_digit 保持一致）
+            function roundToAllowedLastDigit(price) {{
+                if (price <= 0) return price;
+                let cents = Math.round(price * 100);
+                let last = cents % 10;
+                let mapped;
+                if (last <= 2) mapped = 0;
+                else if (last <= 5) mapped = 5;
+                else if (last === 6) mapped = 6;
+                else if (last <= 8) mapped = 8;
+                else mapped = 9;
+                return (Math.floor(cents / 10) * 10 + mapped) / 100;
+            }}
+
+            // 通用：拉取商品最近采购价并在采购/销售单选商品后做同基础单位对比提示
+            // kind = 'purchase'：采购价对比最近采购价
+            // kind = 'sales'：销售零售价对比最近采购价
+            async function checkPriceAfterSelect(productId, currentBaseUnit, currentPrice, kind, productName) {{
+                try {{
+                    const res = await fetch('/api/product/last_purchase_price?product_id=' + productId);
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    const lastPrice = parseFloat(data.purchase_price) || 0;
+                    const lastUnit = data.base_unit || '';
+                    if (lastPrice <= 0) return;
+                    // 必须同基础单位才比较（避免五花肉/斤 与 五花肉/块 误比）
+                    if (lastUnit !== currentBaseUnit) {{
+                        return;
+                    }}
+                    if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
+                        const diff = currentPrice - lastPrice;
+                        const sign = diff > 0 ? '上涨' : '下降';
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                            // 用户取消：不清空已选商品，仅提示
+                        }}
+                    }} else if (kind === 'sales' && currentPrice < lastPrice) {{
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                        }}
+                    }}
+                }} catch(e) {{
+                    console.error('价格比较失败:', e);
+                }}
+            }}
+
+            // 批量设置所有商品的自动更新售价开关
+            async function batchSetAutoUpdate(auto) {{
+                const text = auto === 1 ? '开启' : '关闭';
+                if (!confirm('确定要' + text + '所有商品的自动更新售价吗？')) return;
+                const res = await fetch('/api/product/batch_set_auto_update_price', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ auto_update_price: auto }})
+                }});
+                if (res.ok) {{
+                    alert('已' + text + '所有商品的自动更新售价');
+                    loadProductsByCategory(currentCategoryId);
+                }} else {{
+                    alert('操作失败');
+                }}
+            }}
+
+            // 单个商品切换自动更新售价
+            async function toggleProductAutoUpdate(pid, currentAuto) {{
+                const nextAuto = currentAuto === 1 ? 0 : 1;
+                const text = nextAuto === 1 ? '开启' : '关闭';
+                if (!confirm('确定要' + text + '该商品的自动更新售价吗？')) return;
+                const res = await fetch('/api/product/set_auto_update_price', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ product_id: pid, auto_update_price: nextAuto }})
+                }});
+                if (res.ok) {{
+                    loadProductsByCategory(currentCategoryId);
+                }} else {{
+                    alert('操作失败');
+                }}
+            }}
+
+            // 商品编辑页价格校验：进价/售价为零普通提醒；进价>售价严重提醒
+            function validateProductPrices() {{
+                const form = document.getElementById('editForm');
+                const purchase = parseFloat(form.purchase_price.value) || 0;
+                const selling = parseFloat(form.base_price.value) || 0;
+                const warnings = [];
+                if (purchase <= 0) warnings.push('当前进价为 0');
+                if (selling <= 0) warnings.push('当前售价为 0');
+                if (purchase > 0 && selling > 0 && purchase > selling) {{
+                    const msg = '警告：当前进价（{{0}}）高于当前售价（{{1}}），请确认是否倒置！'.replace('{{0}}', purchase.toFixed(2)).replace('{{1}}', selling.toFixed(2));
+                    if (!confirm('【严重提醒】\\n' + msg + '\\n\\n是否仍要保存？')) {{
+                        return false;
+                    }}
+                    return warnings.length > 0 ? confirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\\n\\n是否仍要保存？') : true;
+                }}
+                if (warnings.length > 0) {{
+                    return confirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\\n\\n是否仍要保存？');
+                }}
+                return true;
             }}
 
             function addUnitRow(unitData) {{
@@ -3413,7 +3579,9 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 form.max_purchase_price.value = p.max_purchase_price || 0;
                 form.min_purchase_price.value = p.min_purchase_price || 0;
                 form.category_id.value = p.category_id || '';
-                
+                form.markup_rate.value = (p.markup_rate !== undefined && p.markup_rate !== null) ? p.markup_rate : 0.5;
+                form.auto_update_price.value = (p.auto_update_price !== undefined && p.auto_update_price !== null) ? p.auto_update_price : 0;
+
                 form.gov_price.value = '';
                 form.supermarket_1.value = '';
                 form.supermarket_2.value = '';
@@ -3516,6 +3684,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             async function submitEdit() {{
+                if (!validateProductPrices()) return;
                 const form = document.getElementById('editForm');
                 const p = allProducts.find(x => x.id === editingProductId);
                 const data = {{
@@ -3529,7 +3698,9 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     base_price: parseFloat(form.base_price.value) || null,
                     purchase_price: parseFloat(form.purchase_price.value) || null,
                     image_url: p ? p.image_url : null,
-                    category_id: form.category_id.value ? parseInt(form.category_id.value) : null
+                    category_id: form.category_id.value ? parseInt(form.category_id.value) : null,
+                    markup_rate: parseFloat(form.markup_rate.value) || 0.5,
+                    auto_update_price: parseInt(form.auto_update_price.value)
                 }};
                 const res = await fetch('/api/product/update', {{
                     method: 'POST',
@@ -4535,7 +4706,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
-                
+
+                // 采购单：本次采购价与最近采购价对比（同基础单位）
+                checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'purchase', items[index].product_name);
+
                 fetch('/api/product/unit/list?product_id=' + items[index].product_id)
                     .then(res => res.json())
                     .then(units => {{
@@ -5223,7 +5397,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
-                
+
+                // 销售单：本次零售价对比最近采购价（同基础单位），低于则提醒
+                checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'sales', items[index].product_name);
+
                 fetch('/api/product/unit/list?product_id=' + items[index].product_id)
                     .then(res => res.json())
                     .then(units => {{
@@ -6788,14 +6965,51 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
         Ok(_) => {}
     }
     let content = r#"
+        <style>
+            .search-suggest {
+                position: absolute;
+                z-index: 1000;
+                top: 100%;
+                left: 0;
+                right: 0;
+                max-height: 320px;
+                overflow-y: auto;
+                background: #fff;
+                border: 1px solid #ced4da;
+                border-top: none;
+                border-radius: 0 0 4px 4px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            }
+            .search-suggest ul { list-style: none; margin: 0; padding: 0; }
+            .search-suggest li {
+                padding: 8px 12px;
+                cursor: pointer;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            .search-suggest li:hover, .search-suggest li.active {
+                background-color: #e9ecef;
+            }
+            .search-suggest li strong { color: #0d6efd; }
+            .search-suggest li small { color: #6c757d; }
+        </style>
         <div class="card p-4">
             <h3>销售价格查询</h3>
             <div class="row mb-3">
-                <div class="col-md-4">
+                <div class="col-md-4" style="position:relative;">
                     <label>商品名称：</label>
-                    <input type="text" id="productName" class="form-control" placeholder="输入商品名称">
+                    <input type="text" id="productKeyword" class="form-control" placeholder="输入商品名或别称进行模糊搜索" autocomplete="off">
+                    <input type="hidden" id="productId" value="">
+                    <div id="productSuggest" class="search-suggest" style="display:none;"></div>
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-2">
                     <label>采购单位：</label>
                     <select id="purchaserId" class="form-control">
                         <option value="">全部采购单位</option>
@@ -6811,8 +7025,17 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
             </table>
             <div id="pagination" class="mt-3"></div>
         </div>
+        <div class="card p-4 mt-4" id="trendCard" style="display:none;">
+            <h4 id="trendTitle">价格趋势</h4>
+            <p class="text-muted small">进价来源于历史采购单实际成交价，售价来源于历史销售单实际成交价（均已换算为同一基础单位），保留历史原值。</p>
+            <div style="position:relative; height:380px;">
+                <canvas id="trendChart"></canvas>
+            </div>
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
         <script>
             let currentPage = 1;
+            let trendChartObj = null;
             async function loadPurchasers() {
                 const res = await fetch('/api/purchaser/list');
                 const purchasers = await res.json();
@@ -6821,13 +7044,64 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
                     select.innerHTML += '<option value="' + p.id + '">' + p.name + '</option>';
                 });
             }
+            let productSearchTimeout = null;
+            // 商品模糊搜索：输入时调用 /api/product/search（匹配商品名/别称）
+            async function handleProductSearchInput() {
+                const keyword = document.getElementById('productKeyword').value.trim();
+                const suggest = document.getElementById('productSuggest');
+                if (keyword.length < 1) {
+                    suggest.style.display = 'none';
+                    document.getElementById('productId').value = '';
+                    return;
+                }
+                if (productSearchTimeout) clearTimeout(productSearchTimeout);
+                productSearchTimeout = setTimeout(async () => {
+                    const res = await fetch('/api/product/search?keyword=' + encodeURIComponent(keyword));
+                    const products = await res.json();
+                    if (products.length === 0) {
+                        suggest.innerHTML = '<div class="p-2 text-muted">无匹配商品</div>';
+                        suggest.style.display = 'block';
+                        return;
+                    }
+                    let html = '<ul>';
+                    products.slice(0, 50).forEach(p => {
+                        const label = p.name + (p.spec ? ' (' + p.spec + ')' : '') + (p.base_unit ? ' / ' + p.base_unit : '');
+                        html += '<li onclick="selectSuggestProduct(this)" data-id="' + p.id + '" data-name="' + p.name + '">'
+                            + '<strong>' + label + '</strong>'
+                            + (p.purchase_price ? '<br><small>进价: ' + p.purchase_price + '</small>' : '')
+                            + '</li>';
+                    });
+                    html += '</ul>';
+                    suggest.innerHTML = html;
+                    suggest.style.display = 'block';
+                }, 250);
+            }
+            function selectSuggestProduct(li) {
+                const id = li.getAttribute('data-id');
+                const name = li.getAttribute('data-name');
+                document.getElementById('productId').value = id;
+                document.getElementById('productKeyword').value = name;
+                document.getElementById('productSuggest').style.display = 'none';
+            }
+            // 页面点击别处关闭下拉
+            document.addEventListener('click', function(e) {
+                const suggest = document.getElementById('productSuggest');
+                const input = document.getElementById('productKeyword');
+                if (suggest && input && !suggest.contains(e.target) && e.target !== input) {
+                    suggest.style.display = 'none';
+                }
+            });
             async function searchSalesPrice() {
                 currentPage = 1;
                 loadData();
+                loadPriceTrend();
             }
             async function loadData(page) {
                 if (page !== undefined) currentPage = page;
-                const url = '/api/query/sales_price?product_name=' + encodeURIComponent(document.getElementById('productName').value) + 
+                const productId = document.getElementById('productId').value;
+                const productName = productId ? document.getElementById('productKeyword').value.trim() : '';
+                const url = '/api/query/sales_price?product_name=' + encodeURIComponent(productName) +
+                    '&product_id=' + productId +
                     '&purchaser_id=' + document.getElementById('purchaserId').value +
                     '&page=' + currentPage + '&page_size=20';
                 const res = await fetch(url);
@@ -6864,7 +7138,90 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
                 html += '<p class="text-center text-muted mt-2">共 ' + total + ' 条记录，当前第 ' + page + '/' + totalPages + ' 页</p>';
                 container.innerHTML = html;
             }
+            async function loadPriceTrend() {
+                const productId = document.getElementById('productId').value;
+                const card = document.getElementById('trendCard');
+                if (!productId) {
+                    card.style.display = 'none';
+                    if (trendChartObj) { trendChartObj.destroy(); trendChartObj = null; }
+                    return;
+                }
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+                const url = '/api/query/product_price_trend?product_id=' + productId
+                    + (startDate ? '&start_date=' + startDate : '')
+                    + (endDate ? '&end_date=' + endDate : '');
+                const res = await fetch(url);
+                const data = await res.json();
+                card.style.display = 'block';
+                document.getElementById('trendTitle').textContent = '价格趋势 - ' + data.product_name + (data.base_unit ? '（基础单位：' + data.base_unit + '）' : '');
+                const purchasePoints = data.purchase_points || [];
+                const sellingPoints = data.selling_points || [];
+
+                // 合并进价与售价的所有日期作为统一时间轴（去重 + 排序）
+                const dateSet = new Set();
+                purchasePoints.forEach(p => dateSet.add(p.date.substring(0, 10)));
+                sellingPoints.forEach(p => {
+                    const d = (p.date || '').substring(0, 10);
+                    if (d) dateSet.add(d);
+                });
+                const labels = Array.from(dateSet).sort();
+                const purchaseMap = new Map();
+                purchasePoints.forEach(p => purchaseMap.set(p.date.substring(0, 10), p.price));
+                const sellingMap = new Map();
+                sellingPoints.forEach(p => {
+                    const d = (p.date || '').substring(0, 10);
+                    if (d) sellingMap.set(d, p.price);
+                });
+                const purchaseData = labels.map(l => purchaseMap.has(l) ? purchaseMap.get(l) : null);
+                const sellingData = labels.map(l => sellingMap.has(l) ? sellingMap.get(l) : null);
+
+                const ctx = document.getElementById('trendChart').getContext('2d');
+                if (trendChartObj) trendChartObj.destroy();
+                trendChartObj = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: '进价（基础单位）',
+                                data: purchaseData,
+                                borderColor: '#dc3545',
+                                backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                                tension: 0.2,
+                                pointRadius: 3,
+                                spanGaps: true,
+                                fill: false
+                            },
+                            {
+                                label: '售价',
+                                data: sellingData,
+                                borderColor: '#0d6efd',
+                                backgroundColor: 'rgba(13, 110, 253, 0.1)',
+                                tension: 0.2,
+                                pointRadius: 3,
+                                spanGaps: true,
+                                fill: false
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'top' },
+                            tooltip: { mode: 'index', intersect: false }
+                        },
+                        scales: {
+                            x: { title: { display: true, text: '日期' } },
+                            y: { title: { display: true, text: '价格（元）' }, beginAtZero: false }
+                        }
+                    }
+                });
+            }
             loadPurchasers();
+            // 商品模糊搜索输入监听
+            document.getElementById('productKeyword').addEventListener('input', handleProductSearchInput);
             searchSalesPrice();
         </script>
     "#;
@@ -12327,7 +12684,7 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
 
     // 分页数据查询
     let data_sql = format!(
-        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
+        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.image_url, p.category_id, p.status, c.name as category_name 
          FROM product p LEFT JOIN category c ON p.category_id = c.id
          {}
          ORDER BY p.id DESC LIMIT ? OFFSET ?",
@@ -12418,6 +12775,8 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
             "purchase_price": row.get::<f64, _>("purchase_price"),
             "max_purchase_price": row.get::<f64, _>("max_purchase_price"),
             "min_purchase_price": row.get::<f64, _>("min_purchase_price"),
+            "markup_rate": row.get::<f64, _>("markup_rate"),
+            "auto_update_price": row.get::<i64, _>("auto_update_price"),
             "image_url": row.get::<Option<String>, _>("image_url"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "status": row.get::<i64, _>("status"),
@@ -12602,6 +12961,8 @@ struct ProductUpdateReq {
     purchase_price: Option<f64>,
     image_url: Option<String>,
     category_id: Option<i64>,
+    markup_rate: Option<f64>,
+    auto_update_price: Option<i64>,
 }
 
 async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<ProductUpdateReq>) -> impl IntoResponse {
@@ -12609,8 +12970,28 @@ async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<Prod
         Err(e) => return e,
         Ok(_) => {}
     }
+    // 读取旧值用于日志
+    let old_row = sqlx::query(
+        "SELECT base_price, purchase_price, markup_rate, auto_update_price FROM product WHERE id = ?"
+    )
+    .bind(req.id)
+    .fetch_optional(pool())
+    .await
+    .ok()
+    .flatten();
+    let (old_base, old_purchase, old_markup, old_auto): (f64, f64, f64, i64) = if let Some(r) = &old_row {
+        (
+            r.get::<f64, _>("base_price"),
+            r.get::<f64, _>("purchase_price"),
+            r.get::<f64, _>("markup_rate"),
+            r.get::<i64, _>("auto_update_price"),
+        )
+    } else {
+        (0.0, 0.0, 0.5, 0)
+    };
+
     let result = sqlx::query(
-        "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ? WHERE id = ?"
+        "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ?, markup_rate = ?, auto_update_price = ? WHERE id = ?"
     )
     .bind(&req.name)
     .bind(&req.spec)
@@ -12622,12 +13003,52 @@ async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<Prod
     .bind(&req.purchase_price)
     .bind(&req.image_url)
     .bind(&req.category_id)
+    .bind(&req.markup_rate)
+    .bind(&req.auto_update_price)
     .bind(req.id)
     .execute(pool())
     .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, "更新成功".to_string()),
+        Ok(_) => {
+            let new_purchase = req.purchase_price.unwrap_or(old_purchase);
+            let new_base = req.base_price.unwrap_or(old_base);
+            // 记录进价变更
+            if (old_purchase - new_purchase).abs() >= 0.001 {
+                log_price_change(
+                    req.id,
+                    "purchase_price",
+                    old_purchase,
+                    new_purchase,
+                    "product_update",
+                    None,
+                    Some("商品编辑修改进价"),
+                ).await;
+            }
+            // 记录售价变更
+            if (old_base - new_base).abs() >= 0.001 {
+                log_price_change(
+                    req.id,
+                    "base_price",
+                    old_base,
+                    new_base,
+                    "product_update",
+                    None,
+                    Some("商品编辑修改售价"),
+                ).await;
+            }
+            // 若加成率或 auto_update_price 改变，触发重算
+            let new_markup = req.markup_rate.unwrap_or(old_markup);
+            let new_auto = req.auto_update_price.unwrap_or(old_auto);
+            if (old_markup - new_markup).abs() >= 0.001 || old_auto != new_auto {
+                eprintln!(
+                    "[商品编辑] 商品ID={} 加成率/开关变更 旧加成率={:.4} 新加成率={:.4} 旧开关={} 新开关={} 触发售价重算",
+                    req.id, old_markup, new_markup, old_auto, new_auto
+                );
+                recalc_base_price_by_markup(req.id, "product_update", None).await;
+            }
+            (StatusCode::OK, "更新成功".to_string())
+        }
         Err(e) => {
             eprintln!("更新商品失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string())
@@ -13605,14 +14026,93 @@ async fn api_product_sync_base_price(Json(req): Json<std::collections::HashMap<S
     };
 
     if selling_price > 0.0 {
+        // 读取旧值用于日志
+        let old_row = sqlx::query("SELECT base_price FROM product WHERE id = ?")
+            .bind(product_id)
+            .fetch_optional(pool())
+            .await
+            .ok()
+            .flatten();
+        let old_base_price: f64 = old_row.as_ref().map(|r| r.get::<f64, _>("base_price")).unwrap_or(0.0);
+
+        // 应用统一尾数规则
+        let normalized = round_to_allowed_last_digit(selling_price);
+        eprintln!(
+            "[售价同步] 商品ID={} 同步原始售价={:.4} 尾数处理后={:.4} 旧售价={:.4}",
+            product_id, selling_price, normalized, old_base_price
+        );
+
         let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
-            .bind(selling_price)
+            .bind(normalized)
             .bind(product_id)
             .execute(pool())
             .await;
+
+        // 若开启了自动售价更新，则该同步值会立即被加成率重算覆盖，这里仅记录日志
+        log_price_change(
+            product_id,
+            "base_price",
+            old_base_price,
+            normalized,
+            "sync_base_price",
+            None,
+            Some("按政府指导价/超市价同步"),
+        ).await;
+
+        // 若开启自动更新售价，则按加成率重算 base_price
+        recalc_base_price_by_markup(product_id, "sync_base_price", None).await;
     }
 
     StatusCode::OK
+}
+
+// 查询商品价格变更日志（支持按商品ID过滤，可选 limit）
+async fn api_product_price_log_list(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let product_id: Option<i64> = params.get("product_id").and_then(|s| s.parse().ok());
+    let limit: i64 = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(100);
+
+    let rows = if let Some(pid) = product_id {
+        sqlx::query(
+            "SELECT ppl.id, ppl.product_id, p.name as product_name, ppl.price_type, ppl.old_price, ppl.new_price, ppl.source, ppl.ref_id, ppl.remark, ppl.changed_at
+             FROM product_price_log ppl LEFT JOIN product p ON ppl.product_id = p.id
+             WHERE ppl.product_id = ? ORDER BY ppl.changed_at DESC LIMIT ?"
+        )
+        .bind(pid)
+        .bind(limit)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query(
+            "SELECT ppl.id, ppl.product_id, p.name as product_name, ppl.price_type, ppl.old_price, ppl.new_price, ppl.source, ppl.ref_id, ppl.remark, ppl.changed_at
+             FROM product_price_log ppl LEFT JOIN product p ON ppl.product_id = p.id
+             ORDER BY ppl.changed_at DESC LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+    };
+
+    let logs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "product_id": r.get::<i64, _>("product_id"),
+            "product_name": r.get::<Option<String>, _>("product_name"),
+            "price_type": r.get::<String, _>("price_type"),
+            "old_price": r.get::<f64, _>("old_price"),
+            "new_price": r.get::<f64, _>("new_price"),
+            "source": r.get::<Option<String>, _>("source"),
+            "ref_id": r.get::<Option<i64>, _>("ref_id"),
+            "remark": r.get::<Option<String>, _>("remark"),
+            "changed_at": r.get::<Option<String>, _>("changed_at"),
+        }))
+        .collect();
+
+    (StatusCode::OK, serde_json::to_string(&logs).unwrap())
 }
 
 async fn api_category_list() -> impl IntoResponse {
@@ -13937,6 +14437,362 @@ async fn api_order_generate_no(axum::extract::Query(params): axum::extract::Quer
 // 采购入库后，按商品ID更新当前进价/历史最高进价/历史最低进价
 // unit_price 为该采购明细单位单价，需换算回基础单位单价：base_unit_price = unit_price / ratio
 // 这里 base_quantity/quantity 可近似换算比例，但为稳妥直接用 unit_price 与商品当前记录比较（明细已按下单单位存储）。
+// 售价自动更新专用取整：保留两位小数，最末位仅允许 0/5/6/8/9
+// 就近取值（不向上靠）：末位与允许集合中最近者匹配
+// 映射表（百位百分位）：0→0, 1→0, 2→0, 3→5, 4→5, 5→5, 6→6, 7→8, 8→8, 9→9
+fn round_to_allowed_last_digit(price: f64) -> f64 {
+    if price <= 0.0 {
+        return price;
+    }
+    // 截断到分
+    let cents = (price * 100.0).round() / 100.0;
+    // 取出末位
+    let last = (cents * 100.0).round() as i64 % 10;
+    let mapped = match last {
+        0 | 1 | 2 => 0,
+        3 | 4 | 5 => 5,
+        6 => 6,
+        7 | 8 => 8,
+        9 => 9,
+        _ => last,
+    };
+    let integer_cents = (cents * 100.0).round() as i64;
+    let tens = integer_cents / 10;
+    let new_cents = tens * 10 + mapped;
+    new_cents as f64 / 100.0
+}
+
+#[cfg(test)]
+mod price_rounding_tests {
+    use super::round_to_allowed_last_digit;
+
+    // 末位映射表：0/1/2→0, 3/4/5→5, 6→6, 7/8→8, 9→9
+    fn expected(whole: i64, last: i64) -> f64 {
+        let mapped = match last {
+            0 | 1 | 2 => 0,
+            3 | 4 | 5 => 5,
+            6 => 6,
+            7 | 8 => 8,
+            9 => 9,
+            _ => last,
+        };
+        (whole * 10 + mapped) as f64 / 100.0
+    }
+
+    #[test]
+    fn test_last_digit_zero_to_two_rounds_to_zero() {
+        for last in 0..=2 {
+            let price = 8.30 + (last as f64) * 0.01;
+            let r = round_to_allowed_last_digit(price);
+            assert!(
+                (r - expected(83, last)).abs() < 0.0001,
+                "末位 {} 输入 {} 期望 {} 实际 {}",
+                last, price, expected(83, last), r
+            );
+        }
+    }
+
+    #[test]
+    fn test_last_digit_three_to_five_rounds_to_five() {
+        for last in 3..=5 {
+            let price = 8.30 + (last as f64) * 0.01;
+            let r = round_to_allowed_last_digit(price);
+            assert!(
+                (r - expected(83, last)).abs() < 0.0001,
+                "末位 {} 输入 {} 期望 {} 实际 {}",
+                last, price, expected(83, last), r
+            );
+        }
+    }
+
+    #[test]
+    fn test_last_digit_six_unchanged() {
+        let r = round_to_allowed_last_digit(8.36);
+        assert!((r - 8.36).abs() < 0.0001, "8.36 期望 8.36 实际 {}", r);
+    }
+
+    #[test]
+    fn test_last_digit_seven_eight_rounds_to_eight() {
+        let r7 = round_to_allowed_last_digit(8.37);
+        assert!((r7 - 8.38).abs() < 0.0001, "8.37 期望 8.38 实际 {}", r7);
+        let r8 = round_to_allowed_last_digit(8.38);
+        assert!((r8 - 8.38).abs() < 0.0001, "8.38 期望 8.38 实际 {}", r8);
+    }
+
+    #[test]
+    fn test_last_digit_nine_unchanged() {
+        let r = round_to_allowed_last_digit(8.39);
+        assert!((r - 8.39).abs() < 0.0001, "8.39 期望 8.39 实际 {}", r);
+    }
+
+    #[test]
+    fn test_full_ten_cent_coverage() {
+        // 覆盖 0.00-0.09 共 10 个尾数，期望结果末位必须属于 {0,5,6,8,9}
+        let allowed = [0, 5, 6, 8, 9];
+        for last in 0..=9 {
+            let price = 12.30 + (last as f64) * 0.01;
+            let r = round_to_allowed_last_digit(price);
+            // 用 100 倍还原分
+            let cents = (r * 100.0).round() as i64;
+            let actual_last = cents % 10;
+            assert!(
+                allowed.contains(&actual_last),
+                "尾数 {} 输入 {} 得到 {}，末位 {} 不在允许集合",
+                last, price, r, actual_last
+            );
+        }
+    }
+
+    #[test]
+    fn test_realistic_purchase_markup_scenarios() {
+        // 模拟一批进价 × (1 + 0.5) 后的尾数
+        for purchase_cents in [350i64, 437, 562, 689, 715, 832, 999, 1024, 1280, 1567, 2034] {
+            let purchase = purchase_cents as f64 / 100.0;
+            let raw = purchase * 1.5;
+            let r = round_to_allowed_last_digit(raw);
+            let cents = (r * 100.0).round() as i64;
+            let last = cents % 10;
+            let allowed = [0, 5, 6, 8, 9];
+            assert!(
+                allowed.contains(&last),
+                "进价 {} → 原始售价 {} → 调整后 {} 末位 {} 不在允许集合",
+                purchase, raw, r, last
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_or_negative_returns_as_is() {
+        assert_eq!(round_to_allowed_last_digit(0.0), 0.0);
+        assert_eq!(round_to_allowed_last_digit(-1.5), -1.5);
+    }
+
+    #[test]
+    fn test_floating_edge_cases() {
+        // 浮点 8.57000000000001 应等同 8.57
+        let r = round_to_allowed_last_digit(8.570_000_000_000_007);
+        assert!((r - 8.58).abs() < 0.0001, "8.57(浮点) 期望 8.58 实际 {}", r);
+    }
+}
+
+// 记录价格变更日志（price_type: purchase_price / base_price）
+async fn log_price_change(
+    product_id: i64,
+    price_type: &str,
+    old_price: f64,
+    new_price: f64,
+    source: &str,
+    ref_id: Option<i64>,
+    remark: Option<&str>,
+) {
+    // 仅当价格实际变化时记录
+    if (old_price - new_price).abs() < 0.001 {
+        return;
+    }
+    let _ = sqlx::query(
+        "INSERT INTO product_price_log(product_id, price_type, old_price, new_price, source, ref_id, remark) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(product_id)
+    .bind(price_type)
+    .bind(old_price)
+    .bind(new_price)
+    .bind(source)
+    .bind(ref_id)
+    .bind(remark)
+    .execute(pool())
+    .await;
+}
+
+// 根据加成率自动重算 base_price；返回是否实际更新了售价及旧/新值
+// 当商品开启 auto_update_price 且 purchase_price > 0 时生效
+async fn recalc_base_price_by_markup(
+    product_id: i64,
+    source: &str,
+    ref_id: Option<i64>,
+) {
+    let row = sqlx::query(
+        "SELECT purchase_price, base_price, markup_rate, auto_update_price FROM product WHERE id = ?"
+    )
+    .bind(product_id)
+    .fetch_optional(pool())
+    .await
+    .unwrap_or(None);
+
+    if let Some(r) = row {
+        let purchase_price: f64 = r.get("purchase_price");
+        let old_base_price: f64 = r.get("base_price");
+        let markup_rate: f64 = r.get("markup_rate");
+        let auto_update: i64 = r.get("auto_update_price");
+
+        if auto_update == 0 || purchase_price <= 0.0 {
+            eprintln!(
+                "[售价自动更新] 商品ID={} 跳过：auto_update_price={}, purchase_price={}",
+                product_id, auto_update, purchase_price
+            );
+            return;
+        }
+
+        let raw_price = purchase_price * (1.0 + markup_rate);
+        let new_base_price = round_to_allowed_last_digit(raw_price);
+        eprintln!(
+            "[售价自动更新] 商品ID={} source={} 进价={:.4} 加成率={:.4} 原始售价={:.6} 取整后售价={:.4} 旧售价={:.4}",
+            product_id, source, purchase_price, markup_rate, raw_price, new_base_price, old_base_price
+        );
+        if (old_base_price - new_base_price).abs() < 0.001 {
+            eprintln!("[售价自动更新] 商品ID={} 售价未变化，跳过写库", product_id);
+            return;
+        }
+
+        let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
+            .bind(new_base_price)
+            .bind(product_id)
+            .execute(pool())
+            .await;
+
+        log_price_change(
+            product_id,
+            "base_price",
+            old_base_price,
+            new_base_price,
+            source,
+            ref_id,
+            Some("按加成率自动重算"),
+        ).await;
+    }
+}
+
+// 单个商品开启/关闭自动更新售价，并立即按加成率重算 base_price
+async fn api_product_set_auto_update_price(
+    Json(req): Json<std::collections::HashMap<String, i64>>,
+) -> impl IntoResponse {
+    let product_id = match req.get("product_id") {
+        Some(&id) => id,
+        None => return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "missing product_id"}).to_string()).into_response(),
+    };
+    let auto = req.get("auto_update_price").copied().unwrap_or(1);
+
+    let _ = sqlx::query("UPDATE product SET auto_update_price = ? WHERE id = ?")
+        .bind(auto)
+        .bind(product_id)
+        .execute(pool())
+        .await;
+
+    recalc_base_price_by_markup(product_id, "set_auto_update_price", None).await;
+
+    (StatusCode::OK, serde_json::json!({"ok": true}).to_string()).into_response()
+}
+
+// 批量：对所有商品开启/关闭自动更新售价，并对开启的商品立即按加成率重算 base_price
+async fn api_product_batch_set_auto_update_price(
+    Json(req): Json<std::collections::HashMap<String, i64>>,
+) -> impl IntoResponse {
+    let auto = req.get("auto_update_price").copied().unwrap_or(1);
+    let _ = sqlx::query("UPDATE product SET auto_update_price = ?")
+        .bind(auto)
+        .execute(pool())
+        .await;
+
+    if auto == 1 {
+        eprintln!("[批量售价自动更新] 开始处理所有商品（auto=开启）");
+        // 开启时，对所有进价>0 的商品按加成率重算售价
+        let rows = sqlx::query("SELECT id, purchase_price, base_price, markup_rate FROM product WHERE purchase_price > 0")
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default();
+        eprintln!("[批量售价自动更新] 共 {} 个商品需要重算", rows.len());
+        for r in rows {
+            let pid: i64 = r.get("id");
+            let old_base: f64 = r.get("base_price");
+            let purchase: f64 = r.get("purchase_price");
+            let markup: f64 = r.get("markup_rate");
+            let raw = purchase * (1.0 + markup);
+            let new_base = round_to_allowed_last_digit(raw);
+            eprintln!(
+                "[批量售价自动更新] 商品ID={} 进价={:.4} 加成率={:.4} 原始售价={:.6} 取整后={:.4} 旧售价={:.4}",
+                pid, purchase, markup, raw, new_base, old_base
+            );
+            if (old_base - new_base).abs() >= 0.001 {
+                let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
+                    .bind(new_base)
+                    .bind(pid)
+                    .execute(pool())
+                    .await;
+                log_price_change(
+                    pid,
+                    "base_price",
+                    old_base,
+                    new_base,
+                    "batch_set_auto_update_price",
+                    None,
+                    Some("批量开启自动更新售价"),
+                ).await;
+            }
+        }
+    }
+
+    (StatusCode::OK, serde_json::json!({"ok": true}).to_string()).into_response()
+}
+
+// 获取某商品最近一次采购的基础单位单价（按 purchase_order_item 的 base_unit 维度的同基础单位）
+// 通过该商品最近的采购单明细反推：unit_price 为下单单位价，乘以 ratio 得基础单位价
+async fn api_product_last_purchase_price(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let product_id: i64 = match params.get("product_id").and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "missing product_id"}).to_string()).into_response(),
+    };
+
+    // 优先用商品表里维护的 purchase_price（每次采购后已同步）
+    let row = sqlx::query(
+        "SELECT purchase_price, base_unit FROM product WHERE id = ?"
+    )
+    .bind(product_id)
+    .fetch_optional(pool())
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(r) = row {
+        let purchase_price: f64 = r.get("purchase_price");
+        let base_unit: String = r.get("base_unit");
+        // 同时取出最近一次采购的原始下单单价及单位，便于前端核对是否同基础单位
+        let last_row = sqlx::query(
+            "SELECT poi.unit_price, poi.unit, p.base_unit
+             FROM purchase_order_item poi
+             JOIN purchase_order po ON poi.order_id = po.id
+             JOIN product p ON poi.product_id = p.id
+             WHERE poi.product_id = ?
+             ORDER BY po.order_date DESC, po.id DESC
+             LIMIT 1"
+        )
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+
+        let (last_unit_price, last_unit) = if let Some(lr) = last_row {
+            (
+                lr.get::<f64, _>("unit_price"),
+                lr.get::<String, _>("unit"),
+            )
+        } else {
+            (0.0, base_unit.clone())
+        };
+
+        let payload = serde_json::json!({
+            "purchase_price": purchase_price,
+            "base_unit": base_unit,
+            "last_unit_price": last_unit_price,
+            "last_unit": last_unit,
+        });
+        return (StatusCode::OK, serde_json::to_string(&payload).unwrap()).into_response();
+    }
+
+    (StatusCode::NOT_FOUND, serde_json::json!({"error": "product not found"}).to_string()).into_response()
+}
+
 // 规则：当前进价 = 最近一次采购价；最高进价 = 历史最高；最低进价 = 历史最低（新品或价格为0时初始化）。
 async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
     for item in items {
@@ -13968,6 +14824,7 @@ async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
         .unwrap_or(None);
 
         if let Some(r) = row {
+            let old_purchase: f64 = r.get::<f64, _>("purchase_price");
             let old_max: f64 = r.get::<f64, _>("max_purchase_price");
             let old_min: f64 = r.get::<f64, _>("min_purchase_price");
 
@@ -13984,6 +14841,24 @@ async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
             .bind(item.product_id)
             .execute(pool())
             .await;
+
+            // 记录进价变更日志
+            log_price_change(
+                item.product_id,
+                "purchase_price",
+                old_purchase,
+                base_unit_price,
+                "purchase_order",
+                None,
+                Some("采购单更新进价"),
+            ).await;
+
+            // 进价变化后，若开启自动售价更新则按加成率重算 base_price
+            eprintln!(
+                "[采购单进价更新] 商品ID={} 基础单位进价={:.4} 触发售价重算",
+                item.product_id, base_unit_price
+            );
+            recalc_base_price_by_markup(item.product_id, "purchase_order", None).await;
         }
     }
 }
@@ -15969,8 +16844,148 @@ async fn api_query_sales_order_export(axum::extract::Query(params): axum::extrac
     ).into_response()
 }
 
+// 商品价格同期走势：返回指定商品在时间段内的进价点（来自采购单实际成交价）和售价点（来自价格变更日志）
+// 不应用尾数取整规则——历史原值
+async fn api_query_product_price_trend(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let product_id: i64 = match params.get("product_id").and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "missing product_id"}).to_string()).into_response(),
+    };
+    let start_date = params.get("start_date").cloned().unwrap_or_default();
+    let end_date = params.get("end_date").cloned().unwrap_or_default();
+
+    // 1) 取商品信息（基础单位）
+    let product_row = sqlx::query("SELECT id, name, spec, base_unit FROM product WHERE id = ?")
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    if product_row.is_none() {
+        return (StatusCode::NOT_FOUND, serde_json::json!({"error": "product not found"}).to_string()).into_response();
+    }
+    let product = product_row.unwrap();
+    let product_name: String = product.get("name");
+    let base_unit: String = product.get("base_unit");
+
+    // 2) 同一商品可能因别名/规格存在多个 product_id，需要一并查询（仅当同 base_unit 时聚合）
+    // 简化处理：只查主 product_id；如 spec 不同则按名称+基础单位匹配
+    let same_base_products: Vec<i64> = {
+        let rows = sqlx::query("SELECT id FROM product WHERE name = ? AND base_unit = ?")
+            .bind(&product_name)
+            .bind(&base_unit)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default();
+        rows.iter().map(|r| r.get::<i64, _>("id")).collect()
+    };
+    if same_base_products.is_empty() {
+        return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+            "product_id": product_id,
+            "product_name": product_name,
+            "base_unit": base_unit,
+            "purchase_points": [],
+            "selling_points": [],
+        })).unwrap()).into_response();
+    }
+
+    // 构造 IN 列表
+    let placeholders = same_base_products.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    // 备注：早期版本曾尝试在 SQL 内做单位换算匹配，因实现复杂改为在应用层按 base_unit 过滤
+    let purchase_sql = format!(
+        "SELECT po.order_date as date, poi.unit_price as price, poi.unit as unit, poi.base_quantity as bq, poi.quantity as qty, poi.amount as amount
+         FROM purchase_order_item poi
+         JOIN purchase_order po ON poi.order_id = po.id
+         WHERE poi.product_id IN ({})
+         {} {}
+         ORDER BY po.order_date ASC",
+        placeholders,
+        if start_date.is_empty() { String::new() } else { format!("AND po.order_date >= '{}'", start_date.replace('\'', "''")) },
+        if end_date.is_empty() { String::new() } else { format!("AND po.order_date <= '{}'", end_date.replace('\'', "''")) },
+    );
+    let mut purchase_q = sqlx::query(AssertSqlSafe(purchase_sql));
+    for pid in &same_base_products {
+        purchase_q = purchase_q.bind(pid);
+    }
+    let purchase_rows = purchase_q.fetch_all(pool()).await.unwrap_or_default();
+
+    // 换算为基础单位单价：基础单位单价 = amount / base_quantity（若 base_quantity>0）；否则 unit_price（仅在 unit == base_unit 时）
+    let mut purchase_points: Vec<serde_json::Value> = Vec::new();
+    for r in &purchase_rows {
+        let date: String = r.get("date");
+        let unit: String = r.get("unit");
+        let unit_price: f64 = r.get("price");
+        let bq: Option<f64> = r.get("bq");
+        let qty: Option<f64> = r.get("qty");
+        let amount: Option<f64> = r.get("amount");
+        let base_unit_price = if unit == base_unit {
+            unit_price
+        } else if let (Some(bqv), Some(_qv), Some(av)) = (bq, qty, amount) {
+            if bqv > 0.0 { av / bqv } else { unit_price }
+        } else {
+            // 没有 base_quantity 字段时跳过（避免与不同单位数据混淆）
+            continue;
+        };
+        purchase_points.push(serde_json::json!({
+            "date": date,
+            "price": base_unit_price,
+        }));
+    }
+
+    // 3) 售价点：来自销售订单明细的实际成交价（sales_order_item），与查询列表数据源一致
+    //    换算为基础单位单价，与进价同口径比较
+    let selling_sql = format!(
+        "SELECT so.order_date as date, soi.unit_price as price, soi.unit as unit, soi.base_quantity as bq, soi.quantity as qty, soi.amount as amount
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         WHERE soi.product_id IN ({})
+         {} {}
+         ORDER BY so.order_date ASC",
+        placeholders,
+        if start_date.is_empty() { String::new() } else { format!("AND so.order_date >= '{}'", start_date.replace('\'', "''")) },
+        if end_date.is_empty() { String::new() } else { format!("AND so.order_date <= '{}'", end_date.replace('\'', "''")) },
+    );
+    let mut selling_q = sqlx::query(AssertSqlSafe(selling_sql));
+    for pid in &same_base_products {
+        selling_q = selling_q.bind(pid);
+    }
+    let selling_rows = selling_q.fetch_all(pool()).await.unwrap_or_default();
+    // 换算为基础单位单价：同进价口径
+    let mut selling_points: Vec<serde_json::Value> = Vec::new();
+    for r in &selling_rows {
+        let date: String = r.get("date");
+        let unit: String = r.get("unit");
+        let unit_price: f64 = r.get("price");
+        let bq: Option<f64> = r.get("bq");
+        let qty: Option<f64> = r.get("qty");
+        let amount: Option<f64> = r.get("amount");
+        let base_unit_price = if unit == base_unit {
+            unit_price
+        } else if let (Some(bqv), Some(_qv), Some(av)) = (bq, qty, amount) {
+            if bqv > 0.0 { av / bqv } else { unit_price }
+        } else {
+            continue;
+        };
+        selling_points.push(serde_json::json!({
+            "date": date,
+            "price": base_unit_price,
+        }));
+    }
+
+    (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+        "product_id": product_id,
+        "product_name": product_name,
+        "base_unit": base_unit,
+        "purchase_points": purchase_points,
+        "selling_points": selling_points,
+    })).unwrap()).into_response()
+}
+
 async fn api_query_sales_price(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
+    let product_id = params.get("product_id").map(|s| s.as_str()).unwrap_or("");
     let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
     
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -15987,6 +17002,10 @@ async fn api_query_sales_price(axum::extract::Query(params): axum::extract::Quer
     if !product_name.is_empty() {
         base_sql.push_str(" AND soi.product_name LIKE ?");
         binds.push(format!("%{}%", product_name));
+    }
+    if !product_id.is_empty() {
+        base_sql.push_str(" AND soi.product_id = ?");
+        binds.push(product_id.to_string());
     }
     if !purchaser_id.is_empty() {
         base_sql.push_str(" AND so.purchaser_id = ?");
@@ -23263,6 +24282,10 @@ fn build_router() -> Router {
         .route("/api/product/price/delete", post(api_product_price_delete))
         .route("/api/product/price/delete_by_product", post(api_product_price_delete_by_product))
         .route("/api/product/sync_base_price", post(api_product_sync_base_price))
+        .route("/api/product/price_log/list", get(api_product_price_log_list))
+        .route("/api/product/last_purchase_price", get(api_product_last_purchase_price))
+        .route("/api/product/set_auto_update_price", post(api_product_set_auto_update_price))
+        .route("/api/product/batch_set_auto_update_price", post(api_product_batch_set_auto_update_price))
         .route("/api/category/list", get(api_category_list))
         .route("/api/category/tree", get(api_category_tree))
         .route("/api/category/create", post(api_category_create))
@@ -23341,6 +24364,7 @@ fn build_router() -> Router {
         .route("/api/query/sales_order/export", get(api_query_sales_order_export))
         .route("/api/query/sales_price", get(api_query_sales_price))
         .route("/api/query/sales_price/export", get(api_query_sales_price_export))
+        .route("/api/query/product_price_trend", get(api_query_product_price_trend))
         .route("/api/query/sales_summary", get(api_query_sales_summary))
         .route("/api/query/sales_summary/export", get(api_query_sales_summary_export))
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
