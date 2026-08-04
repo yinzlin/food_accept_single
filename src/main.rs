@@ -124,21 +124,21 @@ fn has_permission(role: &str, required_role: &str) -> bool {
 fn has_permission_point(role: &str, permission: &str) -> bool {
     use std::collections::HashSet;
     // 全部业务权限点（供 super_admin 全量拥有）
-    const ALL_PERMS: [&str; 17] = [
-        "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel", "purchase_order.delete",
-        "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
+    const ALL_PERMS: [&str; 20] = [
+        "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.unapprove", "purchase_order.cancel", "purchase_order.delete",
+        "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.unapprove", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
         "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
     ];
 
     let role_perms: HashSet<&str> = match role {
         "super_admin" => HashSet::from(ALL_PERMS),
         "admin" => HashSet::from([
-            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel", "purchase_order.delete",
-            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
+            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.unapprove", "purchase_order.cancel", "purchase_order.delete",
+            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.unapprove", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
             "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
         ]),
         "supplier" => HashSet::from([
-            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel",
+            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.cancel",
             "sales_order.view", "query.view",
         ]),
         "purchaser" => HashSet::from([
@@ -265,6 +265,7 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
         "/system" | "/api/system/config" => Some("super_admin"),
+        "/system/operation_log" => Some("admin"),
         "/backup" | "/api/backup" | "/api/backup/*" => Some("super_admin"),
         "/restore" | "/api/restore/*" => Some("super_admin"),
         _ => None,
@@ -290,6 +291,10 @@ fn check_api_route_permission(path: &str) -> Option<&str> {
             Some("purchase_order.create")
         } else if path.ends_with("/update") {
             Some("purchase_order.update")
+        } else if path.ends_with("/approve") {
+            Some("purchase_order.approve")
+        } else if path.ends_with("/unapprove") {
+            Some("purchase_order.unapprove")
         } else if path.ends_with("/delete") {
             Some("purchase_order.delete")
         } else if path.ends_with("/cancel") {
@@ -310,6 +315,10 @@ fn check_api_route_permission(path: &str) -> Option<&str> {
             Some("sales_order.create")
         } else if path.ends_with("/update") || path.ends_with("/correction") || path.ends_with("/upload_image") || path.ends_with("/delete_image") {
             Some("sales_order.update")
+        } else if path.ends_with("/approve") {
+            Some("sales_order.approve")
+        } else if path.ends_with("/unapprove") {
+            Some("sales_order.unapprove")
         } else if path.ends_with("/delete") {
             Some("sales_order.delete")
         } else if path.ends_with("/update_prices") {
@@ -1087,6 +1096,15 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 乐观锁版本号：审核/反审核与并发修改防护，已有数据默认 version=1 不受影响
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN version INTEGER DEFAULT 1")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN version INTEGER DEFAULT 1")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN alias1 TEXT")
         .execute(pool)
         .await;
@@ -1458,6 +1476,8 @@ struct PurchaseOrderReq {
     handler_phone: Option<String>,
     items: Vec<PurchaseOrderItemReq>,
     remark: Option<String>,
+    /// 乐观锁版本号：编辑时从详情接口取得，提交时校验，防止覆盖他人修改
+    version: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1490,6 +1510,8 @@ struct SalesOrderReq {
     warehouse_name: String,
     items: Vec<SalesOrderItemReq>,
     remark: Option<String>,
+    /// 乐观锁版本号：编辑时从详情接口取得，提交时校验，防止覆盖他人修改
+    version: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1781,6 +1803,9 @@ fn sidebar_html() -> String {
                         </li>
                         <li class="tree-node leaf" data-path="/restore">
                             <a href="/restore"><span class="node-icon">🔄</span><span class="node-label">数据恢复</span></a>
+                        </li>
+                        <li class="tree-node leaf" data-path="/system/operation_log">
+                            <a href="/system/operation_log"><span class="node-icon">📝</span><span class="node-label">操作日志</span></a>
                         </li>
                     </ul>
                 </li>
@@ -4762,8 +4787,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + discounted.toFixed(2) + '</td>' +
                         '<td>' + reduction.toFixed(2) + '</td>' +
                         '<td>' + finalAmt.toFixed(2) + '</td>' +
-                        '<td>' + order.status + '</td>' +
+                        '<td>' + orderStatusLabel(order.status) + '</td>' +
                         '<td>' +
+                        (order.status === 'pending' ? '<button onclick="event.stopPropagation(); approveOrder(' + order.id + ')" class="btn btn-success btn-sm me-1">审核</button>' : '') +
+                        (order.status === 'confirmed' ? '<button onclick="event.stopPropagation(); unapproveOrder(' + order.id + ')" class="btn btn-warning btn-sm me-1">反审核</button>' : '') +
                         '<button onclick="event.stopPropagation(); exportPurchaseOrder(' + order.id + ')" class="btn btn-info btn-sm me-1">导出采购单</button>' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
@@ -5062,6 +5089,51 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             let currentOrderId = null;
+            let currentVersion = 1;
+
+            function orderStatusLabel(s) {{
+                const map = {{ 'pending': '待审核', 'confirmed': '已审核', 'sorting': '分拣中', 'sorted': '已分拣', 'delivering': '配送中', 'delivered': '已送达', 'accepted': '已验收', 'settled': '已结算', 'cancelled': '已作废' }};
+                return map[s] || s;
+            }}
+
+            // 审核：pending → confirmed，锁定订单（需审核权限）
+            async function approveOrder(id) {{
+                if (!confirm('确定审核通过该订单？审核后订单将被锁定，修改需管理员反审核。')) return;
+                const res = await fetch('/api/purchase_order/approve/' + id, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ reason: '' }})
+                }});
+                const text = await res.text();
+                if (res.ok) {{
+                    alert('审核成功');
+                    loadOrders();
+                }} else {{
+                    alert(text || '审核失败');
+                }}
+            }}
+
+            // 反审核：confirmed → pending，解锁订单（仅管理员，强制原因）
+            async function unapproveOrder(id) {{
+                const reason = prompt('请输入反审核原因（必填）：');
+                if (reason === null) return;
+                if (!reason.trim()) {{
+                    alert('反审核必须填写原因');
+                    return;
+                }}
+                const res = await fetch('/api/purchase_order/unapprove/' + id, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ reason: reason.trim() }})
+                }});
+                const text = await res.text();
+                if (res.ok) {{
+                    alert('反审核成功，订单已解锁');
+                    loadOrders();
+                }} else {{
+                    alert(text || '反审核失败');
+                }}
+            }}
 
             async function saveOrder() {{
                 const supplierId = document.getElementById('supplierId').value;
@@ -5087,7 +5159,8 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     warehouse_name: document.getElementById('warehouseInput').value || '',
                     user_id: parseInt(document.getElementById('handlerId').value) || null,
                     items: validItems,
-                    remark: document.getElementById('remarkInput').value || null
+                    remark: document.getElementById('remarkInput').value || null,
+                    version: currentVersion
                 }};
                 const url = currentOrderId ? '/api/purchase_order/update' : '/api/purchase_order/create';
                 const res = await fetch(url, {{
@@ -5097,6 +5170,9 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 }});
                 if (res.ok) {{
                     location.reload();
+                }} else {{
+                    const text = await res.text();
+                    alert(text || '保存失败');
                 }}
             }}
 
@@ -5104,6 +5180,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 const res = await fetch('/api/purchase_order/detail/' + id);
                 const order = await res.json();
                 currentOrderId = order.id;
+                currentVersion = order.version || 1;
                 document.getElementById('supplierId').value = order.supplier_id;
                 document.getElementById('supplierInput').value = order.supplier_name;
                 document.getElementById('warehouseId').value = order.warehouse_id || 0;
@@ -5883,6 +5960,29 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             let currentOrderId = null;
+            let currentVersion = 1;
+
+            // 反审核：confirmed → pending，解锁订单（仅管理员，强制原因）
+            async function unapproveSalesOrder(id) {{
+                const reason = prompt('请输入反审核原因（必填）：');
+                if (reason === null) return;
+                if (!reason.trim()) {{
+                    alert('反审核必须填写原因');
+                    return;
+                }}
+                const res = await fetch('/api/sales_order/unapprove/' + id, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ reason: reason.trim() }})
+                }});
+                const text = await res.text();
+                if (res.ok) {{
+                    alert('反审核成功，订单已解锁');
+                    loadOrders();
+                }} else {{
+                    alert(text || '反审核失败');
+                }}
+            }}
 
             async function saveOrder() {{
                 const purchaserId = document.getElementById('purchaserId').value;
@@ -5907,7 +6007,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
                     items: validItems,
-                    remark: document.getElementById('remarkInput').value || null
+                    remark: document.getElementById('remarkInput').value || null,
+                    version: currentVersion
                 }};
                 const isNew = !currentOrderId;
                 const url = isNew ? '/api/sales_order/create' : '/api/sales_order/update';
@@ -6031,7 +6132,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     sumFinal += finalAmt;
                     const selected = currentOrderId === order.id ? ' style="cursor: pointer; background-color: #fff3cd;"' : ' style="cursor: pointer;"';
                     const statusMap = {{
-                        'pending': '{{"text":"待分拣","class":"bg-secondary"}}',
+                        'pending': '{{"text":"待审核","class":"bg-secondary"}}',
+                        'confirmed': '{{"text":"已审核","class":"bg-primary"}}',
                         'sorting': '{{"text":"分拣中","class":"bg-primary"}}',
                         'sorted': '{{"text":"已分拣","class":"bg-success"}}',
                         'delivering': '{{"text":"配送中","class":"bg-warning text-dark"}}',
@@ -6042,7 +6144,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const statusInfo = JSON.parse(statusMap[order.status] || '{{"text":"未知","class":"bg-gray"}}');
                     const statusBadge = '<span class="badge ' + statusInfo.class + '">' + statusInfo.text + '</span>';
                     const nextStatusMap = {{
-                        'pending': '{{"text":"开始分拣","status":"sorting"}}',
+                        'pending': '{{"text":"审核","status":"confirmed"}}',
+                        'confirmed': '{{"text":"开始分拣","status":"sorting"}}',
                         'sorting': '{{"text":"完成分拣","status":"sorted"}}',
                         'sorted': '{{"text":"开始配送","status":"delivering"}}',
                         'delivering': '{{"text":"确认送达","status":"delivered"}}',
@@ -6052,6 +6155,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     }};
                     const nextInfo = JSON.parse(nextStatusMap[order.status] || '{{"text":"","status":""}}');
                     const nextBtn = nextInfo.text ? '<button onclick="event.stopPropagation(); updateOrderStatus(' + order.id + ', \'' + nextInfo.status + '\')" class="btn btn-primary btn-sm">' + nextInfo.text + '</button> ' : '';
+                    const unapproveBtn = order.status === 'confirmed' ? '<button onclick="event.stopPropagation(); unapproveSalesOrder(' + order.id + ')" class="btn btn-warning btn-sm">反审核</button> ' : '';
                     const reimburseBtn = order.is_reimburse ? '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-warning btn-sm">导出报销单</button> ' : '';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')"' + selected + '>' +
                         '<td>' + order.id + '</td>' +
@@ -6065,6 +6169,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + statusBadge + '</td>' +
                         '<td>' +
                         nextBtn +
+                        unapproveBtn +
                         '<button onclick="event.stopPropagation(); exportRealExcel(' + order.id + ')" class="btn btn-success btn-sm">导出验收单</button> ' +
                         reimburseBtn +
                         '<button onclick="event.stopPropagation(); generatePurchaseOrders(' + order.id + ')" class="btn btn-info btn-sm">生成采购订单</button> ' +
@@ -6104,6 +6209,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 const res = await fetch('/api/sales_order/detail/' + id);
                 const order = await res.json();
                 currentOrderId = order.id;
+                currentVersion = order.version || 1;
                 document.getElementById('formTitle').textContent = '编辑销售订单';
                 document.getElementById('saveBtn').textContent = '保存修改';
                 document.getElementById('purchaserId').value = order.purchaser_id;
@@ -9223,6 +9329,150 @@ async fn page_system(headers: axum::http::HeaderMap) -> Html<String> {
     Html(layout_html("系统参数", "/system", &content))
 }
 
+async fn page_operation_log(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/system/operation_log").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+
+    let content = r#"
+        <div class="card p-4">
+            <h3>操作日志</h3>
+            <p class="text-muted">记录所有关键写操作（创建/修改/删除/审核/反审核/调价/状态流转等），全程留痕可追溯。</p>
+
+            <div class="row g-2 mb-3">
+                <div class="col-auto">
+                    <input type="text" id="logUsername" class="form-control" placeholder="操作人">
+                </div>
+                <div class="col-auto">
+                    <input type="text" id="logAction" class="form-control" placeholder="动作（如 审核）">
+                </div>
+                <div class="col-auto">
+                    <input type="date" id="logStartDate" class="form-control">
+                </div>
+                <div class="col-auto">
+                    <input type="date" id="logEndDate" class="form-control">
+                </div>
+                <div class="col-auto">
+                    <button onclick="searchLogs()" class="btn btn-primary">查询</button>
+                    <button onclick="resetLogs()" class="btn btn-secondary">重置</button>
+                    <button onclick="exportLogs()" class="btn btn-success">导出Excel</button>
+                </div>
+            </div>
+
+            <table class="table table-bordered table-sm">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>时间</th>
+                        <th>操作人</th>
+                        <th>动作</th>
+                        <th>目标</th>
+                        <th>详情</th>
+                    </tr>
+                </thead>
+                <tbody id="logListBody"></tbody>
+            </table>
+            <div id="pagination"></div>
+        </div>
+
+        <script>
+            let logPage = 1;
+
+            function renderLogs(data) {
+                const tbody = document.getElementById('logListBody');
+                tbody.innerHTML = '';
+                (data.data || []).forEach(row => {
+                    const typeLabel = row.target_type === 'purchase_order' ? '采购单' : row.target_type === 'sales_order' ? '销售单' : row.target_type === 'purchase_document' ? '采购单据' : (row.target_type || '-');
+                    tbody.innerHTML += '<tr>' +
+                        '<td>' + row.id + '</td>' +
+                        '<td>' + row.created_at + '</td>' +
+                        '<td>' + (row.username || '-') + '</td>' +
+                        '<td><span class="badge bg-info text-dark">' + row.action_label + '</span></td>' +
+                        '<td>' + typeLabel + (row.target_id ? ' #' + row.target_id : '') + '</td>' +
+                        '<td class="small">' + (row.detail || '') + '</td>' +
+                        '</tr>';
+                });
+                if (!data.data || data.data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">暂无日志记录</td></tr>';
+                }
+                renderPagination(data);
+            }
+
+            function renderPagination(data) {
+                const container = document.getElementById('pagination');
+                if (!container) return;
+                if (data.total_pages <= 1) {
+                    container.innerHTML = '<p class="text-center text-muted mt-2">共 ' + data.total + ' 条记录</p>';
+                    return;
+                }
+                let html = '<nav><ul class="pagination justify-content-center">';
+                html += '<li class="page-item ' + (data.page <= 1 ? 'disabled' : '') + '"><a class="page-link" onclick="loadLogs(' + (data.page - 1) + ')">上一页</a></li>';
+                for (let i = 1; i <= data.total_pages; i++) {
+                    html += '<li class="page-item ' + (i === data.page ? 'active' : '') + '"><a class="page-link" onclick="loadLogs(' + i + ')">' + i + '</a></li>';
+                }
+                html += '<li class="page-item ' + (data.page >= data.total_pages ? 'disabled' : '') + '"><a class="page-link" onclick="loadLogs(' + (data.page + 1) + ')">下一页</a></li>';
+                html += '</ul></nav>';
+                html += '<p class="text-center text-muted mt-2">共 ' + data.total + ' 条记录，当前第 ' + data.page + '/' + data.total_pages + ' 页</p>';
+                container.innerHTML = html;
+            }
+
+            function buildLogUrl(page) {
+                let url = '/api/system/operation_log?page=' + page + '&page_size=20';
+                const username = document.getElementById('logUsername').value.trim();
+                const action = document.getElementById('logAction').value.trim();
+                const startDate = document.getElementById('logStartDate').value;
+                const endDate = document.getElementById('logEndDate').value;
+                if (username) url += '&username=' + encodeURIComponent(username);
+                if (action) url += '&action=' + encodeURIComponent(action);
+                if (startDate) url += '&start_date=' + startDate;
+                if (endDate) url += '&end_date=' + endDate;
+                return url;
+            }
+
+            async function loadLogs(page) {
+                if (page !== undefined) logPage = page;
+                const res = await fetch(buildLogUrl(logPage));
+                const data = await res.json();
+                renderLogs(data);
+            }
+
+            function searchLogs() {
+                logPage = 1;
+                loadLogs(1);
+            }
+
+            function resetLogs() {
+                document.getElementById('logUsername').value = '';
+                document.getElementById('logAction').value = '';
+                document.getElementById('logStartDate').value = '';
+                document.getElementById('logEndDate').value = '';
+                logPage = 1;
+                loadLogs(1);
+            }
+
+            // 导出 Excel：应用当前筛选条件，下载全量匹配记录
+            function exportLogs() {
+                const params = new URLSearchParams();
+                const username = document.getElementById('logUsername').value.trim();
+                const action = document.getElementById('logAction').value.trim();
+                const startDate = document.getElementById('logStartDate').value;
+                const endDate = document.getElementById('logEndDate').value;
+                if (username) params.set('username', username);
+                if (action) params.set('action', action);
+                if (startDate) params.set('start_date', startDate);
+                if (endDate) params.set('end_date', endDate);
+                const qs = params.toString();
+                window.location.href = '/api/system/operation_log/export' + (qs ? '?' + qs : '');
+            }
+
+            loadLogs(1);
+        </script>
+    "#;
+
+    Html(layout_html("操作日志", "/system/operation_log", &content))
+}
+
 async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
     match check_page_permission(&headers, "/user").await {
         Err(e) => return e,
@@ -11418,6 +11668,214 @@ async fn api_system_config(Json(data): Json<std::collections::HashMap<String, St
             .unwrap_or_default();
     }
     (StatusCode::OK, "设置保存成功".to_string())
+}
+
+/// 操作动作中文文案
+fn operation_action_label(action: &str) -> String {
+    let map = [
+        ("purchase_order.create", "创建采购单"),
+        ("purchase_order.update", "修改采购单"),
+        ("purchase_order.delete", "删除采购单"),
+        ("purchase_order.approve", "采购单审核"),
+        ("purchase_order.unapprove", "采购单反审核"),
+        ("purchase_order.import", "导入采购单"),
+        ("sales_order.create", "创建销售单"),
+        ("sales_order.update", "修改销售单"),
+        ("sales_order.delete", "删除销售单"),
+        ("sales_order.approve", "销售单审核"),
+        ("sales_order.unapprove", "销售单反审核"),
+        ("sales_order.update_status", "销售单状态流转"),
+        ("sales_order.adjust_price", "销售单调价"),
+        ("sales_order.import", "导入销售单"),
+        ("sales_order.correction", "批量修正数量"),
+        ("sales_order.generate_purchase", "生成采购订单"),
+        ("sales_order.upload_image", "上传订单图片"),
+        ("sales_order.delete_image", "删除订单图片"),
+        ("purchase_document.upload", "上传采购单据"),
+        ("purchase_document.delete", "删除采购单据"),
+    ];
+    for (k, v) in map {
+        if action == k {
+            return v.to_string();
+        }
+    }
+    action.to_string()
+}
+
+/// 操作审计日志查询：分页 + 按操作人/动作/日期范围筛选
+async fn api_operation_log_list(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/system/operation_log").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20).min(100);
+    let offset = (page - 1) * page_size;
+
+    let username = params.get("username").map(|s| s.as_str()).unwrap_or("").trim();
+    let action = params.get("action").map(|s| s.as_str()).unwrap_or("").trim();
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new();
+    if !username.is_empty() {
+        where_sql.push_str(" AND username LIKE ?");
+        binds.push(format!("%{}%", username));
+    }
+    if !action.is_empty() {
+        where_sql.push_str(" AND action LIKE ?");
+        binds.push(format!("%{}%", action));
+    }
+    if !start_date.is_empty() {
+        where_sql.push_str(" AND date(created_at) >= ?");
+        binds.push(start_date.to_string());
+    }
+    if !end_date.is_empty() {
+        where_sql.push_str(" AND date(created_at) <= ?");
+        binds.push(end_date.to_string());
+    }
+
+    let count_sql = format!("SELECT COUNT(*) as count FROM operation_log{}", where_sql);
+    let mut count_q = sqlx::query(AssertSqlSafe(count_sql.as_str()));
+    for b in &binds {
+        count_q = count_q.bind(b);
+    }
+    let total_rows = count_q.fetch_one(pool()).await.unwrap();
+    let total: i64 = total_rows.get("count");
+
+    let data_sql = format!(
+        "SELECT id, user_id, username, action, target_type, target_id, detail, created_at FROM operation_log{} ORDER BY id DESC LIMIT ? OFFSET ?",
+        where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(data_sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    q = q.bind(page_size).bind(offset);
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
+
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let action: String = r.get("action");
+            serde_json::json!({
+                "id": r.get::<i64, _>("id"),
+                "user_id": r.get::<i64, _>("user_id"),
+                "username": r.get::<String, _>("username"),
+                "action": action,
+                "action_label": operation_action_label(&action),
+                "target_type": r.get::<String, _>("target_type"),
+                "target_id": r.get::<String, _>("target_id"),
+                "detail": r.get::<String, _>("detail"),
+                "created_at": r.get::<String, _>("created_at"),
+            })
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "data": list,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) / page_size
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+/// 操作审计日志导出 Excel：应用与列表一致的筛选条件，导出全量匹配记录供审计分析
+async fn api_operation_log_export(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/system/operation_log/export").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+
+    let username = params.get("username").map(|s| s.as_str()).unwrap_or("").trim();
+    let action = params.get("action").map(|s| s.as_str()).unwrap_or("").trim();
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new();
+    if !username.is_empty() {
+        where_sql.push_str(" AND username LIKE ?");
+        binds.push(format!("%{}%", username));
+    }
+    if !action.is_empty() {
+        where_sql.push_str(" AND action LIKE ?");
+        binds.push(format!("%{}%", action));
+    }
+    if !start_date.is_empty() {
+        where_sql.push_str(" AND date(created_at) >= ?");
+        binds.push(start_date.to_string());
+    }
+    if !end_date.is_empty() {
+        where_sql.push_str(" AND date(created_at) <= ?");
+        binds.push(end_date.to_string());
+    }
+
+    let sql = format!(
+        "SELECT id, user_id, username, action, target_type, target_id, detail, created_at FROM operation_log{} ORDER BY id DESC",
+        where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
+
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("操作日志").unwrap();
+
+    let header_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0x2E75B6))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+
+    let headers = ["ID", "操作时间", "操作人", "动作", "目标类型", "目标ID", "详情"];
+    for (col, header) in headers.iter().enumerate() {
+        worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
+    }
+
+    for (i, row) in rows.iter().enumerate() {
+        let r = (i + 1) as u32;
+        let action: String = row.get("action");
+        let target_type: String = row.get("target_type");
+        let type_label = match target_type.as_str() {
+            "purchase_order" => "采购单",
+            "sales_order" => "销售单",
+            "purchase_document" => "采购单据",
+            _ => &target_type,
+        };
+        worksheet.write(r, 0, row.get::<i64, _>("id")).unwrap();
+        worksheet.write(r, 1, row.get::<String, _>("created_at")).unwrap();
+        worksheet.write(r, 2, row.get::<String, _>("username")).unwrap();
+        worksheet.write(r, 3, operation_action_label(&action)).unwrap();
+        worksheet.write(r, 4, type_label).unwrap();
+        worksheet.write(r, 5, row.get::<String, _>("target_id")).unwrap();
+        worksheet.write(r, 6, row.get::<String, _>("detail")).unwrap();
+    }
+
+    worksheet.set_column_width(0, 8).unwrap();
+    worksheet.set_column_width(1, 20).unwrap();
+    worksheet.set_column_width(2, 14).unwrap();
+    worksheet.set_column_width(3, 18).unwrap();
+    worksheet.set_column_width(4, 12).unwrap();
+    worksheet.set_column_width(5, 10).unwrap();
+    worksheet.set_column_width(6, 60).unwrap();
+
+    let filename = format!("操作日志_{}.xlsx", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    xlsx_response(workbook.save_to_buffer().unwrap(), &filename)
 }
 
 async fn api_user_list() -> impl IntoResponse {
@@ -15399,7 +15857,7 @@ async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extract::
 async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
     let ctx = get_user_ctx(&headers).await;
     let order_row = sqlx::query(
-        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, s.name as supplier_name
+        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, po.version, s.name as supplier_name
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id WHERE po.id = ?"
     )
     .bind(id)
@@ -15457,6 +15915,7 @@ async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Pat
         "warehouse_id": row.get::<i64, _>("warehouse_id"),
         "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
         "status": row.get::<String, _>("status"),
+        "version": row.get::<i64, _>("version"),
         "remark": row.get::<Option<String>, _>("remark"),
         "supplier_name": row.get::<String, _>("supplier_name"),
         "items": items,
@@ -15472,8 +15931,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
     }
     let ctx = get_user_ctx(&headers).await;
 
-    // 状态约束 + 行级数据权限：先查订单当前状态与所属供应商
-    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+    // 状态约束 + 行级数据权限 + 乐观锁：先查订单当前状态、版本与所属供应商
+    let order = sqlx::query("SELECT supplier_id, status, version, order_no, total_amount, final_amount FROM purchase_order WHERE id = ?")
         .bind(req.id)
         .fetch_optional(pool())
         .await
@@ -15485,16 +15944,26 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
     };
     let order_supplier_id: i64 = order.get("supplier_id");
     let order_status: String = order.get("status");
+    let db_version: i64 = order.get("version");
+    let old_order_no: String = order.get("order_no");
+    let old_total: f64 = order.get("total_amount");
+    let old_final: f64 = order.get("final_amount");
     if !can_access_purchase_order(&ctx, order_supplier_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
-    // 已确认/已作废的订单不允许修改（防篡改）
+    // 仅待审核（pending）状态的订单允许修改；已审核/已流转/已作废的订单必须反审核后才能修改（防篡改）
     if order_status != "pending" {
-        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，已确认或作废的订单不允许修改", order_status));
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许修改；已审核订单需管理员反审核后才能修改", order_status));
+    }
+    // 乐观锁：客户端携带的版本号必须与数据库当前版本一致，防止并发覆盖
+    if let Some(ver) = req.version {
+        if ver != db_version {
+            return (StatusCode::CONFLICT, format!("订单已被其他用户修改（版本 {} → {}），请刷新后重试", ver, db_version));
+        }
     }
 
     let result = sqlx::query(
-        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ? WHERE id = ?"
+        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -15509,10 +15978,15 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
     .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
     .bind(req.id)
+    .bind(db_version)
     .execute(pool())
     .await;
     
     match result {
+        Ok(res) if res.rows_affected() == 0 => {
+            // 版本已被他人递增（极端并发），拒绝写入
+            (StatusCode::CONFLICT, format!("订单已被其他用户修改，请刷新后重试（版本 {}", db_version))
+        }
         Ok(_) => {
             sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
                 .bind(req.id)
@@ -15552,7 +16026,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                 update_product_purchase_prices(&req.items).await;
             }
             log_operation(&ctx, "purchase_order.update", "purchase_order", &req.id.unwrap_or(0).to_string(),
-                &format!("更新采购单 {}（供应商ID={}）", req.order_no, req.supplier_id)).await;
+                &format!("更新采购单 {}（原单号 {}）：金额 {:.2}→{:.2}，下浮后合计 {:.2}→{:.2}，版本 {}→{}",
+                    req.order_no, old_order_no, old_total, req.total_amount, old_final, req.final_amount, db_version, db_version + 1)).await;
             (StatusCode::OK, "更新成功".to_string())
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string()),
@@ -15583,7 +16058,7 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
     if order_status != "pending" {
-        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，已确认或作废的订单不允许删除", order_status));
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许删除；已审核订单需管理员反审核后才能删除", order_status));
     }
 
     sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
@@ -15604,6 +16079,99 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
             (StatusCode::OK, "删除成功".to_string())
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
+    }
+}
+
+/// 采购单审核：pending → confirmed，锁定订单禁止修改（需填写备注原因）
+async fn api_purchase_order_approve(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_order/approve").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status == "confirmed" {
+        return (StatusCode::BAD_REQUEST, "订单已审核，请勿重复操作".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许审核", order_status));
+    }
+
+    let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
+    let result = sqlx::query("UPDATE purchase_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            log_operation(&ctx, "purchase_order.approve", "purchase_order", &id.to_string(),
+                &format!("审核通过采购单 ID={}（{}）", id, if reason.is_empty() { "无备注" } else { &reason })).await;
+            (StatusCode::OK, "审核成功，订单已锁定".to_string())
+        }
+        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
+    }
+}
+
+/// 采购单反审核：confirmed → pending，解除锁定以便修改（仅管理员，强制原因）
+async fn api_purchase_order_unapprove(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_order/unapprove").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, "反审核必须填写原因".to_string());
+    }
+
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "confirmed" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅已审核状态的订单允许反审核", order_status));
+    }
+
+    let result = sqlx::query("UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            log_operation(&ctx, "purchase_order.unapprove", "purchase_order", &id.to_string(),
+                &format!("反审核采购单 ID={}，原因：{}", id, reason)).await;
+            (StatusCode::OK, "反审核成功，订单已解锁".to_string())
+        }
+        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
     }
 }
 
@@ -16185,7 +16753,7 @@ async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i
     }
 
     let order_row = sqlx::query(
-        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.customer_order_image, so.signed_order_image, COALESCE(p.name, '') as purchaser_name
+        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.version, so.remark, so.warehouse_id, so.warehouse_name, so.customer_order_image, so.signed_order_image, COALESCE(p.name, '') as purchaser_name
          FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
     )
     .bind(id)
@@ -16247,6 +16815,7 @@ async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i
         "warehouse_id": row.get::<Option<i64>, _>("warehouse_id"),
         "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
         "status": row.get::<String, _>("status"),
+        "version": row.get::<i64, _>("version"),
         "remark": row.get::<Option<String>, _>("remark"),
         "customer_order_image": row.get::<Option<String>, _>("customer_order_image"),
         "signed_order_image": row.get::<Option<String>, _>("signed_order_image"),
@@ -16267,8 +16836,8 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     }
     let ctx = get_user_ctx(&headers).await;
 
-    // 状态约束 + 行级数据权限：先查订单当前状态与所属采购单位
-    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+    // 状态约束 + 行级数据权限 + 乐观锁：先查订单当前状态、版本与所属采购单位
+    let order = sqlx::query("SELECT purchaser_id, status, version, order_no, total_amount, final_amount FROM sales_order WHERE id = ?")
         .bind(req.id)
         .fetch_optional(pool())
         .await
@@ -16280,16 +16849,26 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     };
     let order_purchaser_id: i64 = order.get("purchaser_id");
     let order_status: String = order.get("status");
+    let db_version: i64 = order.get("version");
+    let old_order_no: String = order.get("order_no");
+    let old_total: f64 = order.get("total_amount");
+    let old_final: f64 = order.get("final_amount");
     if !can_access_sales_order(&ctx, order_purchaser_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
-    // 仅待配单（pending）状态允许修改，防止对已流转订单篡改
+    // 仅待审核（pending）状态允许修改；已审核/已流转的订单必须反审核后才能修改（防篡改）
     if order_status != "pending" {
-        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许修改", order_status));
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许修改；已审核订单需管理员反审核后才能修改", order_status));
+    }
+    // 乐观锁：客户端携带的版本号必须与数据库当前版本一致，防止并发覆盖
+    if let Some(ver) = req.version {
+        if ver != db_version {
+            return (StatusCode::CONFLICT, format!("订单已被其他用户修改（版本 {} → {}），请刷新后重试", ver, db_version));
+        }
     }
 
     let result = sqlx::query(
-        "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ? WHERE id = ?"
+        "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
     .bind(req.purchaser_id)
     .bind(&req.order_no)
@@ -16302,10 +16881,15 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     .bind(&req.warehouse_name)
     .bind(&req.remark)
     .bind(req.id)
+    .bind(db_version)
     .execute(pool())
     .await;
 
     match result {
+        Ok(res) if res.rows_affected() == 0 => {
+            // 版本已被他人递增（极端并发），拒绝写入
+            (StatusCode::CONFLICT, format!("订单已被其他用户修改，请刷新后重试（版本 {}", db_version))
+        }
         Ok(_) => {
             sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
                 .bind(req.id)
@@ -16345,7 +16929,8 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                 let _ = query.execute(pool()).await;
             }
             log_operation(&ctx, "sales_order.update", "sales_order", &req.id.unwrap_or(0).to_string(),
-                &format!("更新销售单 {}（采购单位ID={}）", req.order_no, req.purchaser_id)).await;
+                &format!("更新销售单 {}（原单号 {}）：金额 {:.2}→{:.2}，下浮后合计 {:.2}→{:.2}，版本 {}→{}",
+                    req.order_no, old_order_no, old_total, req.total_amount, old_final, req.final_amount, db_version, db_version + 1)).await;
             (StatusCode::OK, "更新成功".to_string())
         }
         Err(e) => {
@@ -24717,7 +25302,7 @@ async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(req)
     let id = id.unwrap();
     let new_status = new_status.unwrap();
     
-    let valid_statuses = vec!["pending", "sorting", "sorted", "delivering", "delivered", "accepted", "settled"];
+    let valid_statuses = vec!["pending", "confirmed", "sorting", "sorted", "delivering", "delivered", "accepted", "settled"];
     if !valid_statuses.contains(&new_status.as_str()) {
         return (StatusCode::BAD_REQUEST, "无效状态".to_string());
     }
@@ -24740,8 +25325,11 @@ async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(req)
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
     
+    // 状态机：待审核 → 已审核 → 分拣中 → 已分拣 → 配送中 → 已送达 → 已验收 → 已结算
+    // confirmed（已审核）为锁定态，允许反审核回 pending 或进入分拣
     let allowed_transitions = match current_status.as_str() {
-        "pending" => vec!["sorting"],
+        "pending" => vec!["confirmed", "sorting"],
+        "confirmed" => vec!["pending", "sorting"],
         "sorting" => vec!["pending", "sorted"],
         "sorted" => vec!["sorting", "delivering"],
         "delivering" => vec!["sorted", "delivered"],
@@ -24755,19 +25343,117 @@ async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(req)
         return (StatusCode::BAD_REQUEST, format!("状态不允许从 {} 转换到 {}", current_status, new_status));
     }
     
-    let result = sqlx::query("UPDATE sales_order SET status = ? WHERE id = ?")
+    // 原子状态转换 + 版本递增：WHERE 校验当前状态，防止并发重复流转
+    let result = sqlx::query("UPDATE sales_order SET status = ?, version = version + 1 WHERE id = ? AND status = ?")
         .bind(new_status)
         .bind(id)
+        .bind(&current_status)
         .execute(pool())
         .await;
     
     match result {
+        Ok(res) if res.rows_affected() == 0 => {
+            (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string())
+        }
         Ok(_) => {
             log_operation(&ctx, "sales_order.update_status", "sales_order", &id.to_string(),
                 &format!("销售单 {} 状态 {} -> {}", id, current_status, new_status)).await;
             (StatusCode::OK, "状态更新成功".to_string())
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "状态更新失败".to_string()),
+    }
+}
+
+/// 销售单审核：pending → confirmed，锁定订单禁止修改（需填写备注原因）
+async fn api_sales_order_approve(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/approve").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status == "confirmed" {
+        return (StatusCode::BAD_REQUEST, "订单已审核，请勿重复操作".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许审核", order_status));
+    }
+
+    let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
+    let result = sqlx::query("UPDATE sales_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            log_operation(&ctx, "sales_order.approve", "sales_order", &id.to_string(),
+                &format!("审核通过销售单 ID={}（{}）", id, if reason.is_empty() { "无备注" } else { &reason })).await;
+            (StatusCode::OK, "审核成功，订单已锁定".to_string())
+        }
+        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
+    }
+}
+
+/// 销售单反审核：confirmed → pending，解除锁定以便修改（仅管理员，强制原因）
+async fn api_sales_order_unapprove(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/unapprove").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, "反审核必须填写原因".to_string());
+    }
+
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "confirmed" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅已审核状态的订单允许反审核", order_status));
+    }
+
+    let result = sqlx::query("UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'")
+        .bind(id)
+        .execute(pool())
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            log_operation(&ctx, "sales_order.unapprove", "sales_order", &id.to_string(),
+                &format!("反审核销售单 ID={}，原因：{}", id, reason)).await;
+            (StatusCode::OK, "反审核成功，订单已解锁".to_string())
+        }
+        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
     }
 }
 
@@ -24949,9 +25635,12 @@ fn build_router() -> Router {
         .route("/query/document_summary", get(page_query_document_summary))
         .route("/user", get(page_user))
         .route("/system", get(page_system))
+        .route("/system/operation_log", get(page_operation_log))
         .route("/backup", get(page_backup))
         .route("/restore", get(page_restore))
         .route("/api/system/config", post(api_system_config))
+        .route("/api/system/operation_log", get(api_operation_log_list))
+        .route("/api/system/operation_log/export", get(api_operation_log_export))
         .route("/api/user/list", get(api_user_list))
         .route("/api/user/{id}", get(api_user_get))
         .route("/api/user", post(api_user_create))
@@ -25020,6 +25709,8 @@ fn build_router() -> Router {
         .route("/api/purchase_order/list", get(api_purchase_order_list))
         .route("/api/purchase_order/detail/{id}", get(api_purchase_order_detail))
         .route("/api/purchase_order/update", post(api_purchase_order_update))
+        .route("/api/purchase_order/approve/{id}", post(api_purchase_order_approve))
+        .route("/api/purchase_order/unapprove/{id}", post(api_purchase_order_unapprove))
         .route("/api/purchase_order/delete/{id}", delete(api_purchase_order_delete))
         .route("/api/purchase_order/export", get(api_purchase_order_export))
         .route("/api/purchase_order/export_print/{id}", get(api_purchase_order_print_excel))
@@ -25029,6 +25720,8 @@ fn build_router() -> Router {
         .route("/api/sales_order/by_purchaser/{purchaser_id}", get(api_sales_order_by_purchaser))
         .route("/api/sales_order/detail/{id}", get(api_sales_order_detail))
         .route("/api/sales_order/update", post(api_sales_order_update))
+        .route("/api/sales_order/approve/{id}", post(api_sales_order_approve))
+        .route("/api/sales_order/unapprove/{id}", post(api_sales_order_unapprove))
         .route("/api/sales_order/update_prices/{id}", post(api_sales_order_update_prices))
         .route("/api/sales_order/upload_image", post(api_sales_order_upload_image))
         .route("/api/sales_order/delete_image", post(api_sales_order_delete_image))
