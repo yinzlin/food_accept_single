@@ -116,6 +116,140 @@ fn has_permission(role: &str, required_role: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ===== 细粒度权限点系统（工程化 RBAC） =====
+// 权限点：resource.action，如 purchase_order.update
+// 角色 → 权限点映射，super_admin 拥有全部权限
+
+/// 判断某角色是否拥有指定权限点
+fn has_permission_point(role: &str, permission: &str) -> bool {
+    use std::collections::HashSet;
+    // 全部业务权限点（供 super_admin 全量拥有）
+    const ALL_PERMS: [&str; 17] = [
+        "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel", "purchase_order.delete",
+        "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
+        "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
+    ];
+
+    let role_perms: HashSet<&str> = match role {
+        "super_admin" => HashSet::from(ALL_PERMS),
+        "admin" => HashSet::from([
+            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel", "purchase_order.delete",
+            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
+            "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
+        ]),
+        "supplier" => HashSet::from([
+            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel",
+            "sales_order.view", "query.view",
+        ]),
+        "purchaser" => HashSet::from([
+            "purchase_order.view",
+            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel",
+            "query.view",
+        ]),
+        "user" => HashSet::from(["query.view"]),
+        _ => HashSet::new(),
+    };
+    role_perms.contains(permission)
+}
+
+/// 当前登录用户的上下文（角色 + 用户ID + 行级数据权限关联）
+#[derive(Debug, Clone)]
+struct UserCtx {
+    role: String,
+    user_id: i64,
+    supplier_id: i64,
+    purchaser_id: i64,
+}
+
+/// 解析用户上下文：cookie session -> (role, user_id, supplier_id, purchaser_id)
+async fn get_user_ctx(headers: &axum::http::HeaderMap) -> UserCtx {
+    let session_token = headers.get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find(|s| s.trim().starts_with("session="))
+                .map(|s| s.trim().strip_prefix("session=").unwrap_or(""))
+        })
+        .unwrap_or("");
+
+    let empty = UserCtx { role: "anonymous".to_string(), user_id: 0, supplier_id: 0, purchaser_id: 0 };
+    if session_token.is_empty() {
+        return empty;
+    }
+
+    let parts: Vec<&str> = session_token.split(':').collect();
+    if parts.len() < 2 {
+        return empty;
+    }
+
+    let user_id = match parts[0].parse::<i64>() {
+        Ok(id) => id,
+        Err(_) => return empty,
+    };
+
+    let rows = sqlx::query(
+        "SELECT role, COALESCE(supplier_id,0) as supplier_id, COALESCE(purchaser_id,0) as purchaser_id FROM user_account WHERE id = ? AND status = 1"
+    )
+    .bind(user_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return empty;
+    }
+    let row = &rows[0];
+    UserCtx {
+        role: row.get::<String, _>("role"),
+        user_id,
+        supplier_id: row.get::<i64, _>("supplier_id"),
+        purchaser_id: row.get::<i64, _>("purchaser_id"),
+    }
+}
+
+/// 记录操作审计日志（关键写操作）
+async fn log_operation(
+    user: &UserCtx,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    detail: &str,
+) {
+    let username: String = sqlx::query_scalar("SELECT COALESCE(username,'') FROM user_account WHERE id = ?")
+        .bind(user.user_id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO operation_log(user_id, username, action, target_type, target_id, detail) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(user.user_id)
+    .bind(&username)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(detail)
+    .execute(pool())
+    .await;
+}
+
+/// 判断用户是否可操作该采购单（行级数据权限）：admin/super_admin 可见全部；supplier 仅可见自己绑定的供应商
+fn can_access_purchase_order(user: &UserCtx, order_supplier_id: i64) -> bool {
+    match user.role.as_str() {
+        "super_admin" | "admin" => true,
+        "supplier" => user.supplier_id == order_supplier_id,
+        _ => false,
+    }
+}
+
+/// 判断用户是否可操作该销售单（行级数据权限）：admin/super_admin 可见全部；purchaser 仅可见自己绑定的采购单位
+fn can_access_sales_order(user: &UserCtx, order_purchaser_id: i64) -> bool {
+    match user.role.as_str() {
+        "super_admin" | "admin" => true,
+        "purchaser" => user.purchaser_id == order_purchaser_id,
+        _ => false,
+    }
+}
+
 fn get_route_required_role(path: &str) -> Option<&str> {
     match path {
         "/supplier" | "/api/supplier/create" | "/api/supplier/update" | "/api/supplier/delete" => Some("supplier"),
@@ -139,45 +273,94 @@ fn get_route_required_role(path: &str) -> Option<&str> {
 
 fn check_api_route_permission(path: &str) -> Option<&str> {
     if path.starts_with("/api/supplier/") {
-        if path.starts_with("/api/supplier/list") || path.starts_with("/api/supplier/export") {
-            Some("supplier")
-        } else {
-            Some("supplier")
-        }
+        // 供应商基础资料：supplier 角色以上可访问
+        Some("supplier")
     } else if path.starts_with("/api/purchaser/") {
+        // 采购单位基础资料：purchaser 角色以上可访问
         Some("purchaser")
     } else if path.starts_with("/api/product/") {
-        Some("admin")
+        Some("manage.admin")
     } else if path.starts_with("/api/warehouse/") {
-        Some("admin")
+        Some("manage.admin")
+    } else if path.starts_with("/api/inventory/") {
+        Some("manage.admin")
     } else if path.starts_with("/api/purchase_order/") {
-        Some("supplier")
+        // 采购单：按操作细分权限点
+        if path.ends_with("/create") || path.ends_with("/import") {
+            Some("purchase_order.create")
+        } else if path.ends_with("/update") {
+            Some("purchase_order.update")
+        } else if path.ends_with("/delete") {
+            Some("purchase_order.delete")
+        } else if path.ends_with("/cancel") {
+            Some("purchase_order.cancel")
+        } else {
+            Some("purchase_order.view")
+        }
     } else if path.starts_with("/api/purchase_document/") {
-        Some("supplier")
+        // 采购单据：上传/删除属于写操作
+        if path.ends_with("/upload") || path.ends_with("/delete") {
+            Some("purchase_order.update")
+        } else {
+            Some("purchase_order.view")
+        }
     } else if path.starts_with("/api/sales_order/") {
-        Some("purchaser")
-    } else if path.starts_with("/api/query/purchase") {
-        Some("supplier")
+        // 销售单：按操作细分权限点
+        if path.ends_with("/create") || path.ends_with("/import") || path.contains("/generate_purchase") {
+            Some("sales_order.create")
+        } else if path.ends_with("/update") || path.ends_with("/correction") || path.ends_with("/upload_image") || path.ends_with("/delete_image") {
+            Some("sales_order.update")
+        } else if path.ends_with("/delete") {
+            Some("sales_order.delete")
+        } else if path.ends_with("/update_prices") {
+            Some("sales_order.adjust_price")
+        } else if path.ends_with("/update_status") {
+            Some("sales_order.approve")
+        } else if path.ends_with("/cancel") {
+            Some("sales_order.cancel")
+        } else {
+            Some("sales_order.view")
+        }
+    } else if path.starts_with("/api/query/purchase") || path.starts_with("/api/query/supplier_balance") {
+        Some("query.view")
     } else if path.starts_with("/api/query/sales") || path.starts_with("/api/query/purchaser_balance") || path.starts_with("/api/query/product_rank") {
-        Some("purchaser")
+        Some("query.view")
     } else if path.starts_with("/api/query/stock") || path.starts_with("/api/query/income") || path.starts_with("/api/query/profit") || path.starts_with("/api/query/overview") || path.starts_with("/api/query/category") || path.starts_with("/api/query/document") {
-        Some("admin")
+        Some("manage.admin")
+    } else if path.starts_with("/api/query/") {
+        Some("query.view")
     } else if path.starts_with("/api/user/") {
         if path == "/api/user/list" {
             // 用户列表（用于采购单/销售单经手人选择），采购/销售/管理员均可访问
-            Some("query")
+            Some("query.view")
         } else {
-            Some("super_admin")
+            Some("manage.user")
         }
     } else if path.starts_with("/api/system/") {
-        Some("super_admin")
+        Some("manage.system")
     } else if path.starts_with("/api/backup/") {
-        Some("super_admin")
+        Some("manage.backup")
     } else if path.starts_with("/api/restore/") {
-        Some("super_admin")
+        Some("manage.backup")
     } else {
         None
     }
+}
+
+/// 校验 API 权限：返回权限点对应的角色校验（权限点系统）
+async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, (StatusCode, String)> {
+    let ctx = get_user_ctx(headers).await;
+    
+    if let Some(permission) = check_api_route_permission(path) {
+        if !has_permission_point(&ctx.role, permission) {
+            return Err((StatusCode::FORBIDDEN, serde_json::to_string(&serde_json::json!({
+                "success": false,
+                "message": "您没有权限执行此操作"
+            })).unwrap()));
+        }
+    }
+    
+    Ok(ctx.role)
 }
 
 async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, Html<String>> {
@@ -196,21 +379,6 @@ async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> R
             }
             let content = r#"<div class="container mt-5"><div class="alert alert-danger text-center" style="font-size:1.5rem;">您没有权限访问此页面</div></div>"#;
             return Err(Html(layout_html("无权限", path, content)));
-        }
-    }
-    
-    Ok(role)
-}
-
-async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, (StatusCode, String)> {
-    let role = get_user_role(headers).await;
-    
-    if let Some(required_role) = check_api_route_permission(path) {
-        if !has_permission(&role, required_role) {
-            return Err((StatusCode::FORBIDDEN, serde_json::to_string(&serde_json::json!({
-                "success": false,
-                "message": "您没有权限执行此操作"
-            })).unwrap()));
         }
     }
     
@@ -876,6 +1044,38 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
 
     // 用户表增加联系方式字段（用于采购单/销售单打印）
     let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN phone TEXT")
+        .execute(pool)
+        .await;
+
+    // 用户表增加行级数据权限关联字段：supplier 账号绑定供应商，purchaser 账号绑定采购单位
+    // 用于"只能查看/操作自己的单据"的行级数据权限
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN supplier_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN purchaser_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // 操作审计日志表：记录所有关键写操作（谁、何时、做了什么）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER DEFAULT 0,
+            username TEXT DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT DEFAULT '',
+            target_id TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_op_log_created ON operation_log(created_at)")
         .execute(pool)
         .await;
 
@@ -9028,10 +9228,32 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
         Err(e) => return e,
         Ok(_) => {}
     }
-    let rows = sqlx::query("SELECT id, username, nickname, role, status, last_login_time, create_at FROM user_account ORDER BY id")
+    let rows = sqlx::query("SELECT u.id, u.username, u.nickname, u.role, u.status, u.last_login_time, u.create_at, COALESCE(u.supplier_id,0) as supplier_id, COALESCE(u.purchaser_id,0) as purchaser_id, COALESCE(s.name,'') as supplier_name, COALESCE(p.name,'') as purchaser_name FROM user_account u LEFT JOIN supplier s ON u.supplier_id = s.id LEFT JOIN purchaser p ON u.purchaser_id = p.id ORDER BY u.id")
         .fetch_all(pool())
         .await
         .unwrap_or_default();
+
+    // 绑定下拉选项：供应商 / 采购方
+    let mut supplier_options = String::from("<option value=\"0\">未绑定</option>");
+    let supplier_rows = sqlx::query("SELECT id, name FROM supplier ORDER BY name")
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    for sr in &supplier_rows {
+        let sid: i64 = sr.get("id");
+        let sname: String = sr.get("name");
+        supplier_options.push_str(&format!(r#"<option value="{}">{}</option>"#, sid, sname));
+    }
+    let mut purchaser_options = String::from("<option value=\"0\">未绑定</option>");
+    let purchaser_rows = sqlx::query("SELECT id, name FROM purchaser ORDER BY name")
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    for pr in &purchaser_rows {
+        let pid: i64 = pr.get("id");
+        let pname: String = pr.get("name");
+        purchaser_options.push_str(&format!(r#"<option value="{}">{}</option>"#, pid, pname));
+    }
 
     let mut table_html = String::new();
     for row in rows {
@@ -9042,6 +9264,10 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
         let status: i32 = row.get("status");
         let last_login_time: Option<String> = row.get("last_login_time");
         let create_at: String = row.get("create_at");
+        let supplier_id: i64 = row.get("supplier_id");
+        let purchaser_id: i64 = row.get("purchaser_id");
+        let supplier_name: String = row.get("supplier_name");
+        let purchaser_name: String = row.get("purchaser_name");
         
         let role_label = match role.as_str() {
             "super_admin" => "超级管理员",
@@ -9057,8 +9283,16 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
             "<span class='badge bg-danger'>禁用</span>"
         };
 
+        // 数据权限展示：供应商角色显示绑定的供应商，采购方角色显示绑定的采购单位
+        let data_scope = match role.as_str() {
+            "supplier" if supplier_id > 0 => format!("供应商：{}", supplier_name),
+            "purchaser" if purchaser_id > 0 => format!("采购方：{}", purchaser_name),
+            _ => "-".to_string(),
+        };
+
         table_html.push_str(&format!(
             r#"<tr>
+                <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
@@ -9076,6 +9310,7 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
             username,
             nickname,
             role_label,
+            data_scope,
             status_label,
             last_login_time.unwrap_or("-".to_string()),
             create_at,
@@ -9099,6 +9334,7 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                         <th>用户名</th>
                         <th>昵称</th>
                         <th>角色</th>
+                        <th>数据权限</th>
                         <th>状态</th>
                         <th>最后登录</th>
                         <th>创建时间</th>
@@ -9134,12 +9370,20 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">角色</label>
-                                <select id="role" class="form-control">
+                                <select id="role" class="form-control" onchange="toggleDataScope()">
                                     <option value="admin">管理员</option>
                                     <option value="supplier">供应商</option>
                                     <option value="purchaser">采购方</option>
                                     <option value="user">普通用户</option>
                                 </select>
+                            </div>
+                            <div class="mb-3" id="supplierBindRow">
+                                <label class="form-label">绑定供应商（供应商角色数据权限）</label>
+                                <select id="supplierId" class="form-control">{}</select>
+                            </div>
+                            <div class="mb-3" id="purchaserBindRow">
+                                <label class="form-label">绑定采购单位（采购方角色数据权限）</label>
+                                <select id="purchaserId" class="form-control">{}</select>
                             </div>
                         </form>
                     </div>
@@ -9154,11 +9398,21 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
         <script>
             let currentUserId = null;
 
+            // 根据角色显示/隐藏数据权限绑定行
+            function toggleDataScope() {{
+                const role = document.getElementById('role').value;
+                document.getElementById('supplierBindRow').style.display = (role === 'supplier') ? '' : 'none';
+                document.getElementById('purchaserBindRow').style.display = (role === 'purchaser') ? '' : 'none';
+            }}
+
             function showAddModal() {{
                 currentUserId = null;
                 document.getElementById('modalTitle').textContent = '添加用户';
                 document.getElementById('userForm').reset();
                 document.getElementById('userId').value = '';
+                document.getElementById('supplierId').value = '0';
+                document.getElementById('purchaserId').value = '0';
+                toggleDataScope();
                 new bootstrap.Modal(document.getElementById('userModal')).show();
             }}
 
@@ -9172,7 +9426,10 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                     document.getElementById('username').value = data.user.username;
                     document.getElementById('nickname').value = data.user.nickname || '';
                     document.getElementById('role').value = data.user.role;
+                    document.getElementById('supplierId').value = String(data.user.supplier_id || 0);
+                    document.getElementById('purchaserId').value = String(data.user.purchaser_id || 0);
                     document.getElementById('password').value = '';
+                    toggleDataScope();
                     new bootstrap.Modal(document.getElementById('userModal')).show();
                 }}
             }}
@@ -9183,7 +9440,9 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                     username: document.getElementById('username').value,
                     nickname: document.getElementById('nickname').value,
                     password: document.getElementById('password').value,
-                    role: document.getElementById('role').value
+                    role: document.getElementById('role').value,
+                    supplier_id: parseInt(document.getElementById('supplierId').value || '0'),
+                    purchaser_id: parseInt(document.getElementById('purchaserId').value || '0')
                 }};
                 
                 const url = id ? '/api/user/' + id : '/api/user';
@@ -9224,7 +9483,7 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
         </script>
-    "#, table_html);
+    "#, table_html, supplier_options, purchaser_options);
 
     Html(layout_html("用户管理", "/user", &content))
 }
@@ -11162,7 +11421,7 @@ async fn api_system_config(Json(data): Json<std::collections::HashMap<String, St
 }
 
 async fn api_user_list() -> impl IntoResponse {
-    let rows = sqlx::query("SELECT id, username, nickname, phone, role, status FROM user_account WHERE status = 1 ORDER BY id")
+    let rows = sqlx::query("SELECT id, username, nickname, phone, role, status, COALESCE(supplier_id,0) as supplier_id, COALESCE(purchaser_id,0) as purchaser_id FROM user_account WHERE status = 1 ORDER BY id")
         .fetch_all(pool())
         .await
         .unwrap_or_default();
@@ -11173,13 +11432,15 @@ async fn api_user_list() -> impl IntoResponse {
             "nickname": r.get::<Option<String>, _>("nickname").unwrap_or_default(),
             "phone": r.get::<Option<String>, _>("phone").unwrap_or_default(),
             "role": r.get::<String, _>("role"),
+            "supplier_id": r.get::<i64, _>("supplier_id"),
+            "purchaser_id": r.get::<i64, _>("purchaser_id"),
         })
     }).collect();
     (StatusCode::OK, serde_json::to_string(&list).unwrap())
 }
 
 async fn api_user_get(Path(id): Path<i64>) -> impl IntoResponse {
-    let rows = sqlx::query("SELECT id, username, nickname, role, status FROM user_account WHERE id = ?")
+    let rows = sqlx::query("SELECT id, username, nickname, role, status, COALESCE(supplier_id,0) as supplier_id, COALESCE(purchaser_id,0) as purchaser_id FROM user_account WHERE id = ?")
         .bind(id)
         .fetch_all(pool())
         .await
@@ -11200,7 +11461,9 @@ async fn api_user_get(Path(id): Path<i64>) -> impl IntoResponse {
             "username": row.get::<String, _>("username"),
             "nickname": row.get::<String, _>("nickname"),
             "role": row.get::<String, _>("role"),
-            "status": row.get::<i32, _>("status")
+            "status": row.get::<i32, _>("status"),
+            "supplier_id": row.get::<i64, _>("supplier_id"),
+            "purchaser_id": row.get::<i64, _>("purchaser_id")
         }
     })).unwrap())
 }
@@ -11210,6 +11473,8 @@ async fn api_user_create(Json(data): Json<serde_json::Value>) -> impl IntoRespon
     let password = data["password"].as_str().unwrap_or("");
     let nickname = data["nickname"].as_str().unwrap_or("");
     let role = data["role"].as_str().unwrap_or("user");
+    let supplier_id = data["supplier_id"].as_i64().unwrap_or(0);
+    let purchaser_id = data["purchaser_id"].as_i64().unwrap_or(0);
     
     if username.is_empty() {
         return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
@@ -11240,11 +11505,13 @@ async fn api_user_create(Json(data): Json<serde_json::Value>) -> impl IntoRespon
     
     let hashed_pwd = bcrypt::hash(password, bcrypt::DEFAULT_COST).unwrap();
     
-    sqlx::query("INSERT INTO user_account (username, password, nickname, role) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO user_account (username, password, nickname, role, supplier_id, purchaser_id) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(username)
         .bind(hashed_pwd)
         .bind(nickname)
         .bind(role)
+        .bind(supplier_id)
+        .bind(purchaser_id)
         .execute(pool())
         .await
         .ok();
@@ -11260,6 +11527,8 @@ async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::Value
     let password = data["password"].as_str().unwrap_or("");
     let nickname = data["nickname"].as_str().unwrap_or("");
     let role = data["role"].as_str().unwrap_or("");
+    let supplier_id = data["supplier_id"].as_i64().unwrap_or(0);
+    let purchaser_id = data["purchaser_id"].as_i64().unwrap_or(0);
     
     if username.is_empty() {
         return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
@@ -11279,18 +11548,22 @@ async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::Value
     }
     
     if role.is_empty() {
-        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, supplier_id = ?, purchaser_id = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(username)
             .bind(nickname)
+            .bind(supplier_id)
+            .bind(purchaser_id)
             .bind(id)
             .execute(pool())
             .await
             .ok();
     } else {
-        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, supplier_id = ?, purchaser_id = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(username)
             .bind(nickname)
             .bind(role)
+            .bind(supplier_id)
+            .bind(purchaser_id)
             .bind(id)
             .execute(pool())
             .await
@@ -13259,14 +13532,27 @@ async fn api_product_delete_image(
 
 // 销售订单图片上传：type = customer(客户订单) / signed(已验收签字订单)
 async fn api_sales_order_upload_image(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+
     let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
     if order_id.is_none() {
         return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
     }
     let order_id = order_id.unwrap();
+
+    // 行级数据权限：仅可为自己采购单位的销售单上传图片
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(order_id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
 
     let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
     let (folder, prefix, column) = match image_type {
@@ -13344,17 +13630,33 @@ async fn api_sales_order_upload_image(
         .execute(pool())
         .await;
 
+    log_operation(&ctx, "sales_order.upload_image", "sales_order", &order_id.to_string(),
+        &format!("上传{}图片：{}", if image_type == "customer" { "客户订单" } else { "签字验收单" }, file_path)).await;
+
     (StatusCode::OK, serde_json::json!({ "url": file_path }).to_string())
 }
 
 async fn api_sales_order_delete_image(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, String) {
+    let ctx = get_user_ctx(&headers).await;
+
     let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
     if order_id.is_none() {
         return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
     }
     let order_id = order_id.unwrap();
+
+    // 行级数据权限：仅可操作归属自己的销售单
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(order_id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
 
     let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
     let column = match image_type {
@@ -13385,14 +13687,24 @@ async fn api_sales_order_delete_image(
         .execute(pool())
         .await;
 
+    log_operation(&ctx, "sales_order.delete_image", "sales_order", &order_id.to_string(),
+        &format!("删除{}图片", if image_type == "customer" { "客户订单" } else { "签字验收单" })).await;
+
     (StatusCode::OK, "删除成功".to_string())
 }
 
 // 采购单据列表：按供应商+日期查询
 async fn api_purchase_document_list(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let supplier_id = params.get("supplier_id").and_then(|s| s.parse::<i64>().ok());
+    // 行级数据权限：supplier 角色只能看自己绑定的供应商单据
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) }
+    } else {
+        params.get("supplier_id").and_then(|s| s.parse::<i64>().ok())
+    };
     let document_date = params.get("document_date").map(|s| s.as_str()).unwrap_or("");
 
     let mut sql = "SELECT id, supplier_id, supplier_name, document_date, image_url, remark, create_at FROM purchase_document WHERE 1=1".to_string();
@@ -13445,7 +13757,13 @@ async fn api_purchase_document_list(
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResponse {
+async fn api_purchase_document_upload(headers: axum::http::HeaderMap, mut multipart: Multipart) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_document/upload").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let mut supplier_id: Option<i64> = None;
     let mut supplier_name: Option<String> = None;
     let mut document_date: Option<String> = None;
@@ -13489,6 +13807,13 @@ async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResp
         return (StatusCode::BAD_REQUEST, "缺少必填参数".to_string());
     }
 
+    // 行级数据权限：supplier 角色只能上传自己绑定的供应商单据
+    if ctx.role == "supplier" {
+        if ctx.supplier_id == 0 || supplier_id != Some(ctx.supplier_id) {
+            return (StatusCode::FORBIDDEN, "供应商账号只能为自己上传单据".to_string());
+        }
+    }
+
     let sname = supplier_name.unwrap();
     let ddate = document_date.unwrap();
     let name_prefix = format!("{}_{}", sanitize_filename_prefix(&sname), ddate);
@@ -13518,24 +13843,38 @@ async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResp
     match result {
         Ok(r) => {
             let id = r.last_insert_rowid();
+            log_operation(&ctx, "purchase_document.upload", "purchase_document", &id.to_string(),
+                &format!("上传采购单据（供应商ID={}，日期={}）：{}", supplier_id.unwrap_or(0), ddate, saved_url)).await;
             (StatusCode::OK, serde_json::json!({ "id": id, "url": saved_url }).to_string())
         },
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "保存失败".to_string()),
     }
 }
 
-async fn api_purchase_document_delete(Path(id): Path<i64>) -> impl IntoResponse {
-    let row = sqlx::query("SELECT image_url FROM purchase_document WHERE id = ?")
+async fn api_purchase_document_delete(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_document/delete").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let row = sqlx::query("SELECT image_url, supplier_id FROM purchase_document WHERE id = ?")
         .bind(id)
         .fetch_optional(pool())
         .await
         .unwrap_or(None);
 
     if let Some(row) = row {
+        // 行级数据权限：supplier 角色只能删除自己供应商的单据
+        if ctx.role == "supplier" && row.get::<i64, _>("supplier_id") != ctx.supplier_id {
+            return (StatusCode::FORBIDDEN, "您没有权限删除此单据".to_string());
+        }
         let url: String = row.get("image_url");
         if let Some(path) = image_url_to_path(&url) {
             let _ = tokio::fs::remove_file(&path).await;
         }
+    } else {
+        return (StatusCode::NOT_FOUND, "单据不存在".to_string());
     }
 
     let result = sqlx::query("DELETE FROM purchase_document WHERE id = ?")
@@ -13544,7 +13883,11 @@ async fn api_purchase_document_delete(Path(id): Path<i64>) -> impl IntoResponse 
         .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "purchase_document.delete", "purchase_document", &id.to_string(),
+                &format!("删除采购单据 ID={}", id)).await;
+            (StatusCode::OK, "删除成功".to_string())
+        },
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
     }
 }
@@ -14872,7 +15215,21 @@ async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
     }
 }
 
-async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
+async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_order/create").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限：supplier 只能为自己绑定的供应商创建采购单
+    if ctx.role == "supplier" {
+        let effective_supplier_id = if req.supplier_id != 0 { req.supplier_id } else { ctx.supplier_id };
+        if ctx.supplier_id == 0 || effective_supplier_id != ctx.supplier_id {
+            return (StatusCode::FORBIDDEN, "供应商账号只能为自己创建采购单".to_string());
+        }
+    }
+
     let result = sqlx::query(
         "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, user_id, handler_phone, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -14924,20 +15281,28 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                 // 采购入库后更新商品进价（当前/最高/最低）
                 update_product_purchase_prices(&req.items).await;
             }
-            StatusCode::OK
+            log_operation(&ctx, "purchase_order.create", "purchase_order", &order_id.to_string(),
+                &format!("创建采购单 {}（供应商ID={}）", req.order_no, req.supplier_id)).await;
+            (StatusCode::OK, "创建成功".to_string())
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "创建失败".to_string()),
     }
 }
 
-async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let keyword_pattern = parse_keyword_pattern(&params);
     
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
-    let supplier_id: Option<i64> = params.get("supplier_id").and_then(|s| s.parse().ok());
+    // 行级数据权限：supplier 角色强制只看自己绑定的供应商
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) /* 未绑定则查不到任何数据 */ }
+    } else {
+        params.get("supplier_id").and_then(|s| s.parse().ok())
+    };
     
     // 排序处理
     let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
@@ -15031,7 +15396,8 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
+async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
     let order_row = sqlx::query(
         "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, s.name as supplier_name
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id WHERE po.id = ?"
@@ -15046,6 +15412,11 @@ async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     }
     
     let row = order_row.unwrap();
+    // 行级数据权限：supplier 只能看自己的
+    let order_supplier_id: i64 = row.get("supplier_id");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string());
+    }
     
     let item_rows = sqlx::query(
         "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark FROM purchase_order_item WHERE order_id = ?"
@@ -15099,6 +15470,29 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 状态约束 + 行级数据权限：先查订单当前状态与所属供应商
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+        .bind(req.id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    // 已确认/已作废的订单不允许修改（防篡改）
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，已确认或作废的订单不允许修改", order_status));
+    }
+
     let result = sqlx::query(
         "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ? WHERE id = ?"
     )
@@ -15157,6 +15551,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                 // 采购单更新后同步商品进价（当前/最高/最低）
                 update_product_purchase_prices(&req.items).await;
             }
+            log_operation(&ctx, "purchase_order.update", "purchase_order", &req.id.unwrap_or(0).to_string(),
+                &format!("更新采购单 {}（供应商ID={}）", req.order_no, req.supplier_id)).await;
             (StatusCode::OK, "更新成功".to_string())
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string()),
@@ -15168,6 +15564,28 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限 + 状态约束
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，已确认或作废的订单不允许删除", order_status));
+    }
+
     sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
         .bind(id)
         .execute(pool())
@@ -15180,23 +15598,37 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
         .await;
     
     match result {
-        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "purchase_order.delete", "purchase_order", &id.to_string(),
+                &format!("删除采购单 ID={}", id)).await;
+            (StatusCode::OK, "删除成功".to_string())
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
     }
 }
 
-async fn api_purchase_order_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_purchase_order_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：supplier 只能导出自己的
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.final_amount, po.status, po.remark, s.name as supplier_name,
                 poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.ordered_quantity, poi.quantity, poi.unit_price, poi.base_quantity, poi.amount, poi.remark as item_remark
          FROM purchase_order po 
          JOIN supplier s ON po.supplier_id = s.id
-         LEFT JOIN purchase_order_item poi ON po.id = poi.order_id
-         ORDER BY po.id, poi.id"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN purchase_order_item poi ON po.id = poi.order_id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "supplier" {
+        sql.push_str(" WHERE po.supplier_id = ?");
+        binds.push(ctx.supplier_id);
+    }
+    sql.push_str(" ORDER BY po.id, poi.id");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
@@ -15541,7 +15973,13 @@ async fn get_user_by_id(id: i64) -> Option<UserSimple> {
         .map(|(nickname, phone)| UserSimple { nickname, phone: phone.unwrap_or_default() })
 }
 
-async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
+async fn api_purchase_order_import(headers: axum::http::HeaderMap, content: Bytes) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_order/import").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let rows: Vec<Vec<String>>;
     
     if content.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
@@ -15716,15 +16154,31 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
         }
     }
     
+    log_operation(&ctx, "purchase_order.import", "purchase_order", "",
+        &format!("导入采购单：成功 {} 条，失败 {} 条", success, failed)).await;
+
     (StatusCode::OK, format!("导入完成：成功 {} 条，失败 {} 条", success, failed)).into_response()
 }
 
-async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限：先确认订单存在并校验归属
+    let exists_row: Option<(i64,)> = sqlx::query_as("SELECT purchaser_id FROM sales_order WHERE id = ?")
         .bind(id)
-        .fetch_one(pool())
+        .fetch_optional(pool())
         .await
-        .unwrap_or(false);
+        .unwrap_or(None);
+
+    let exists = match exists_row {
+        Some((pid,)) => {
+            if !can_access_sales_order(&ctx, pid) {
+                return (StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string());
+            }
+            true
+        }
+        None => false,
+    };
 
     if !exists {
         return (StatusCode::NOT_FOUND, format!("订单不存在 (ID: {})", id).to_string());
@@ -15811,6 +16265,29 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 状态约束 + 行级数据权限：先查订单当前状态与所属采购单位
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+        .bind(req.id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    // 仅待配单（pending）状态允许修改，防止对已流转订单篡改
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许修改", order_status));
+    }
+
     let result = sqlx::query(
         "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ? WHERE id = ?"
     )
@@ -15867,6 +16344,8 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                 }
                 let _ = query.execute(pool()).await;
             }
+            log_operation(&ctx, "sales_order.update", "sales_order", &req.id.unwrap_or(0).to_string(),
+                &format!("更新销售单 {}（采购单位ID={}）", req.order_no, req.purchaser_id)).await;
             (StatusCode::OK, "更新成功".to_string())
         }
         Err(e) => {
@@ -15880,6 +16359,27 @@ async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id):
     match check_api_permission(&headers, "/api/sales_order/update_prices").await {
         Err(e) => return e,
         Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 状态约束 + 行级数据权限：调价仅限待配单且归属自己的订单
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许调整价格", order_status));
     }
 
     let items = sqlx::query(
@@ -15956,6 +16456,8 @@ async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id):
         "final_amount": new_final.max(0.0),
         "errors": errors,
     });
+    log_operation(&ctx, "sales_order.adjust_price", "sales_order", &id.to_string(),
+        &format!("一键获取销售单 {} 最新售价，新合计={}，错误数={}", id, new_total, errors.len())).await;
     (StatusCode::OK, serde_json::to_string(&resp).unwrap())
 }
 
@@ -15964,15 +16466,26 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
 
-    let order_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+    // 行级数据权限 + 状态约束
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
         .bind(id)
-        .fetch_one(pool())
+        .fetch_optional(pool())
         .await
-        .unwrap_or(false);
-
-    if !order_exists {
-        return (StatusCode::NOT_FOUND, "订单不存在".to_string());
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许删除", order_status));
     }
 
     let delete_items_result = sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
@@ -15994,7 +16507,11 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
         .await;
     
     match result {
-        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "sales_order.delete", "sales_order", &id.to_string(),
+                &format!("删除销售单 ID={}", id)).await;
+            (StatusCode::OK, "删除成功".to_string())
+        }
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("foreign key constraint") || err_str.contains("FOREIGN KEY") {
@@ -16006,18 +16523,28 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
     }
 }
 
-async fn api_sales_order_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：purchaser 只能导出自己采购单位的销售单
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name,
                 soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.pre_sale_quantity, soi.quantity, soi.unit_price, soi.base_quantity, soi.amount, soi.remark as item_remark
          FROM sales_order so 
          JOIN purchaser p ON so.purchaser_id = p.id
-         LEFT JOIN sales_order_item soi ON so.id = soi.order_id
-         ORDER BY so.id, soi.id"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN sales_order_item soi ON so.id = soi.order_id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "purchaser" {
+        sql.push_str(" WHERE so.purchaser_id = ?");
+        binds.push(ctx.purchaser_id);
+    }
+    sql.push_str(" ORDER BY so.id, soi.id");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
@@ -16095,7 +16622,13 @@ async fn api_sales_order_export() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
+async fn api_sales_order_import(headers: axum::http::HeaderMap, content: Bytes) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/import").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let rows: Vec<Vec<String>>;
     
     if content.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
@@ -16270,11 +16803,20 @@ async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
         }
     }
     
+    log_operation(&ctx, "sales_order.import", "sales_order", "",
+        &format!("导入销售单：成功 {} 条，失败 {} 条", success, failed)).await;
+
     (StatusCode::OK, format!("导入完成：成功 {} 条，失败 {} 条", success, failed)).into_response()
 }
 
-async fn api_query_purchase_order(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_purchase_order(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色强制只看自己绑定的供应商
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { ctx.supplier_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("supplier_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -16358,8 +16900,14 @@ async fn api_query_purchase_order(axum::extract::Query(params): axum::extract::Q
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_purchase_order_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_purchase_order_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色只能导出自己供应商的数据
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { ctx.supplier_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("supplier_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -16590,19 +17138,28 @@ async fn api_query_purchase_summary(axum::extract::Query(params): axum::extract:
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_supplier_balance() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_supplier_balance(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色只能看自己绑定的供应商往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT s.id, s.name, 
                 COALESCE(SUM(po.final_amount), 0.0) as purchase_total,
                 COALESCE(SUM(po.final_amount), 0.0) as unpaid
          FROM supplier s 
-         LEFT JOIN purchase_order po ON po.supplier_id = s.id 
-         GROUP BY s.id, s.name 
-         ORDER BY purchase_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN purchase_order po ON po.supplier_id = s.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "supplier" {
+        sql.push_str(" WHERE s.id = ?");
+        binds.push(ctx.supplier_id);
+    }
+    sql.push_str(" GROUP BY s.id, s.name ORDER BY purchase_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let balances: Vec<serde_json::Value> = rows
         .iter()
@@ -16623,19 +17180,28 @@ async fn api_query_supplier_balance() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&balances).unwrap())
 }
 
-async fn api_query_supplier_balance_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_supplier_balance_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色只能导出自己绑定的供应商往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT s.id, s.name, 
                 COALESCE(SUM(po.final_amount), 0.0) as purchase_total,
                 COALESCE(SUM(po.final_amount), 0.0) as unpaid
          FROM supplier s 
-         LEFT JOIN purchase_order po ON po.supplier_id = s.id 
-         GROUP BY s.id, s.name 
-         ORDER BY purchase_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN purchase_order po ON po.supplier_id = s.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "supplier" {
+        sql.push_str(" WHERE s.id = ?");
+        binds.push(ctx.supplier_id);
+    }
+    sql.push_str(" GROUP BY s.id, s.name ORDER BY purchase_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -16674,8 +17240,14 @@ async fn api_query_supplier_balance_export() -> impl IntoResponse {
     ).into_response()
 }
 
-async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_sales_order(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色强制只看自己绑定的采购单位
+    let ctx = get_user_ctx(&headers).await;
+    let purchaser_id = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { ctx.purchaser_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -16770,8 +17342,14 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_sales_order_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_sales_order_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能导出自己采购单位的数据
+    let ctx = get_user_ctx(&headers).await;
+    let purchaser_id = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { ctx.purchaser_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -17379,19 +17957,28 @@ async fn api_query_allocation_source(axum::extract::Query(params): axum::extract
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_purchaser_balance() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_purchaser_balance(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能看自己绑定的采购单位往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT p.id, p.name, 
                 COALESCE(SUM(so.final_amount), 0) as sales_total,
                 COALESCE(SUM(so.final_amount), 0) as unreceived
          FROM purchaser p 
-         LEFT JOIN sales_order so ON so.purchaser_id = p.id 
-         GROUP BY p.id, p.name 
-         ORDER BY sales_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN sales_order so ON so.purchaser_id = p.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "purchaser" {
+        sql.push_str(" WHERE p.id = ?");
+        binds.push(ctx.purchaser_id);
+    }
+    sql.push_str(" GROUP BY p.id, p.name ORDER BY sales_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let balances: Vec<serde_json::Value> = rows
         .iter()
@@ -17412,19 +17999,28 @@ async fn api_query_purchaser_balance() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&balances).unwrap())
 }
 
-async fn api_query_purchaser_balance_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_purchaser_balance_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能导出自己绑定的采购单位往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT p.id, p.name, 
                 COALESCE(SUM(so.final_amount), 0) as sales_total,
                 COALESCE(SUM(so.final_amount), 0) as unreceived
          FROM purchaser p 
-         LEFT JOIN sales_order so ON so.purchaser_id = p.id 
-         GROUP BY p.id, p.name 
-         ORDER BY sales_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN sales_order so ON so.purchaser_id = p.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "purchaser" {
+        sql.push_str(" WHERE p.id = ?");
+        binds.push(ctx.purchaser_id);
+    }
+    sql.push_str(" GROUP BY p.id, p.name ORDER BY sales_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -17464,13 +18060,20 @@ async fn api_query_purchaser_balance_export() -> impl IntoResponse {
 }
 
 async fn api_sales_order_generate_purchase(
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/generate_purchase").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let force = params.get("force").map(|s| s == "1").unwrap_or(false);
 
     let order_row = sqlx::query(
-        "SELECT so.id, so.order_date, so.warehouse_id, so.warehouse_name
+        "SELECT so.id, so.order_date, so.warehouse_id, so.warehouse_name, so.purchaser_id
          FROM sales_order so WHERE so.id = ?"
     )
     .bind(id)
@@ -17483,6 +18086,11 @@ async fn api_sales_order_generate_purchase(
     }
 
     let row = order_row.unwrap();
+    // 行级数据权限：仅可为自己采购单位的销售单生成采购订单
+    let row_purchaser_id: i64 = row.get("purchaser_id");
+    if !can_access_sales_order(&ctx, row_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string()).into_response();
+    }
     let order_date = row.get::<String, _>("order_date");
     let warehouse_id = row.get::<i64, _>("warehouse_id");
     let warehouse_name = row.get::<Option<String>, _>("warehouse_name").unwrap_or_default();
@@ -17676,6 +18284,9 @@ async fn api_sales_order_generate_purchase(
         }
     }
     
+    log_operation(&ctx, "sales_order.generate_purchase", "sales_order", &id.to_string(),
+        &format!("由销售单生成采购订单，成功 {} 张", created_count)).await;
+
     (StatusCode::OK, serde_json::json!({ "count": created_count, "message": format!("成功生成 {} 张采购订单", created_count) }).to_string()).into_response()
 }
 
@@ -19211,8 +19822,14 @@ async fn api_query_document_summary_export(axum::extract::Query(params): axum::e
     xlsx_response(workbook.save_to_buffer().unwrap(), "单据汇总查询.xlsx")
 }
 
-async fn api_purchase_document_list_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let supplier_id=params.get("supplier_id").and_then(|s|s.parse::<i64>().ok());let document_date=params.get("document_date").map(|s|s.as_str()).unwrap_or("");
+async fn api_purchase_document_list_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) }
+    } else {
+        params.get("supplier_id").and_then(|s|s.parse::<i64>().ok())
+    };
+    let document_date=params.get("document_date").map(|s|s.as_str()).unwrap_or("");
     let mut sql="SELECT id,supplier_id,supplier_name,document_date,remark,create_at FROM purchase_document WHERE 1=1".to_string();
     let rows=match(supplier_id,document_date.is_empty()){(Some(sid),false)=>{sql.push_str(" AND supplier_id=? AND document_date=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(sid).bind(document_date).fetch_all(pool()).await.unwrap_or_default()},(Some(sid),true)=>{sql.push_str(" AND supplier_id=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(sid).fetch_all(pool()).await.unwrap_or_default()},(None,false)=>{sql.push_str(" AND document_date=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(document_date).fetch_all(pool()).await.unwrap_or_default()},(None,true)=>{sql.push_str(" ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default()},};
     let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("采购单据").unwrap();let hf=xlsx_header_format(0x4472C4);
@@ -19222,7 +19839,21 @@ async fn api_purchase_document_list_export(axum::extract::Query(params): axum::e
     xlsx_response(workbook.save_to_buffer().unwrap(), "采购单据列表.xlsx")
 }
 
-async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
+async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/create").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限：purchaser 只能为自己绑定的采购单位创建销售单
+    if ctx.role == "purchaser" {
+        let effective_purchaser_id = if req.purchaser_id != 0 { req.purchaser_id } else { ctx.purchaser_id };
+        if ctx.purchaser_id == 0 || effective_purchaser_id != ctx.purchaser_id {
+            return (StatusCode::FORBIDDEN, "采购单位账号只能为自己创建销售单".to_string());
+        }
+    }
+
     let result = sqlx::query(
         "INSERT INTO sales_order(purchaser_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -19252,7 +19883,7 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
                 );
                 
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for item in &req.items {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -19272,20 +19903,28 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
                 }
                 let _ = query.execute(pool()).await;
             }
-            StatusCode::OK
+            log_operation(&ctx, "sales_order.create", "sales_order", &order_id.to_string(),
+                &format!("创建销售单 {}（采购单位ID={}）", req.order_no, req.purchaser_id)).await;
+            (StatusCode::OK, "创建成功".to_string())
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "创建失败".to_string()),
     }
 }
 
-async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_sales_order_list(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let keyword_pattern = parse_keyword_pattern(&params);
     
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
-    let purchaser_id: Option<i64> = params.get("purchaser_id").and_then(|s| s.parse().ok());
+    // 行级数据权限：purchaser 角色强制只看自己绑定的采购单位
+    let ctx = get_user_ctx(&headers).await;
+    let purchaser_id: Option<i64> = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { Some(ctx.purchaser_id) } else { Some(-1) /* 未绑定则查不到任何数据 */ }
+    } else {
+        params.get("purchaser_id").and_then(|s| s.parse().ok())
+    };
     
     // 排序处理
     let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
@@ -19382,7 +20021,9 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
+async fn api_sales_order_accept(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
                 p.name as purchaser_name, p.address as purchaser_address
@@ -19397,7 +20038,12 @@ async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
         return (StatusCode::NOT_FOUND, "订单不存在".to_string());
     }
 
+    // 行级数据权限：仅可查看归属自己的销售单验收单
     let row = order_row.unwrap();
+    let row_purchaser_id: i64 = row.get("purchaser_id");
+    if !can_access_sales_order(&ctx, row_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string());
+    }
     let discount_rate = row.get::<f64, _>("discount_rate");
 
     // 1) 真实明细（带分类信息，用于排序）
@@ -21087,14 +21733,22 @@ async fn page_supplement() -> Html<String> {
     Html(layout_html("耗材分摊管理", "supplement", content))
 }
 
-async fn api_sales_order_by_purchaser(Path(purchaser_id): Path<i64>) -> impl IntoResponse {
+async fn api_sales_order_by_purchaser(headers: axum::http::HeaderMap, Path(purchaser_id): Path<i64>) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能查自己绑定的采购单位
+    let ctx = get_user_ctx(&headers).await;
+    let effective_purchaser_id = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { ctx.purchaser_id } else { -1 }
+    } else {
+        purchaser_id
+    };
+
     let orders = sqlx::query(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount as discount_total, so.status,
                 p.name as purchaser_name, so.purchaser_id
          FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id
          WHERE so.purchaser_id = ? ORDER BY so.order_date DESC"
     )
-    .bind(purchaser_id)
+    .bind(effective_purchaser_id)
     .fetch_all(pool())
     .await
     .unwrap_or_default();
@@ -21879,20 +22533,47 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
 
 // 导出报销单（报销口径）：合并分摊增项后的明细
 async fn api_sales_order_accept_excel(
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let force = params.get("force").map(|s| s == "1").unwrap_or(false);
-    build_accept_excel(id, true, force).await
+    match check_sales_order_access(&headers, id).await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    build_accept_excel(id, true, force).await.into_response()
 }
 
 // 导出验收单（真实口径）：真实账套明细，不合并分摊增项
 async fn api_sales_order_real_excel(
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let force = params.get("force").map(|s| s == "1").unwrap_or(false);
-    build_accept_excel(id, false, force).await
+    match check_sales_order_access(&headers, id).await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    build_accept_excel(id, false, force).await.into_response()
+}
+
+/// 校验用户是否有权查看/导出指定销售单（行级数据权限）
+async fn check_sales_order_access(
+    headers: &axum::http::HeaderMap,
+    id: i64,
+) -> Result<(), (StatusCode, String)> {
+    let ctx = get_user_ctx(headers).await;
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return Err((StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string()));
+    }
+    Ok(())
 }
 
 // reimburse=true 报销口径（合并分摊增项）；false 真实口径（真实账套）
@@ -24019,7 +24700,13 @@ async fn api_sales_order_sort_comprehensive_excel() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_update_status(Json(req): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(req): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/update_status").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let id = req.get("id").and_then(|s| s.parse::<i64>().ok());
     let new_status = req.get("status");
     
@@ -24042,6 +24729,16 @@ async fn api_sales_order_update_status(Json(req): Json<std::collections::HashMap
         .ok();
     
     let current_status = current_status.unwrap_or_else(|| "pending".to_string());
+
+    // 行级数据权限：仅可操作归属自己的销售单
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
     
     let allowed_transitions = match current_status.as_str() {
         "pending" => vec!["sorting"],
@@ -24065,12 +24762,22 @@ async fn api_sales_order_update_status(Json(req): Json<std::collections::HashMap
         .await;
     
     match result {
-        Ok(_) => (StatusCode::OK, "状态更新成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "sales_order.update_status", "sales_order", &id.to_string(),
+                &format!("销售单 {} 状态 {} -> {}", id, current_status, new_status)).await;
+            (StatusCode::OK, "状态更新成功".to_string())
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "状态更新失败".to_string()),
     }
 }
 
-async fn api_sales_order_correction(Json(data): Json<std::collections::HashMap<String, serde_json::Value>>) -> impl IntoResponse {
+async fn api_sales_order_correction(headers: axum::http::HeaderMap, Json(data): Json<std::collections::HashMap<String, serde_json::Value>>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/correction").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let corrections = data.get("corrections");
     if corrections.is_none() {
         return (StatusCode::BAD_REQUEST, "缺少修正数据".to_string());
@@ -24119,6 +24826,9 @@ async fn api_sales_order_correction(Json(data): Json<std::collections::HashMap<S
         }
     }
     
+    log_operation(&ctx, "sales_order.correction", "sales_order", "", 
+        &format!("批量修正销售单数量，共修正 {} 条记录", updated_count)).await;
+
     (StatusCode::OK, format!("成功修正 {} 条记录", updated_count))
 }
 
