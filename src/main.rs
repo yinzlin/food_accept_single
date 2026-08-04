@@ -4890,6 +4890,27 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             let searchTimeout = null;
             let productSearchActiveIndex = -1;
 
+            // WPS 风格：回车后跳到下一行商品名称；最后一行则新增明细并聚焦新行的商品名称
+            function focusNextProductName(index) {{
+                const nextIndex = index + 1;
+                const tbody = document.getElementById('itemsTable');
+                if (tbody && nextIndex < items.length && tbody.rows[nextIndex]) {{
+                    const targetInput = tbody.rows[nextIndex].querySelector('.product-search-input');
+                    if (targetInput) {{
+                        targetInput.focus();
+                        try {{ targetInput.select(); }} catch(e) {{}}
+                        return;
+                    }}
+                }}
+                // 最后一行：新增明细，焦点留在新增行的商品名称
+                addItem();
+                const newTbody = document.getElementById('itemsTable');
+                if (newTbody && newTbody.rows[items.length - 1]) {{
+                    const newInput = newTbody.rows[items.length - 1].querySelector('.product-search-input');
+                    if (newInput) newInput.focus();
+                }}
+            }}
+
             // WPS 风格键盘录入：商品名称输入框
             // - 有模糊搜索下拉时：↑/↓ 移动高亮，Enter 选中，Esc 关闭
             // - 无下拉时：Enter 跳到下一行商品名称，最后一行则新增明细并聚焦
@@ -4929,30 +4950,15 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 if (event.key === 'Enter' || event.keyCode === 13) {{
                     event.preventDefault();
                     if (dropdownVisible) {{
-                        // 下拉可见：选中当前高亮项，未高亮时默认选第一项
+                        // 下拉可见：选中当前高亮项（未高亮时默认第一项），
+                        // 选中完成后继续 WPS 录入：跳到下一行商品名称，末行则新增明细并聚焦
                         const li = productSearchActiveIndex >= 0 ? lis[productSearchActiveIndex] : lis[0];
                         productSearchActiveIndex = -1;
-                        selectProduct(index, li);
+                        selectProduct(index, li, function() {{ focusNextProductName(index); }});
                         return;
                     }}
-                    // 无下拉：回车跳下一行商品名称（WPS 风格）
-                    const nextIndex = index + 1;
-                    const tbody = document.getElementById('itemsTable');
-                    if (tbody && nextIndex < items.length && tbody.rows[nextIndex]) {{
-                        const targetInput = tbody.rows[nextIndex].querySelector('.product-search-input');
-                        if (targetInput) {{
-                            targetInput.focus();
-                            try {{ targetInput.select(); }} catch(e) {{}}
-                            return;
-                        }}
-                    }}
-                    // 最后一行：新增明细，焦点留在新增行的商品名称
-                    addItem();
-                    const newTbody = document.getElementById('itemsTable');
-                    if (newTbody && newTbody.rows[items.length - 1]) {{
-                        const newInput = newTbody.rows[items.length - 1].querySelector('.product-search-input');
-                        if (newInput) newInput.focus();
-                    }}
+                    // 无下拉：回车跳下一行商品名称，末行则新增明细并聚焦（WPS 风格）
+                    focusNextProductName(index);
                 }}
             }}
 
@@ -5026,7 +5032,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
-            function selectProduct(index, li) {{
+            function selectProduct(index, li, afterSelect) {{
                 const input = document.querySelector('#itemsTable tr:nth-child(' + (index + 1) + ') .product-search-input');
                 const dropdown = document.getElementById('searchDropdown_' + index);
                 
@@ -5056,10 +5062,12 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     .then(units => {{
                         items[index].units = units;
                         renderItems();
+                        if (afterSelect) afterSelect();
                     }})
                     .catch(() => {{
                         items[index].units = [];
                         renderItems();
+                        if (afterSelect) afterSelect();
                     }});
             }}
 
@@ -5732,6 +5740,27 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             let searchTimeout = null;
             let productSearchActiveIndex = -1;
 
+            // WPS 风格：回车后跳到下一行商品名称；最后一行则新增明细并聚焦新行的商品名称
+            function focusNextProductName(index) {{
+                const nextIndex = index + 1;
+                const tbody = document.getElementById('itemsTable');
+                if (tbody && nextIndex < items.length && tbody.rows[nextIndex]) {{
+                    const targetInput = tbody.rows[nextIndex].querySelector('.product-search-input');
+                    if (targetInput) {{
+                        targetInput.focus();
+                        try {{ targetInput.select(); }} catch(e) {{}}
+                        return;
+                    }}
+                }}
+                // 最后一行：新增明细，焦点留在新增行的商品名称
+                addItem();
+                const newTbody = document.getElementById('itemsTable');
+                if (newTbody && newTbody.rows[items.length - 1]) {{
+                    const newInput = newTbody.rows[items.length - 1].querySelector('.product-search-input');
+                    if (newInput) newInput.focus();
+                }}
+            }}
+
             // WPS 风格键盘录入：商品名称输入框
             // - 有模糊搜索下拉时：↑/↓ 移动高亮，Enter 选中，Esc 关闭
             // - 无下拉时：Enter 跳到下一行商品名称，最后一行则新增明细并聚焦
@@ -5771,30 +5800,15 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 if (event.key === 'Enter' || event.keyCode === 13) {{
                     event.preventDefault();
                     if (dropdownVisible) {{
-                        // 下拉可见：选中当前高亮项，未高亮时默认选第一项
+                        // 下拉可见：选中当前高亮项（未高亮时默认第一项），
+                        // 选中完成后继续 WPS 录入：跳到下一行商品名称，末行则新增明细并聚焦
                         const li = productSearchActiveIndex >= 0 ? lis[productSearchActiveIndex] : lis[0];
                         productSearchActiveIndex = -1;
-                        selectProduct(index, li);
+                        selectProduct(index, li, function() {{ focusNextProductName(index); }});
                         return;
                     }}
-                    // 无下拉：回车跳下一行商品名称（WPS 风格）
-                    const nextIndex = index + 1;
-                    const tbody = document.getElementById('itemsTable');
-                    if (tbody && nextIndex < items.length && tbody.rows[nextIndex]) {{
-                        const targetInput = tbody.rows[nextIndex].querySelector('.product-search-input');
-                        if (targetInput) {{
-                            targetInput.focus();
-                            try {{ targetInput.select(); }} catch(e) {{}}
-                            return;
-                        }}
-                    }}
-                    // 最后一行：新增明细，焦点留在新增行的商品名称
-                    addItem();
-                    const newTbody = document.getElementById('itemsTable');
-                    if (newTbody && newTbody.rows[items.length - 1]) {{
-                        const newInput = newTbody.rows[items.length - 1].querySelector('.product-search-input');
-                        if (newInput) newInput.focus();
-                    }}
+                    // 无下拉：回车跳下一行商品名称，末行则新增明细并聚焦（WPS 风格）
+                    focusNextProductName(index);
                 }}
             }}
 
@@ -5868,7 +5882,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
-            function selectProduct(index, li) {{
+            function selectProduct(index, li, afterSelect) {{
                 const input = document.querySelector('#itemsTable tr:nth-child(' + (index + 1) + ') .product-search-input');
                 const dropdown = document.getElementById('searchDropdown_' + index);
                 
@@ -5897,10 +5911,12 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     .then(units => {{
                         items[index].units = units;
                         renderItems();
+                        if (afterSelect) afterSelect();
                     }})
                     .catch(() => {{
                         items[index].units = [];
                         renderItems();
+                        if (afterSelect) afterSelect();
                     }});
             }}
 
