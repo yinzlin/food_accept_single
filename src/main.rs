@@ -5856,6 +5856,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         if (confirm(data.message + '\n\n确定导出？')) {{
                             downloadExcel(url, id, true);
                         }}
+                    }} else if (data.error) {{
+                        alert(data.message);
                     }}
                     return;
                 }}
@@ -20905,7 +20907,7 @@ async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoR
     .await
     .unwrap_or_default();
 
-    // 检查是否有金额为零的明细
+    // 检查是否有金额为零的明细，存在则禁止导出
     if !force {
         let zero_amount_items: Vec<_> = item_rows.iter()
             .filter(|r| {
@@ -20918,9 +20920,9 @@ async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoR
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 serde_json::to_string(&serde_json::json!({
-                    "warning": true,
+                    "error": true,
                     "count": zero_amount_items.len(),
-                    "message": format!("订单中有 {} 条明细金额为零，确认后仍可导出", zero_amount_items.len())
+                    "message": format!("订单中有 {} 条明细金额为零，不允许导出，请先调整后再试", zero_amount_items.len())
                 })).unwrap(),
             ).into_response();
         }
