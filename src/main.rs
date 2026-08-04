@@ -4911,6 +4911,24 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
+            // WPS 风格：↑/↓ 同列上下移动焦点（按当前所在列定位上一行/下一行同一列的输入框）
+            function moveSameColumnFocus(index, delta, event) {{
+                const input = event.target;
+                const td = input.closest('td');
+                if (!td) return;
+                const cellIndex = td.cellIndex;
+                const targetIndex = index + delta;
+                const tbody = document.getElementById('itemsTable');
+                if (!tbody || targetIndex < 0 || targetIndex >= items.length) return;
+                const targetRow = tbody.rows[targetIndex];
+                if (!targetRow || !targetRow.cells[cellIndex]) return;
+                const targetInput = targetRow.cells[cellIndex].querySelector('input, select');
+                if (targetInput) {{
+                    targetInput.focus();
+                    try {{ targetInput.select(); }} catch(e) {{}}
+                }}
+            }}
+
             // WPS 风格键盘录入：商品名称输入框
             // - 有模糊搜索下拉时：↑/↓ 移动高亮，Enter 选中，Esc 关闭
             // - 无下拉时：Enter 跳到下一行商品名称，最后一行则新增明细并聚焦
@@ -4926,6 +4944,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         productSearchActiveIndex = (productSearchActiveIndex + 1) % lis.length;
                         lis[productSearchActiveIndex].classList.add('active');
                         lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }} else {{
+                        // 无下拉：同列下一行
+                        event.preventDefault();
+                        moveSameColumnFocus(index, 1, event);
                     }}
                     return;
                 }}
@@ -4936,6 +4958,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         productSearchActiveIndex = (productSearchActiveIndex - 1 + lis.length) % lis.length;
                         lis[productSearchActiveIndex].classList.add('active');
                         lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }} else {{
+                        // 无下拉：同列上一行
+                        event.preventDefault();
+                        moveSameColumnFocus(index, -1, event);
                     }}
                     return;
                 }}
@@ -5122,6 +5148,17 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 if (event.key === 'Tab') {{
                     event.preventDefault();
                     handleCellNavigation(event.target, 'next-in-row', index, field);
+                    return;
+                }}
+                // ↑/↓：同列上下移动焦点（WPS 风格）
+                if (event.key === 'ArrowUp') {{
+                    event.preventDefault();
+                    moveSameColumnFocus(index, -1, event);
+                    return;
+                }}
+                if (event.key === 'ArrowDown') {{
+                    event.preventDefault();
+                    moveSameColumnFocus(index, 1, event);
                     return;
                 }}
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
@@ -5761,6 +5798,24 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
+            // WPS 风格：↑/↓ 同列上下移动焦点（按当前所在列定位上一行/下一行同一列的输入框）
+            function moveSameColumnFocus(index, delta, event) {{
+                const input = event.target;
+                const td = input.closest('td');
+                if (!td) return;
+                const cellIndex = td.cellIndex;
+                const targetIndex = index + delta;
+                const tbody = document.getElementById('itemsTable');
+                if (!tbody || targetIndex < 0 || targetIndex >= items.length) return;
+                const targetRow = tbody.rows[targetIndex];
+                if (!targetRow || !targetRow.cells[cellIndex]) return;
+                const targetInput = targetRow.cells[cellIndex].querySelector('input, select');
+                if (targetInput) {{
+                    targetInput.focus();
+                    try {{ targetInput.select(); }} catch(e) {{}}
+                }}
+            }}
+
             // WPS 风格键盘录入：商品名称输入框
             // - 有模糊搜索下拉时：↑/↓ 移动高亮，Enter 选中，Esc 关闭
             // - 无下拉时：Enter 跳到下一行商品名称，最后一行则新增明细并聚焦
@@ -5776,6 +5831,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         productSearchActiveIndex = (productSearchActiveIndex + 1) % lis.length;
                         lis[productSearchActiveIndex].classList.add('active');
                         lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }} else {{
+                        // 无下拉：同列下一行
+                        event.preventDefault();
+                        moveSameColumnFocus(index, 1, event);
                     }}
                     return;
                 }}
@@ -5786,6 +5845,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         productSearchActiveIndex = (productSearchActiveIndex - 1 + lis.length) % lis.length;
                         lis[productSearchActiveIndex].classList.add('active');
                         lis[productSearchActiveIndex].scrollIntoView({{ block: 'nearest' }});
+                    }} else {{
+                        // 无下拉：同列上一行
+                        event.preventDefault();
+                        moveSameColumnFocus(index, -1, event);
                     }}
                     return;
                 }}
@@ -5976,6 +6039,17 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 if (event.key === 'Tab') {{
                     event.preventDefault();
                     handleCellNavigation(event.target, 'next-in-row', index, field);
+                    return;
+                }}
+                // ↑/↓：同列上下移动焦点（WPS 风格）
+                if (event.key === 'ArrowUp') {{
+                    event.preventDefault();
+                    moveSameColumnFocus(index, -1, event);
+                    return;
+                }}
+                if (event.key === 'ArrowDown') {{
+                    event.preventDefault();
+                    moveSameColumnFocus(index, 1, event);
                     return;
                 }}
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
