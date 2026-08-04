@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use axum::{
-    extract::{Json, Path},
+    extract::{Json, Path, Query},
     http::{header, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, post, put},
@@ -12,6 +12,42 @@ use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use chrono::Local;
 use axum::extract::Multipart;
 use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, XlsxError};
+
+// ===== 导出通用辅助 =====
+fn xlsx_header_format(color: u32) -> rust_xlsxwriter::Format {
+    rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(color))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin)
+}
+
+fn xlsx_response(buf: Vec<u8>, filename: &str) -> axum::response::Response {
+    let content_disposition = format!("attachment; filename*=UTF-8''{}", urlencode_filename(filename));
+    (
+        axum::http::StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, content_disposition),
+        ],
+        buf,
+    ).into_response()
+}
+
+fn urlencode_filename(name: &str) -> String {
+    let mut out = String::new();
+    for b in name.as_bytes() {
+        let c = *b;
+        if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_' {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{:02X}", c));
+        }
+    }
+    out
+}
+
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Row};
@@ -25,6 +61,7 @@ static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 
 const BOOTSTRAP_CSS: &str = include_str!("../static/bootstrap.min.css");
 const BOOTSTRAP_JS: &str = include_str!("../static/bootstrap.bundle.min.js");
+const CHART_JS: &str = include_str!("../static/chart.umd.min.js");
 
 async fn get_user_role(headers: &axum::http::HeaderMap) -> String {
     let session_token = headers.get("cookie")
@@ -79,6 +116,140 @@ fn has_permission(role: &str, required_role: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ===== 细粒度权限点系统（工程化 RBAC） =====
+// 权限点：resource.action，如 purchase_order.update
+// 角色 → 权限点映射，super_admin 拥有全部权限
+
+/// 判断某角色是否拥有指定权限点
+fn has_permission_point(role: &str, permission: &str) -> bool {
+    use std::collections::HashSet;
+    // 全部业务权限点（供 super_admin 全量拥有）
+    const ALL_PERMS: [&str; 17] = [
+        "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel", "purchase_order.delete",
+        "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
+        "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
+    ];
+
+    let role_perms: HashSet<&str> = match role {
+        "super_admin" => HashSet::from(ALL_PERMS),
+        "admin" => HashSet::from([
+            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel", "purchase_order.delete",
+            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
+            "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
+        ]),
+        "supplier" => HashSet::from([
+            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.cancel",
+            "sales_order.view", "query.view",
+        ]),
+        "purchaser" => HashSet::from([
+            "purchase_order.view",
+            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel",
+            "query.view",
+        ]),
+        "user" => HashSet::from(["query.view"]),
+        _ => HashSet::new(),
+    };
+    role_perms.contains(permission)
+}
+
+/// 当前登录用户的上下文（角色 + 用户ID + 行级数据权限关联）
+#[derive(Debug, Clone)]
+struct UserCtx {
+    role: String,
+    user_id: i64,
+    supplier_id: i64,
+    purchaser_id: i64,
+}
+
+/// 解析用户上下文：cookie session -> (role, user_id, supplier_id, purchaser_id)
+async fn get_user_ctx(headers: &axum::http::HeaderMap) -> UserCtx {
+    let session_token = headers.get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find(|s| s.trim().starts_with("session="))
+                .map(|s| s.trim().strip_prefix("session=").unwrap_or(""))
+        })
+        .unwrap_or("");
+
+    let empty = UserCtx { role: "anonymous".to_string(), user_id: 0, supplier_id: 0, purchaser_id: 0 };
+    if session_token.is_empty() {
+        return empty;
+    }
+
+    let parts: Vec<&str> = session_token.split(':').collect();
+    if parts.len() < 2 {
+        return empty;
+    }
+
+    let user_id = match parts[0].parse::<i64>() {
+        Ok(id) => id,
+        Err(_) => return empty,
+    };
+
+    let rows = sqlx::query(
+        "SELECT role, COALESCE(supplier_id,0) as supplier_id, COALESCE(purchaser_id,0) as purchaser_id FROM user_account WHERE id = ? AND status = 1"
+    )
+    .bind(user_id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return empty;
+    }
+    let row = &rows[0];
+    UserCtx {
+        role: row.get::<String, _>("role"),
+        user_id,
+        supplier_id: row.get::<i64, _>("supplier_id"),
+        purchaser_id: row.get::<i64, _>("purchaser_id"),
+    }
+}
+
+/// 记录操作审计日志（关键写操作）
+async fn log_operation(
+    user: &UserCtx,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    detail: &str,
+) {
+    let username: String = sqlx::query_scalar("SELECT COALESCE(username,'') FROM user_account WHERE id = ?")
+        .bind(user.user_id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO operation_log(user_id, username, action, target_type, target_id, detail) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(user.user_id)
+    .bind(&username)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(detail)
+    .execute(pool())
+    .await;
+}
+
+/// 判断用户是否可操作该采购单（行级数据权限）：admin/super_admin 可见全部；supplier 仅可见自己绑定的供应商
+fn can_access_purchase_order(user: &UserCtx, order_supplier_id: i64) -> bool {
+    match user.role.as_str() {
+        "super_admin" | "admin" => true,
+        "supplier" => user.supplier_id == order_supplier_id,
+        _ => false,
+    }
+}
+
+/// 判断用户是否可操作该销售单（行级数据权限）：admin/super_admin 可见全部；purchaser 仅可见自己绑定的采购单位
+fn can_access_sales_order(user: &UserCtx, order_purchaser_id: i64) -> bool {
+    match user.role.as_str() {
+        "super_admin" | "admin" => true,
+        "purchaser" => user.purchaser_id == order_purchaser_id,
+        _ => false,
+    }
+}
+
 fn get_route_required_role(path: &str) -> Option<&str> {
     match path {
         "/supplier" | "/api/supplier/create" | "/api/supplier/update" | "/api/supplier/delete" => Some("supplier"),
@@ -87,10 +258,10 @@ fn get_route_required_role(path: &str) -> Option<&str> {
         "/warehouse" | "/api/warehouse/create" | "/api/warehouse/update" | "/api/warehouse/delete" => Some("admin"),
         "/inventory" => Some("admin"),
         "/purchase" | "/api/purchase_order/create" | "/api/purchase_order/update" | "/api/purchase_order/delete" => Some("supplier"),
-        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
+        "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/update_prices" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
         "/query/purchase_order" | "/query/purchase_document" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
         "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
-        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" => Some("admin"),
+        "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" | "/query/stock_summary_reimburse" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
         "/system" | "/api/system/config" => Some("super_admin"),
@@ -102,40 +273,94 @@ fn get_route_required_role(path: &str) -> Option<&str> {
 
 fn check_api_route_permission(path: &str) -> Option<&str> {
     if path.starts_with("/api/supplier/") {
-        if path.starts_with("/api/supplier/list") || path.starts_with("/api/supplier/export") {
-            Some("supplier")
-        } else {
-            Some("supplier")
-        }
+        // 供应商基础资料：supplier 角色以上可访问
+        Some("supplier")
     } else if path.starts_with("/api/purchaser/") {
+        // 采购单位基础资料：purchaser 角色以上可访问
         Some("purchaser")
     } else if path.starts_with("/api/product/") {
-        Some("admin")
+        Some("manage.admin")
     } else if path.starts_with("/api/warehouse/") {
-        Some("admin")
+        Some("manage.admin")
+    } else if path.starts_with("/api/inventory/") {
+        Some("manage.admin")
     } else if path.starts_with("/api/purchase_order/") {
-        Some("supplier")
+        // 采购单：按操作细分权限点
+        if path.ends_with("/create") || path.ends_with("/import") {
+            Some("purchase_order.create")
+        } else if path.ends_with("/update") {
+            Some("purchase_order.update")
+        } else if path.ends_with("/delete") {
+            Some("purchase_order.delete")
+        } else if path.ends_with("/cancel") {
+            Some("purchase_order.cancel")
+        } else {
+            Some("purchase_order.view")
+        }
     } else if path.starts_with("/api/purchase_document/") {
-        Some("supplier")
+        // 采购单据：上传/删除属于写操作
+        if path.ends_with("/upload") || path.ends_with("/delete") {
+            Some("purchase_order.update")
+        } else {
+            Some("purchase_order.view")
+        }
     } else if path.starts_with("/api/sales_order/") {
-        Some("purchaser")
-    } else if path.starts_with("/api/query/purchase") {
-        Some("supplier")
+        // 销售单：按操作细分权限点
+        if path.ends_with("/create") || path.ends_with("/import") || path.contains("/generate_purchase") {
+            Some("sales_order.create")
+        } else if path.ends_with("/update") || path.ends_with("/correction") || path.ends_with("/upload_image") || path.ends_with("/delete_image") {
+            Some("sales_order.update")
+        } else if path.ends_with("/delete") {
+            Some("sales_order.delete")
+        } else if path.ends_with("/update_prices") {
+            Some("sales_order.adjust_price")
+        } else if path.ends_with("/update_status") {
+            Some("sales_order.approve")
+        } else if path.ends_with("/cancel") {
+            Some("sales_order.cancel")
+        } else {
+            Some("sales_order.view")
+        }
+    } else if path.starts_with("/api/query/purchase") || path.starts_with("/api/query/supplier_balance") {
+        Some("query.view")
     } else if path.starts_with("/api/query/sales") || path.starts_with("/api/query/purchaser_balance") || path.starts_with("/api/query/product_rank") {
-        Some("purchaser")
+        Some("query.view")
     } else if path.starts_with("/api/query/stock") || path.starts_with("/api/query/income") || path.starts_with("/api/query/profit") || path.starts_with("/api/query/overview") || path.starts_with("/api/query/category") || path.starts_with("/api/query/document") {
-        Some("admin")
+        Some("manage.admin")
+    } else if path.starts_with("/api/query/") {
+        Some("query.view")
     } else if path.starts_with("/api/user/") {
-        Some("super_admin")
+        if path == "/api/user/list" {
+            // 用户列表（用于采购单/销售单经手人选择），采购/销售/管理员均可访问
+            Some("query.view")
+        } else {
+            Some("manage.user")
+        }
     } else if path.starts_with("/api/system/") {
-        Some("super_admin")
+        Some("manage.system")
     } else if path.starts_with("/api/backup/") {
-        Some("super_admin")
+        Some("manage.backup")
     } else if path.starts_with("/api/restore/") {
-        Some("super_admin")
+        Some("manage.backup")
     } else {
         None
     }
+}
+
+/// 校验 API 权限：返回权限点对应的角色校验（权限点系统）
+async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, (StatusCode, String)> {
+    let ctx = get_user_ctx(headers).await;
+    
+    if let Some(permission) = check_api_route_permission(path) {
+        if !has_permission_point(&ctx.role, permission) {
+            return Err((StatusCode::FORBIDDEN, serde_json::to_string(&serde_json::json!({
+                "success": false,
+                "message": "您没有权限执行此操作"
+            })).unwrap()));
+        }
+    }
+    
+    Ok(ctx.role)
 }
 
 async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, Html<String>> {
@@ -160,21 +385,6 @@ async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> R
     Ok(role)
 }
 
-async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, (StatusCode, String)> {
-    let role = get_user_role(headers).await;
-    
-    if let Some(required_role) = check_api_route_permission(path) {
-        if !has_permission(&role, required_role) {
-            return Err((StatusCode::FORBIDDEN, serde_json::to_string(&serde_json::json!({
-                "success": false,
-                "message": "您没有权限执行此操作"
-            })).unwrap()));
-        }
-    }
-    
-    Ok(role)
-}
-
 async fn serve_bootstrap_css() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -189,6 +399,89 @@ async fn serve_bootstrap_js() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
         BOOTSTRAP_JS,
     )
+}
+
+async fn serve_chart_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        CHART_JS,
+    )
+}
+
+// 修复常见数据库损坏
+async fn repair_db_corruption(pool: &SqlitePool) {
+    // 1. 先尝试 REINDEX + VACUUM
+    let _ = sqlx::query("REINDEX").execute(pool).await;
+    let _ = sqlx::query("VACUUM").execute(pool).await;
+    let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .unwrap_or_default();
+    if check == "ok" { return; }
+    eprintln!("REINDEX+VACUUM 后仍异常: {}", check);
+
+    // 2. 修复 NUMERIC value in ...status 类型错误
+    // 检查 purchase_order.status 是否有数值类型
+    if check.contains("NUMERIC value in purchase_order.status") {
+        let bad_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, CAST(status AS TEXT) as status FROM purchase_order WHERE typeof(status) != 'text'"
+        )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for (id, _) in &bad_rows {
+            let _ = sqlx::query("UPDATE purchase_order SET status = 'pending' WHERE id = ?")
+                .bind(id).execute(pool).await;
+            eprintln!("  修复 purchase_order.status: ID={}", id);
+        }
+    }
+    // 检查 sales_order.status 是否有数值类型
+    if check.contains("NUMERIC value in sales_order.status") {
+        let bad_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, CAST(status AS TEXT) as status FROM sales_order WHERE typeof(status) != 'text'"
+        )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for (id, _) in &bad_rows {
+            let _ = sqlx::query("UPDATE sales_order SET status = 'pending' WHERE id = ?")
+                .bind(id).execute(pool).await;
+            eprintln!("  修复 sales_order.status: ID={}", id);
+        }
+    }
+
+    // 3. 检查并修复重复 order_no
+    for table in &["sales_order", "purchase_order"] {
+        let dupes: Vec<(i64, String)> = {
+            let sql = format!("SELECT id, order_no FROM {} WHERE order_no IN (SELECT order_no FROM {} GROUP BY order_no HAVING COUNT(*) > 1) ORDER BY order_no, id", table, table);
+            sqlx::query_as::<_, (i64, String)>(AssertSqlSafe(sql))
+        }
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for (i, (id, order_no)) in dupes.iter().enumerate() {
+            let new_no = format!("{}-fix-{}", order_no, i);
+            let sql = format!("UPDATE {} SET order_no = ? WHERE id = ?", table);
+            let _ = sqlx::query(AssertSqlSafe(sql))
+                .bind(&new_no).bind(id).execute(pool).await;
+            eprintln!("  修复 {} 重复 order_no: ID={}, {} -> {}", table, id, order_no, new_no);
+        }
+    }
+
+    // 4. 再次 REINDEX + VACUUM
+    let _ = sqlx::query("REINDEX").execute(pool).await;
+    let _ = sqlx::query("VACUUM").execute(pool).await;
+
+    let final_check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .unwrap_or_default();
+    if final_check == "ok" {
+        eprintln!("repair_db_corruption 修复成功");
+    } else {
+        eprintln!("repair_db_corruption 修复后仍异常: {}", final_check);
+    }
 }
 
 async fn init_pool() {
@@ -218,8 +511,39 @@ async fn init_pool() {
     let _ = sqlx::query("PRAGMA auto_vacuum = INCREMENTAL").execute(&pool).await;
     let _ = sqlx::query("PRAGMA page_size = 4096").execute(&pool).await;
     
-    init_tables(&pool).await.expect("初始化数据表失败");
+    // 使用 integrity_check 检测数据库损坏
+    let integrity_check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_default();
+    if integrity_check != "ok" {
+        eprintln!("数据库损坏: {}", integrity_check);
+        // 尝试修复常见的损坏类型
+        repair_db_corruption(&pool).await;
+        // 最终检查
+        let final_check: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_default();
+        if final_check == "ok" {
+            eprintln!("数据库修复成功");
+        } else {
+            eprintln!("数据库修复失败: {}", final_check);
+        }
+    } else {
+        eprintln!("数据库完整性检查通过");
+    }
     
+    init_tables(&pool).await.expect("初始化数据表失败");
+
+    // 一次性修复：重算所有耗材分摊方案的 allocated_amount 与 remaining_balance
+    // 修复历史 bug（replace_remove 冲减负数未计入分摊金额）导致的数据偏差
+    // allocated_amount = SUM(对应 order_supplement_item.amount，含正负)
+    // remaining_balance = total_amount - allocated_amount
+    let _ = sqlx::query(
+        "UPDATE consumable_allocation SET allocated_amount = COALESCE((SELECT SUM(amount) FROM order_supplement_item WHERE source_order_id = consumable_allocation.source_order_id), 0), remaining_balance = total_amount - COALESCE((SELECT SUM(amount) FROM order_supplement_item WHERE source_order_id = consumable_allocation.source_order_id), 0)"
+    ).execute(&pool).await;
+
     // 清理所有孤儿数据（有商品名称的记录保留，用于客户开单备注场景）
     let _ = sqlx::query("DELETE FROM sales_order_item WHERE (unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0) AND (product_name IS NULL OR product_name = '')").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM purchase_order_item WHERE (unit_price IS NULL OR quantity IS NULL OR quantity = 0 OR amount = 0) AND (product_name IS NULL OR product_name = '')").execute(&pool).await;
@@ -345,6 +669,40 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
 
     // 最高进价、最低进价（purchase_price 作为当前进价）
     let _ = sqlx::query("ALTER TABLE product ADD COLUMN max_purchase_price REAL DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // 加成率（毛利率）：base_price = purchase_price * (1 + markup_rate)
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN markup_rate REAL DEFAULT 0.5")
+        .execute(pool)
+        .await;
+
+    // 是否启用售价自动更新（true=按加成率自动算；false=人工维护 base_price）
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN auto_update_price INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // 价格变更日志表：记录每次进价/售价变更，便于审计和对账
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS product_price_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            price_type TEXT NOT NULL,
+            old_price REAL DEFAULT 0,
+            new_price REAL DEFAULT 0,
+            source TEXT,
+            ref_id INTEGER,
+            remark TEXT,
+            changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(product_id) REFERENCES product(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_price_log_product ON product_price_log(product_id, changed_at)")
         .execute(pool)
         .await;
 
@@ -514,6 +872,10 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN ordered_quantity REAL NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS sales_order (
@@ -672,7 +1034,56 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN user_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN handler_phone TEXT")
+        .execute(pool)
+        .await;
+
+    // 用户表增加联系方式字段（用于采购单/销售单打印）
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN phone TEXT")
+        .execute(pool)
+        .await;
+
+    // 用户表增加行级数据权限关联字段：supplier 账号绑定供应商，purchaser 账号绑定采购单位
+    // 用于"只能查看/操作自己的单据"的行级数据权限
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN supplier_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN purchaser_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // 操作审计日志表：记录所有关键写操作（谁、何时、做了什么）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER DEFAULT 0,
+            username TEXT DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT DEFAULT '',
+            target_id TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_op_log_created ON operation_log(created_at)")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN remark TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN source_sales_order_id INTEGER DEFAULT 0")
         .execute(pool)
         .await;
 
@@ -693,6 +1104,10 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN supplier_name TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN pre_sale_quantity REAL NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
 
@@ -1039,6 +1454,8 @@ struct PurchaseOrderReq {
     final_amount: f64,
     warehouse_id: i64,
     warehouse_name: String,
+    user_id: Option<i64>,
+    handler_phone: Option<String>,
     items: Vec<PurchaseOrderItemReq>,
     remark: Option<String>,
 }
@@ -1055,6 +1472,7 @@ struct PurchaseOrderItemReq {
     quantity: f64,
     base_quantity: Option<f64>,
     amount: f64,
+    ordered_quantity: Option<f64>,
     remark: Option<String>,
 }
 
@@ -1086,6 +1504,7 @@ struct SalesOrderItemReq {
     quantity: f64,
     base_quantity: Option<f64>,
     amount: f64,
+    pre_sale_quantity: Option<f64>,
     supplier_id: i64,
     supplier_name: String,
     category_id: Option<i64>,
@@ -1297,7 +1716,10 @@ fn sidebar_html() -> String {
                                     <a href="/query/stock_flow"><span class="node-icon">📋</span><span class="node-label">库存明细台账</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_summary">
-                                    <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">出入库统计</span></a>
+                                    <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">真实出入库统计</span></a>
+                                </li>
+                                <li class="tree-node leaf" data-path="/query/stock_summary_reimburse">
+                                    <a href="/query/stock_summary_reimburse"><span class="node-icon">🧾</span><span class="node-label">报销出入库统计</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_warning">
                                     <a href="/query/stock_warning"><span class="node-icon">⚠️</span><span class="node-label">库存上下限预警</span></a>
@@ -1773,7 +2195,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -1979,7 +2401,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteSupplierCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -2185,7 +2607,7 @@ fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeletePurchaserCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -2881,6 +3303,8 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
                     <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
                     <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
+                    <button class="btn btn-sm btn-success" onclick="batchSetAutoUpdate(1)">全部开启自动更新售价</button>
+                    <button class="btn btn-sm btn-secondary" onclick="batchSetAutoUpdate(0)">全部关闭自动更新售价</button>
                     <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
                     <button class="btn btn-sm btn-warning" onclick="importProducts()">导入</button>
                     <input type="file" id="productFileInput" style="display:none" accept=".xlsx,.csv" onchange="handleProductFile(this)">
@@ -2950,11 +3374,22 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <label class="form-label">分类</label>
                                     <select name="category_id" class="form-control">{0}</select>
                                 </div>
-                                <div class="col-md-4">
+                                <div class="col-md-2">
+                                    <label class="form-label">加成率（毛利率）</label>
+                                    <input type="number" step="0.01" min="0" max="5" name="markup_rate" class="form-control" oninput="onMarkupRateChange()">
+                                </div>
+                                <div class="col-md-2">
+                                    <label class="form-label">售价自动更新</label>
+                                    <select name="auto_update_price" class="form-control">
+                                        <option value="0">关闭</option>
+                                        <option value="1">开启</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-2">
                                     <label class="form-label">历史最高进价（自动）</label>
                                     <input type="number" step="0.01" name="max_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
-                                <div class="col-md-4">
+                                <div class="col-md-2">
                                     <label class="form-label">历史最低进价（自动）</label>
                                     <input type="number" step="0.01" name="min_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
@@ -3163,8 +3598,11 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     let statusBadge = p.status === 1 ? '<span class="badge bg-success">启用</span>' : '<span class="badge bg-secondary">停用</span>';
                     let toggleBtnClass = p.status === 1 ? 'btn-outline-warning' : 'btn-outline-success';
                     let toggleBtnText = p.status === 1 ? '停用' : '启用';
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + '</td>';
-                    html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
+                    let autoBadge = (p.auto_update_price === 1) ? '<span class="badge bg-info" title="开启自动更新售价">自动</span>' : '<span class="badge bg-light text-dark" title="人工维护售价">人工</span>';
+                    let autoBtnClass = (p.auto_update_price === 1) ? 'btn-outline-secondary' : 'btn-outline-info';
+                    let autoBtnText = (p.auto_update_price === 1) ? '关闭自动' : '开启自动';
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
+                    html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
             }}
@@ -3200,7 +3638,123 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                         sellingPrice = parseFloat(form.base_price.value) || 0;
                     }}
                 }}
-                form.selling_price.value = sellingPrice.toFixed(2);
+                // 应用统一尾数规则
+                form.selling_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+            }}
+
+            // 加成率变更时的客户端预览（仅在自动更新开启且有进价时）
+            function onMarkupRateChange() {{
+                const form = document.getElementById('editForm');
+                const auto = parseInt(form.auto_update_price.value);
+                if (auto !== 1) return;
+                const purchase = parseFloat(form.purchase_price.value) || 0;
+                const markup = parseFloat(form.markup_rate.value) || 0;
+                if (purchase > 0) {{
+                    const raw = purchase * (1 + markup);
+                    const preview = roundToAllowedLastDigit(raw);
+                    form.selling_price.value = preview.toFixed(2);
+                }}
+            }}
+
+            // 客户端取整（与后端 round_to_allowed_last_digit 保持一致）
+            function roundToAllowedLastDigit(price) {{
+                if (price <= 0) return price;
+                let cents = Math.round(price * 100);
+                let last = cents % 10;
+                let mapped;
+                if (last <= 2) mapped = 0;
+                else if (last <= 5) mapped = 5;
+                else if (last === 6) mapped = 6;
+                else if (last <= 8) mapped = 8;
+                else mapped = 9;
+                return (Math.floor(cents / 10) * 10 + mapped) / 100;
+            }}
+
+            // 通用：拉取商品最近采购价并在采购/销售单选商品后做同基础单位对比提示
+            // kind = 'purchase'：采购价对比最近采购价
+            // kind = 'sales'：销售零售价对比最近采购价
+            async function checkPriceAfterSelect(productId, currentBaseUnit, currentPrice, kind, productName) {{
+                try {{
+                    const res = await fetch('/api/product/last_purchase_price?product_id=' + productId);
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    const lastPrice = parseFloat(data.purchase_price) || 0;
+                    const lastUnit = data.base_unit || '';
+                    if (lastPrice <= 0) return;
+                    // 必须同基础单位才比较（避免五花肉/斤 与 五花肉/块 误比）
+                    if (lastUnit !== currentBaseUnit) {{
+                        return;
+                    }}
+                    if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
+                        const diff = currentPrice - lastPrice;
+                        const sign = diff > 0 ? '上涨' : '下降';
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                            // 用户取消：不清空已选商品，仅提示
+                        }}
+                    }} else if (kind === 'sales' && currentPrice < lastPrice) {{
+                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
+                        if (!confirm(tip + '\\n\\n是否继续？')) {{
+                        }}
+                    }}
+                }} catch(e) {{
+                    console.error('价格比较失败:', e);
+                }}
+            }}
+
+            // 批量设置所有商品的自动更新售价开关
+            async function batchSetAutoUpdate(auto) {{
+                const text = auto === 1 ? '开启' : '关闭';
+                if (!confirm('确定要' + text + '所有商品的自动更新售价吗？')) return;
+                const res = await fetch('/api/product/batch_set_auto_update_price', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ auto_update_price: auto }})
+                }});
+                if (res.ok) {{
+                    alert('已' + text + '所有商品的自动更新售价');
+                    loadProductsByCategory(currentCategoryId);
+                }} else {{
+                    alert('操作失败');
+                }}
+            }}
+
+            // 单个商品切换自动更新售价
+            async function toggleProductAutoUpdate(pid, currentAuto) {{
+                const nextAuto = currentAuto === 1 ? 0 : 1;
+                const text = nextAuto === 1 ? '开启' : '关闭';
+                if (!confirm('确定要' + text + '该商品的自动更新售价吗？')) return;
+                const res = await fetch('/api/product/set_auto_update_price', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ product_id: pid, auto_update_price: nextAuto }})
+                }});
+                if (res.ok) {{
+                    loadProductsByCategory(currentCategoryId);
+                }} else {{
+                    alert('操作失败');
+                }}
+            }}
+
+            // 商品编辑页价格校验：进价/售价为零普通提醒；进价>售价严重提醒
+            function validateProductPrices() {{
+                const form = document.getElementById('editForm');
+                const purchase = parseFloat(form.purchase_price.value) || 0;
+                const selling = parseFloat(form.base_price.value) || 0;
+                const warnings = [];
+                if (purchase <= 0) warnings.push('当前进价为 0');
+                if (selling <= 0) warnings.push('当前售价为 0');
+                if (purchase > 0 && selling > 0 && purchase > selling) {{
+                    const msg = '警告：当前进价（{{0}}）高于当前售价（{{1}}），请确认是否倒置！'.replace('{{0}}', purchase.toFixed(2)).replace('{{1}}', selling.toFixed(2));
+                    if (!confirm('【严重提醒】\\n' + msg + '\\n\\n是否仍要保存？')) {{
+                        return false;
+                    }}
+                    return warnings.length > 0 ? confirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\\n\\n是否仍要保存？') : true;
+                }}
+                if (warnings.length > 0) {{
+                    return confirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\\n\\n是否仍要保存？');
+                }}
+                return true;
             }}
 
             function addUnitRow(unitData) {{
@@ -3234,7 +3788,9 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 form.max_purchase_price.value = p.max_purchase_price || 0;
                 form.min_purchase_price.value = p.min_purchase_price || 0;
                 form.category_id.value = p.category_id || '';
-                
+                form.markup_rate.value = (p.markup_rate !== undefined && p.markup_rate !== null) ? p.markup_rate : 0.5;
+                form.auto_update_price.value = (p.auto_update_price !== undefined && p.auto_update_price !== null) ? p.auto_update_price : 0;
+
                 form.gov_price.value = '';
                 form.supermarket_1.value = '';
                 form.supermarket_2.value = '';
@@ -3337,6 +3893,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             async function submitEdit() {{
+                if (!validateProductPrices()) return;
                 const form = document.getElementById('editForm');
                 const p = allProducts.find(x => x.id === editingProductId);
                 const data = {{
@@ -3350,7 +3907,9 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     base_price: parseFloat(form.base_price.value) || null,
                     purchase_price: parseFloat(form.purchase_price.value) || null,
                     image_url: p ? p.image_url : null,
-                    category_id: form.category_id.value ? parseInt(form.category_id.value) : null
+                    category_id: form.category_id.value ? parseInt(form.category_id.value) : null,
+                    markup_rate: parseFloat(form.markup_rate.value) || 0.5,
+                    auto_update_price: parseInt(form.auto_update_price.value)
                 }};
                 const res = await fetch('/api/product/update', {{
                     method: 'POST',
@@ -3865,11 +4424,18 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         <label>备注：</label>
                         <input type="text" id="remarkInput" class="form-control">
                     </div>
+                    <div class="col-md-3">
+                        <label>经手人：</label>
+                        <select id="handlerSelect" class="form-control" onchange="document.getElementById('handlerId').value = this.value">
+                            <option value="">请选择经手人</option>
+                        </select>
+                        <input type="hidden" id="handlerId" value="">
+                    </div>
                 </div>
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>备注</th><th>操作</th></tr>
+                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -4023,6 +4589,52 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 }}, 200);
             }});
 
+            // 加载用户列表
+            let users = [];
+            async function loadUsers() {{
+                try {{
+                    const res = await fetch('/api/user/list');
+                    if (res.ok) {{
+                        users = await res.json();
+                        const handlerSelect = document.getElementById('handlerSelect');
+                        if (handlerSelect) {{
+                            const currentVal = handlerSelect.value;
+                            handlerSelect.innerHTML = '<option value="">请选择经手人</option>';
+                            users.forEach(u => {{
+                                const name = u.nickname || u.username || '';
+                                if (name) {{
+                                    handlerSelect.innerHTML += '<option value="' + u.id + '">' + name + (u.phone ? ' (' + u.phone + ')' : '') + '</option>';
+                                }}
+                            }});
+                            if (currentVal) handlerSelect.value = currentVal;
+                        }}
+                    }}
+                }} catch (e) {{}}
+            }}
+            loadUsers();
+
+            // 导出采购单（打印模板样式）
+            async function exportPurchaseOrder(orderId) {{
+                if (users.length === 0) {{ await loadUsers(); }}
+                let uid = 0;
+                let opts = '0. 无经手人（使用订单已存）\n';
+                users.forEach((u, idx) => {{
+                    const name = u.nickname || u.username || '';
+                    if (name) {{ opts += (idx+1) + '. ' + name + (u.phone ? ' (' + u.phone + ')' : '') + '\n'; }}
+                }});
+                const input = prompt('请选择经手人编号：\n' + opts, '0');
+                if (input === null) return;
+                const choice = parseInt(input);
+                if (isNaN(choice)) return;
+                if (choice === 0) {{
+                    uid = 0;
+                }} else if (choice > 0 && choice <= users.length) {{
+                    const selected = users[choice - 1];
+                    uid = selected ? (selected.id || 0) : 0;
+                }}
+                window.location = '/api/purchase_order/export_print/' + orderId + (uid > 0 ? '?user_id=' + uid : '');
+            }}
+
             function showSupplierDropdown(filter) {{
                 const dropdown = document.getElementById('supplierDropdown');
                 let list = suppliers;
@@ -4130,22 +4742,35 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 const orders = result.data || [];
                 const tbody = document.getElementById('orderListBody');
                 tbody.innerHTML = '';
+                let sumAmount = 0, sumDiscounted = 0, sumReduction = 0, sumFinal = 0;
                 orders.forEach(order => {{
+                    const amount = order.total_amount;
+                    const discounted = amount * (1 - (order.discount_rate || 0) / 100);
+                    const reduction = order.amount_reduction || 0;
+                    const finalAmt = order.final_amount || 0;
+                    sumAmount += amount;
+                    sumDiscounted += discounted;
+                    sumReduction += reduction;
+                    sumFinal += finalAmt;
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')" style="cursor: pointer;">' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
                         '<td>' + order.order_date + '</td>' +
                         '<td>' + order.supplier_name + '</td>' +
                         '<td>' + (order.warehouse_name || '') + '</td>' +
-                        '<td>' + order.total_amount.toFixed(2) + '</td>' +
-                        '<td>' + (order.total_amount * (1 - (order.discount_rate || 0) / 100)).toFixed(2) + '</td>' +
-                        '<td>' + (order.amount_reduction || 0).toFixed(2) + '</td>' +
-                        '<td>' + (order.final_amount || 0).toFixed(2) + '</td>' +
+                        '<td>' + amount.toFixed(2) + '</td>' +
+                        '<td>' + discounted.toFixed(2) + '</td>' +
+                        '<td>' + reduction.toFixed(2) + '</td>' +
+                        '<td>' + finalAmt.toFixed(2) + '</td>' +
                         '<td>' + order.status + '</td>' +
                         '<td>' +
+                        '<button onclick="event.stopPropagation(); exportPurchaseOrder(' + order.id + ')" class="btn btn-info btn-sm me-1">导出采购单</button>' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
                 }});
+                if (orders.length > 0) {{
+                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                }}
                 renderPagination(result.page, result.total_pages, result.total);
             }}
 
@@ -4176,7 +4801,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             loadOrders();
 
             function addItem() {{
-                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ratio: 1, units: [] }});
+                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [] }});
                 renderItems();
             }}
 
@@ -4209,17 +4834,18 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
-                            <td>
+                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm"></td>
+                            <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td>${{item.amount.toFixed(2)}}</td>
-                            <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
-                            <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
+                            <td style="width:85px"><input type="text" value="${{item.ordered_quantity != null && item.ordered_quantity > 0 ? item.ordered_quantity.toFixed(2) : ''}}" onchange="updateOrderedQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'ordered_quantity')" class="form-control-sm text-right" placeholder="订购数量" enterkeyhint="next"></td>
+                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'quantity')" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'unit_price')" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:110px">${{item.amount.toFixed(2)}}</td>
+                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'remark')" class="form-control-sm" placeholder="单品备注" enterkeyhint="next"></td>
+                            <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
                     `;
                 }});
@@ -4289,7 +4915,10 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
-                
+
+                // 采购单：本次采购价与最近采购价对比（同基础单位）
+                checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'purchase', items[index].product_name);
+
                 fetch('/api/product/unit/list?product_id=' + items[index].product_id)
                     .then(res => res.json())
                     .then(units => {{
@@ -4343,36 +4972,87 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
+            function updateOrderedQty(index, input) {{ 
+                items[index].ordered_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100; 
+            }}
 
-            function handleEnterKey(event, index, cellIndex) {{
+            function handleEnterKey(event, index, field) {{
+                // Enter: 同列下一行 (WPS 风格)
+                // Tab:   同行下一格，行末换到下一行第一格 (WPS 风格)
+                if (event.key === 'Tab') {{
+                    event.preventDefault();
+                    handleCellNavigation(event.target, 'next-in-row', index, field);
+                    return;
+                }}
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
                 if (enterKeys.includes(event.key) || event.keyCode === 13) {{
                     event.preventDefault();
-                    
+
                     const input = event.target;
-                    if (cellIndex === 3) {{
+                    // renderItems 会重建 DOM，先捕获当前列索引用于回车后同列下移
+                    const td = input.closest('td');
+                    const cellIndex = td ? td.cellIndex : -1;
+                    // 回车时同步当前输入值（与 onchange 一致），避免 renderItems 覆盖未提交的值
+                    if (field === 'quantity') {{
                         items[index].quantity = parseFloat(input.value) || 0;
                         items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
                         items[index].amount = items[index].unit_price * items[index].quantity;
-                    }} else if (cellIndex === 4) {{
+                    }} else if (field === 'unit_price') {{
                         items[index].unit_price = parseFloat(input.value) || 0;
                         items[index].amount = items[index].unit_price * items[index].quantity;
+                    }} else if (field === 'ordered_quantity') {{
+                        items[index].ordered_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                    }} else if (field === 'spec') {{
+                        items[index].spec = input.value;
+                    }} else if (field === 'remark') {{
+                        items[index].remark = input.value.trim();
                     }}
                     renderItems();
-                    
+
+                    // WPS 风格：回车同列下一行
                     const nextIndex = index + 1;
-                    if (nextIndex < items.length) {{
-                        const table = document.getElementById('itemsTable');
-                        if (table && table.rows[nextIndex]) {{
-                            const nextRow = table.rows[nextIndex];
-                            if (nextRow.cells[cellIndex]) {{
-                                const targetInput = nextRow.cells[cellIndex].querySelector('input');
-                                if (targetInput) {{
-                                    targetInput.focus();
-                                    try {{ targetInput.select(); }} catch(e) {{}}
-                                }}
+                    if (cellIndex >= 0 && nextIndex < items.length) {{
+                        const tbody = document.getElementById('itemsTable');
+                        if (tbody && tbody.rows[nextIndex] && tbody.rows[nextIndex].cells[cellIndex]) {{
+                            const targetInput = tbody.rows[nextIndex].cells[cellIndex].querySelector('input, select');
+                            if (targetInput) {{
+                                targetInput.focus();
+                                try {{ targetInput.select(); }} catch(e) {{}}
                             }}
                         }}
+                    }}
+                }}
+            }}
+
+            // WPS 风格 Tab 同行导航：同 row 从左到右，行末换下一行第一个 input
+            // 跳过 select（单位/供应商等下拉），用户用方向键展开
+            function handleCellNavigation(currentInput, direction, index, field) {{
+                const tr = currentInput.closest('tr');
+                if (!tr) return;
+                const tbody = tr.parentElement;
+                if (!tbody) return;
+                const cells = Array.from(tr.cells);
+                const currentCell = currentInput.closest('td');
+                if (!currentCell) return;
+                const currentCellIndex = cells.indexOf(currentCell);
+
+                // 同行下一个可聚焦的 input（跳过 select）
+                for (let i = currentCellIndex + 1; i < cells.length; i++) {{
+                    const inputs = cells[i].querySelectorAll('input');
+                    if (inputs.length > 0) {{
+                        inputs[0].focus();
+                        try {{ inputs[0].select(); }} catch(e) {{}}
+                        return;
+                    }}
+                }}
+
+                // 同行无更多 input，换到下一行第一个 input
+                const nextRow = tbody.rows[index + 1];
+                if (nextRow) {{
+                    const firstInput = nextRow.querySelector('input');
+                    if (firstInput) {{
+                        firstInput.focus();
+                        try {{ firstInput.select(); }} catch(e) {{}}
                     }}
                 }}
             }}
@@ -4405,6 +5085,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
                     warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
                     warehouse_name: document.getElementById('warehouseInput').value || '',
+                    user_id: parseInt(document.getElementById('handlerId').value) || null,
                     items: validItems,
                     remark: document.getElementById('remarkInput').value || null
                 }};
@@ -4432,6 +5113,17 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('remarkInput').value = order.remark || '';
                 document.getElementById('discountRateInput').value = order.discount_rate || 0;
                 document.getElementById('amountReductionInput').value = order.amount_reduction || 0;
+                // 回显经手人
+                const handlerSelect = document.getElementById('handlerSelect');
+                const handlerId = order.user_id || 0;
+                if (handlerSelect) {{
+                    if (!handlerSelect.querySelector('option[value=\"' + handlerId + '\"]') && handlerId > 0) {{
+                        // 用户列表可能还没加载好，先放默认
+                        await loadUsers();
+                    }}
+                    handlerSelect.value = String(handlerId);
+                    document.getElementById('handlerId').value = String(handlerId);
+                }}
                 
                 items = [];
                 for (const item of order.items) {{
@@ -4446,6 +5138,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         quantity: item.quantity || 0,
                         base_quantity: item.base_quantity || 0,
                         amount: item.amount || 0,
+                        ordered_quantity: item.ordered_quantity || 0,
                         remark: item.remark || '',
                         supplier_id: item.supplier_id || 0,
                         supplier_name: item.supplier_name || '',
@@ -4577,7 +5270,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>供应商</th><th>备注</th><th>操作</th></tr>
+                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">预售数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">供应商</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -4609,6 +5302,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 <div class="mt-3 d-flex align-items-center flex-wrap" style="gap:8px;">
                     <button onclick="saveOrder()" class="btn btn-success" id="saveBtn">保存销售订单</button>
                     <button onclick="resetForm()" class="btn btn-secondary">新建订单</button>
+                    <button onclick="updatePrices()" class="btn btn-warning" id="updatePricesBtn" style="display:none">一键更新售价</button>
 
                     <input type="file" id="customerOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('customer')">
                     <button type="button" class="btn btn-outline-primary" onclick="document.getElementById('customerOrderImageInput').click()">📷 上传客户订单</button>
@@ -4623,6 +5317,36 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         <img id="signedOrderImageThumb" src="" style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid #ddd;">
                     </a>
                     <button type="button" class="btn btn-sm btn-outline-danger" id="signedOrderImageDeleteBtn" onclick="deleteSalesOrderImage('signed')" style="display:none">删除</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 售价变更提示弹窗 -->
+        <style>
+            #priceChangeModal {{ display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }}
+            #priceChangeModal .modal-dialog {{ margin: 80px auto; max-width: 600px; }}
+            #priceChangeModal .modal-content {{ background: #fff; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }}
+            #priceChangeModal .modal-header {{ padding: 12px 16px; border-bottom: 1px solid #dee2e6; display: flex; justify-content: space-between; align-items: center; }}
+            #priceChangeModal .modal-body {{ padding: 12px 16px; max-height: 400px; overflow-y: auto; }}
+            #priceChangeModal .modal-footer {{ padding: 12px 16px; border-top: 1px solid #dee2e6; text-align: right; }}
+            #priceChangeModal .close {{ border: none; background: none; font-size: 24px; cursor: pointer; }}
+        </style>
+        <div id="priceChangeModal" class="modal" style="display:none;">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">售价变更明细</h5>
+                        <button type="button" class="close" onclick="document.getElementById('priceChangeModal').style.display='none'">&times;</button>
+                    </div>
+                    <div class="modal-body" style="max-height:400px;overflow-y:auto;">
+                        <table class="table table-sm table-bordered">
+                            <thead><tr><th>商品名称</th><th>原售价</th><th>新售价</th><th>变动</th></tr></thead>
+                            <tbody id="priceChangeBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" onclick="document.getElementById('priceChangeModal').style.display='none'">关闭</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -4751,7 +5475,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             generateOrderNo('sales');
 
             function addItem() {{
-                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, quantity: 0, base_quantity: 0, amount: 0, ratio: 1, units: [], supplier_id: 0, supplier_name: '' }});
+                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, quantity: 0, base_quantity: 0, amount: 0, pre_sale_quantity: 0, ratio: 1, units: [], supplier_id: 0, supplier_name: '' }});
                 renderItems();
             }}
 
@@ -4788,16 +5512,17 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" class="form-control-sm"></td>
-                            <td>
+                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm"></td>
+                            <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
                                 </select>
                             </td>
-                            <td><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 3)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 4)" class="form-control-sm text-right" enterkeyhint="next"></td>
-                            <td>${{item.amount.toFixed(2)}}</td>
-                            <td>
+                            <td style="width:85px"><input type="text" value="${{item.pre_sale_quantity != null && item.pre_sale_quantity > 0 ? item.pre_sale_quantity.toFixed(2) : ''}}" onchange="updatePreSaleQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'pre_sale_quantity')" class="form-control-sm text-right" placeholder="预售数量" enterkeyhint="next"></td>
+                            <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'quantity')" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'unit_price')" class="form-control-sm text-right" enterkeyhint="next"></td>
+                            <td style="width:110px">${{item.amount.toFixed(2)}}</td>
+                            <td style="width:120px">
                                 <div class="position-relative">
                                     <input type="text" value="${{item.supplier_name || ''}}" 
                                            onclick="showItemSupplierDropdown(${{index}}, '')"
@@ -4811,8 +5536,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="supplierDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" class="form-control-sm" placeholder="单品备注"></td>
-                            <td><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
+                            <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'remark')" class="form-control-sm" placeholder="单品备注" enterkeyhint="next"></td>
+                            <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
                     `;
                 }});
@@ -4881,7 +5606,10 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
-                
+
+                // 销售单：本次零售价对比最近采购价（同基础单位），低于则提醒
+                checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'sales', items[index].product_name);
+
                 fetch('/api/product/unit/list?product_id=' + items[index].product_id)
                     .then(res => res.json())
                     .then(units => {{
@@ -4935,36 +5663,96 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 renderItems();
             }}
+            function updatePreSaleQty(index, input) {{ 
+                items[index].pre_sale_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                if (parseFloat(input.value) > 0) {{
+                    items[index].quantity = items[index].pre_sale_quantity;
+                    items[index].amount = items[index].unit_price * items[index].quantity;
+                }}
+                renderItems();
+            }}
 
-            function handleEnterKey(event, index, cellIndex) {{
+            function handleEnterKey(event, index, field) {{
+                // Enter: 同列下一行 (WPS 风格)
+                // Tab:   同行下一格，行末换到下一行第一格 (WPS 风格)
+                if (event.key === 'Tab') {{
+                    event.preventDefault();
+                    handleCellNavigation(event.target, 'next-in-row', index, field);
+                    return;
+                }}
                 const enterKeys = ['Enter', 'Next', 'Go', 'Done'];
                 if (enterKeys.includes(event.key) || event.keyCode === 13) {{
                     event.preventDefault();
-                    
+
                     const input = event.target;
-                    if (cellIndex === 3) {{
+                    // renderItems 会重建 DOM，先捕获当前列索引用于回车后同列下移
+                    const td = input.closest('td');
+                    const cellIndex = td ? td.cellIndex : -1;
+                    // 回车时同步当前输入值（与 onchange 一致），避免 renderItems 覆盖未提交的值
+                    if (field === 'quantity') {{
                         items[index].quantity = parseFloat(input.value) || 0;
                         items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
                         items[index].amount = items[index].unit_price * items[index].quantity;
-                    }} else if (cellIndex === 4) {{
+                    }} else if (field === 'unit_price') {{
                         items[index].unit_price = parseFloat(input.value) || 0;
                         items[index].amount = items[index].unit_price * items[index].quantity;
+                    }} else if (field === 'pre_sale_quantity') {{
+                        items[index].pre_sale_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                        if (items[index].pre_sale_quantity > 0) {{
+                            items[index].quantity = items[index].pre_sale_quantity;
+                            items[index].amount = items[index].unit_price * items[index].quantity;
+                        }}
+                    }} else if (field === 'spec') {{
+                        items[index].spec = input.value;
+                    }} else if (field === 'remark') {{
+                        items[index].remark = input.value.trim();
                     }}
                     renderItems();
-                    
+
+                    // WPS 风格：回车同列下一行
                     const nextIndex = index + 1;
-                    if (nextIndex < items.length) {{
-                        const table = document.getElementById('itemsTable');
-                        if (table && table.rows[nextIndex]) {{
-                            const nextRow = table.rows[nextIndex];
-                            if (nextRow.cells[cellIndex]) {{
-                                const targetInput = nextRow.cells[cellIndex].querySelector('input');
-                                if (targetInput) {{
-                                    targetInput.focus();
-                                    try {{ targetInput.select(); }} catch(e) {{}}
-                                }}
+                    if (cellIndex >= 0 && nextIndex < items.length) {{
+                        const tbody = document.getElementById('itemsTable');
+                        if (tbody && tbody.rows[nextIndex] && tbody.rows[nextIndex].cells[cellIndex]) {{
+                            const targetInput = tbody.rows[nextIndex].cells[cellIndex].querySelector('input, select');
+                            if (targetInput) {{
+                                targetInput.focus();
+                                try {{ targetInput.select(); }} catch(e) {{}}
                             }}
                         }}
+                    }}
+                }}
+            }}
+
+            // WPS 风格 Tab 同行导航：同 row 从左到右，行末换下一行第一个 input
+            // 跳过 select（单位/供应商等下拉），用户用方向键展开
+            function handleCellNavigation(currentInput, direction, index, field) {{
+                const tr = currentInput.closest('tr');
+                if (!tr) return;
+                const tbody = tr.parentElement;
+                if (!tbody) return;
+                const cells = Array.from(tr.cells);
+                const currentCell = currentInput.closest('td');
+                if (!currentCell) return;
+                const currentCellIndex = cells.indexOf(currentCell);
+
+                // 同行下一个可聚焦的 input（跳过 select）
+                for (let i = currentCellIndex + 1; i < cells.length; i++) {{
+                    const inputs = cells[i].querySelectorAll('input');
+                    if (inputs.length > 0) {{
+                        inputs[0].focus();
+                        try {{ inputs[0].select(); }} catch(e) {{}}
+                        return;
+                    }}
+                }}
+
+                // 同行无更多 input，换到下一行第一个 input
+                const nextRow = tbody.rows[index + 1];
+                if (nextRow) {{
+                    const firstInput = nextRow.querySelector('input');
+                    if (firstInput) {{
+                        firstInput.focus();
+                        try {{ firstInput.select(); }} catch(e) {{}}
                     }}
                 }}
             }}
@@ -5137,7 +5925,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         alert('订单保存成功');
                     }}
                 }} else {{
-                    alert('保存失败');
+                    const errText = await res.text();
+                    alert('保存失败: ' + (errText || res.statusText));
                 }}
             }}
 
@@ -5230,7 +6019,16 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 const orders = result.data || [];
                 const tbody = document.getElementById('orderListBody');
                 tbody.innerHTML = '';
+                let sumAmount = 0, sumDiscounted = 0, sumReduction = 0, sumFinal = 0;
                 orders.forEach(order => {{
+                    const amount = order.total_amount;
+                    const discounted = amount * (1 - (order.discount_rate || 0) / 100);
+                    const reduction = order.amount_reduction || 0;
+                    const finalAmt = order.final_amount || 0;
+                    sumAmount += amount;
+                    sumDiscounted += discounted;
+                    sumReduction += reduction;
+                    sumFinal += finalAmt;
                     const selected = currentOrderId === order.id ? ' style="cursor: pointer; background-color: #fff3cd;"' : ' style="cursor: pointer;"';
                     const statusMap = {{
                         'pending': '{{"text":"待分拣","class":"bg-secondary"}}',
@@ -5254,23 +6052,28 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     }};
                     const nextInfo = JSON.parse(nextStatusMap[order.status] || '{{"text":"","status":""}}');
                     const nextBtn = nextInfo.text ? '<button onclick="event.stopPropagation(); updateOrderStatus(' + order.id + ', \'' + nextInfo.status + '\')" class="btn btn-primary btn-sm">' + nextInfo.text + '</button> ' : '';
+                    const reimburseBtn = order.is_reimburse ? '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-warning btn-sm">导出报销单</button> ' : '';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')"' + selected + '>' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
                         '<td>' + order.order_date + '</td>' +
                         '<td>' + order.purchaser_name + '</td>' +
-                        '<td>' + order.total_amount.toFixed(2) + '</td>' +
-                        '<td>' + (order.total_amount * (1 - (order.discount_rate || 0) / 100)).toFixed(2) + '</td>' +
-                        '<td>' + (order.amount_reduction || 0).toFixed(2) + '</td>' +
-                        '<td>' + (order.final_amount || 0).toFixed(2) + '</td>' +
+                        '<td>' + amount.toFixed(2) + '</td>' +
+                        '<td>' + discounted.toFixed(2) + '</td>' +
+                        '<td>' + reduction.toFixed(2) + '</td>' +
+                        '<td>' + finalAmt.toFixed(2) + '</td>' +
                         '<td>' + statusBadge + '</td>' +
                         '<td>' +
                         nextBtn +
-                        '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-success btn-sm">导出验收单</button> ' +
+                        '<button onclick="event.stopPropagation(); exportRealExcel(' + order.id + ')" class="btn btn-success btn-sm">导出验收单</button> ' +
+                        reimburseBtn +
                         '<button onclick="event.stopPropagation(); generatePurchaseOrders(' + order.id + ')" class="btn btn-info btn-sm">生成采购订单</button> ' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
                 }});
+                if (orders.length > 0) {{
+                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="4" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                }}
                 renderPagination(result.page, result.total_pages, result.total);
             }}
 
@@ -5328,6 +6131,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         quantity: item.quantity || 0,
                         base_quantity: item.base_quantity || 0,
                         amount: item.amount || 0,
+                        pre_sale_quantity: item.pre_sale_quantity || 0,
                         remark: item.remark || '',
                         supplier_id: item.supplier_id || 0,
                         supplier_name: item.supplier_name || '',
@@ -5361,14 +6165,105 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
                 renderItems();
                 loadOrders();
+                document.getElementById('updatePricesBtn').style.display = 'inline-block';
+            }}
+
+            async function updatePrices() {{
+                if (!currentOrderId) {{ alert('请先选择要编辑的订单'); return; }}
+                if (!confirm('将自动填入商品最新基础售价，请核对后手动保存修改。\n确定继续？')) return;
+                const btn = document.getElementById('updatePricesBtn');
+                btn.disabled = true;
+                btn.textContent = '获取中...';
+                try {{
+                    const res = await fetch('/api/sales_order/update_prices/' + currentOrderId, {{ method: 'POST' }});
+                    const data = await res.json();
+                    if (data.errors && data.errors.length > 0) {{
+                        alert('部分商品获取售价失败：\n' + data.errors.join('\n'));
+                    }}
+                    // 记录变动明细
+                    const changes = [];
+                    const priceMap = {{}};
+                    data.items.forEach(i => {{ priceMap[i.product_id] = i; }});
+                    items.forEach((item, idx) => {{
+                        const newData = priceMap[item.product_id];
+                        if (newData) {{
+                            const oldPrice = item.unit_price;
+                            const newPrice = newData.unit_price;
+                            const diff = newPrice - oldPrice;
+                            if (Math.abs(diff) > 0.001) {{
+                                changes.push({{
+                                    name: item.product_name,
+                                    oldPrice: oldPrice,
+                                    newPrice: newPrice,
+                                    diff: diff,
+                                }});
+                            }}
+                            item.unit_price = newPrice;
+                            item.amount = newData.amount;
+                        }}
+                    }});
+                    renderItems();
+                    // 显示变动弹窗
+                    if (changes.length > 0) {{
+                        const tbody = document.getElementById('priceChangeBody');
+                        tbody.innerHTML = changes.map(c => {{
+                            const cls = c.diff > 0 ? 'text-success' : 'text-danger';
+                            const arrow = c.diff > 0 ? '↑' : '↓';
+                            return `<tr>
+                                <td>${{c.name}}</td>
+                                <td>¥${{c.oldPrice.toFixed(2)}}</td>
+                                <td>¥${{c.newPrice.toFixed(2)}}</td>
+                                <td class="${{cls}}">${{arrow}} ¥${{Math.abs(c.diff).toFixed(2)}}</td>
+                            </tr>`;
+                        }}).join('');
+                        document.getElementById('priceChangeModal').style.display = 'block';
+                    }} else {{
+                        alert('已获取 ' + data.items.length + ' 项商品最新售价，无变动。');
+                    }}
+                }} catch (e) {{
+                    alert('获取失败：' + e.message);
+                }} finally {{
+                    btn.disabled = false;
+                    btn.textContent = '一键更新售价';
+                }}
             }}
 
             function printAccept(id) {{
                 window.open('/accept?order_id=' + id, '_blank');
             }}
             
+            async function downloadExcel(url, id, force) {{
+                const f = force ? 1 : 0;
+                const res = await fetch(url + id + '?force=' + f);
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {{
+                    const data = await res.json();
+                    if (data.warning) {{
+                        if (confirm(data.message + '\n\n确定导出？')) {{
+                            downloadExcel(url, id, true);
+                        }}
+                    }} else if (data.error) {{
+                        alert(data.message);
+                    }}
+                    return;
+                }}
+                const blob = await res.blob();
+                const disposition = res.headers.get('content-disposition') || '';
+                const match = disposition.match(/filename\*?=(?:UTF-8''|"?)([^;"]+)/);
+                const filename = match ? decodeURIComponent(match[1]) : 'export.xlsx';
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(link.href);
+            }}
             function exportAcceptExcel(id) {{
-                window.location.href = '/api/sales_order/accept_excel/' + id;
+                downloadExcel('/api/sales_order/accept_excel/', id, false);
+            }}
+            function exportRealExcel(id) {{
+                downloadExcel('/api/sales_order/real_excel/', id, false);
             }}
             
             async function deleteOrder(id) {{
@@ -5382,14 +6277,37 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
 
-            async function generatePurchaseOrders(id) {{
-                const res = await fetch('/api/sales_order/generate_purchase/' + id, {{ method: 'POST' }});
-                const data = await res.json();
+            async function generatePurchaseOrders(id, force) {{
+                const f = force ? 1 : 0;
+                const res = await fetch('/api/sales_order/generate_purchase/' + id + '?force=' + f, {{ method: 'POST' }});
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {{
+                    const data = await res.json();
+                    // 已处理的采购订单：不允许重新生成，直接提示
+                    if (data.error) {{
+                        alert(data.message);
+                        return;
+                    }}
+                    // pending 状态的重复：提示确认后删除旧单重新生成
+                    if (data.warning) {{
+                        if (confirm(data.message)) {{
+                            generatePurchaseOrders(id, true);
+                        }}
+                        return;
+                    }}
+                    if (res.ok) {{
+                        alert('成功生成 ' + data.count + ' 张采购订单');
+                        loadOrders();
+                    }} else {{
+                        alert('生成失败：' + (data.message || '未知错误'));
+                    }}
+                    return;
+                }}
                 if (res.ok) {{
-                    alert('成功生成 ' + data.count + ' 张采购订单');
+                    alert('生成成功');
                     loadOrders();
                 }} else {{
-                    alert('生成失败：' + (data.message || '未知错误'));
+                    alert('生成失败：未知错误');
                 }}
             }}
 
@@ -5540,7 +6458,7 @@ async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<Strin
                             </div>
                         </div>
                         <table class="table table-striped table-bordered">
-                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
+                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>订购数量</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
                             <tbody id="modalItems"></tbody>
                         </table>
                     </div>
@@ -5635,9 +6553,9 @@ async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<Strin
                 let itemTotal = 0;
                 data.items.forEach(item => {
                     itemTotal += item.amount || 0;
-                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
+                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.ordered_quantity || 0).toFixed(2) + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
                 });
-                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
+                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="6">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
 
                 const modal = new bootstrap.Modal(document.getElementById('detailModal'));
                 modal.show();
@@ -5877,7 +6795,7 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
                             </div>
                         </div>
                         <table class="table table-striped table-bordered">
-                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
+                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>预售数量</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
                             <tbody id="modalItems"></tbody>
                         </table>
                     </div>
@@ -5999,9 +6917,9 @@ async fn page_query_sales_order(headers: axum::http::HeaderMap) -> Html<String> 
                 let itemTotal = 0;
                 data.items.forEach(item => {
                     itemTotal += item.amount || 0;
-                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
+                    tbody.innerHTML += '<tr><td>' + (item.product_name || '') + '</td><td>' + (item.spec || '-') + '</td><td>' + (item.unit || '') + '</td><td>' + (item.pre_sale_quantity || 0).toFixed(2) + '</td><td>' + (item.quantity || 0).toFixed(2) + '</td><td>¥' + (item.unit_price || 0).toFixed(2) + '</td><td>¥' + (item.amount || 0).toFixed(2) + '</td></tr>';
                 });
-                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
+                tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="6">合计</td><td>¥' + itemTotal.toFixed(2) + '</td></tr>';
 
                 const modal = new bootstrap.Modal(document.getElementById('detailModal'));
                 modal.show();
@@ -6073,9 +6991,9 @@ async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<String
                 const url = '/api/query/stock_flow?product_id=' + productId;
                 const res = await fetch(url);
                 const data = await res.json();
-                let detail = '库存流水:\\n';
+                let detail = '库存流水:\n';
                 data.forEach(flow => {
-                    detail += flow.type + ' ' + flow.quantity.toFixed(2) + ' ' + flow.create_time + '\\n';
+                    detail += flow.type + ' ' + flow.quantity.toFixed(2) + ' ' + flow.create_time + '\n';
                 });
                 alert(detail);
             }
@@ -6185,6 +7103,7 @@ async fn page_query_purchase_price() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchPurchasePrice()" class="btn btn-primary">查询</button>
+            <a href="/api/query/purchase_price/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -6255,14 +7174,51 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
         Ok(_) => {}
     }
     let content = r#"
+        <style>
+            .search-suggest {
+                position: absolute;
+                z-index: 1000;
+                top: 100%;
+                left: 0;
+                right: 0;
+                max-height: 320px;
+                overflow-y: auto;
+                background: #fff;
+                border: 1px solid #ced4da;
+                border-top: none;
+                border-radius: 0 0 4px 4px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            }
+            .search-suggest ul { list-style: none; margin: 0; padding: 0; }
+            .search-suggest li {
+                padding: 8px 12px;
+                cursor: pointer;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            .search-suggest li:hover, .search-suggest li.active {
+                background-color: #e9ecef;
+            }
+            .search-suggest li strong { color: #0d6efd; }
+            .search-suggest li small { color: #6c757d; }
+        </style>
         <div class="card p-4">
             <h3>销售价格查询</h3>
             <div class="row mb-3">
-                <div class="col-md-4">
+                <div class="col-md-4" style="position:relative;">
                     <label>商品名称：</label>
-                    <input type="text" id="productName" class="form-control" placeholder="输入商品名称">
+                    <input type="text" id="productKeyword" class="form-control" placeholder="输入商品名或别称进行模糊搜索" autocomplete="off">
+                    <input type="hidden" id="productId" value="">
+                    <div id="productSuggest" class="search-suggest" style="display:none;"></div>
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-2">
                     <label>采购单位：</label>
                     <select id="purchaserId" class="form-control">
                         <option value="">全部采购单位</option>
@@ -6278,8 +7234,17 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
             </table>
             <div id="pagination" class="mt-3"></div>
         </div>
+        <div class="card p-4 mt-4" id="trendCard" style="display:none;">
+            <h4 id="trendTitle">价格趋势</h4>
+            <p class="text-muted small">进价来源于历史采购单实际成交价，售价来源于历史销售单实际成交价（均已换算为同一基础单位），保留历史原值。</p>
+            <div style="position:relative; height:380px;">
+                <canvas id="trendChart"></canvas>
+            </div>
+        </div>
+        <script src="/static/chart.umd.min.js"></script>
         <script>
             let currentPage = 1;
+            let trendChartObj = null;
             async function loadPurchasers() {
                 const res = await fetch('/api/purchaser/list');
                 const purchasers = await res.json();
@@ -6288,13 +7253,64 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
                     select.innerHTML += '<option value="' + p.id + '">' + p.name + '</option>';
                 });
             }
+            let productSearchTimeout = null;
+            // 商品模糊搜索：输入时调用 /api/product/search（匹配商品名/别称）
+            async function handleProductSearchInput() {
+                const keyword = document.getElementById('productKeyword').value.trim();
+                const suggest = document.getElementById('productSuggest');
+                if (keyword.length < 1) {
+                    suggest.style.display = 'none';
+                    document.getElementById('productId').value = '';
+                    return;
+                }
+                if (productSearchTimeout) clearTimeout(productSearchTimeout);
+                productSearchTimeout = setTimeout(async () => {
+                    const res = await fetch('/api/product/search?keyword=' + encodeURIComponent(keyword));
+                    const products = await res.json();
+                    if (products.length === 0) {
+                        suggest.innerHTML = '<div class="p-2 text-muted">无匹配商品</div>';
+                        suggest.style.display = 'block';
+                        return;
+                    }
+                    let html = '<ul>';
+                    products.slice(0, 50).forEach(p => {
+                        const label = p.name + (p.spec ? ' (' + p.spec + ')' : '') + (p.base_unit ? ' / ' + p.base_unit : '');
+                        html += '<li onclick="selectSuggestProduct(this)" data-id="' + p.id + '" data-name="' + p.name + '">'
+                            + '<strong>' + label + '</strong>'
+                            + (p.purchase_price ? '<br><small>进价: ' + p.purchase_price + '</small>' : '')
+                            + '</li>';
+                    });
+                    html += '</ul>';
+                    suggest.innerHTML = html;
+                    suggest.style.display = 'block';
+                }, 250);
+            }
+            function selectSuggestProduct(li) {
+                const id = li.getAttribute('data-id');
+                const name = li.getAttribute('data-name');
+                document.getElementById('productId').value = id;
+                document.getElementById('productKeyword').value = name;
+                document.getElementById('productSuggest').style.display = 'none';
+            }
+            // 页面点击别处关闭下拉
+            document.addEventListener('click', function(e) {
+                const suggest = document.getElementById('productSuggest');
+                const input = document.getElementById('productKeyword');
+                if (suggest && input && !suggest.contains(e.target) && e.target !== input) {
+                    suggest.style.display = 'none';
+                }
+            });
             async function searchSalesPrice() {
                 currentPage = 1;
                 loadData();
+                loadPriceTrend();
             }
             async function loadData(page) {
                 if (page !== undefined) currentPage = page;
-                const url = '/api/query/sales_price?product_name=' + encodeURIComponent(document.getElementById('productName').value) + 
+                const productId = document.getElementById('productId').value;
+                const productName = productId ? document.getElementById('productKeyword').value.trim() : '';
+                const url = '/api/query/sales_price?product_name=' + encodeURIComponent(productName) +
+                    '&product_id=' + productId +
                     '&purchaser_id=' + document.getElementById('purchaserId').value +
                     '&page=' + currentPage + '&page_size=20';
                 const res = await fetch(url);
@@ -6331,7 +7347,90 @@ async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> 
                 html += '<p class="text-center text-muted mt-2">共 ' + total + ' 条记录，当前第 ' + page + '/' + totalPages + ' 页</p>';
                 container.innerHTML = html;
             }
+            async function loadPriceTrend() {
+                const productId = document.getElementById('productId').value;
+                const card = document.getElementById('trendCard');
+                if (!productId) {
+                    card.style.display = 'none';
+                    if (trendChartObj) { trendChartObj.destroy(); trendChartObj = null; }
+                    return;
+                }
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+                const url = '/api/query/product_price_trend?product_id=' + productId
+                    + (startDate ? '&start_date=' + startDate : '')
+                    + (endDate ? '&end_date=' + endDate : '');
+                const res = await fetch(url);
+                const data = await res.json();
+                card.style.display = 'block';
+                document.getElementById('trendTitle').textContent = '价格趋势 - ' + data.product_name + (data.base_unit ? '（基础单位：' + data.base_unit + '）' : '');
+                const purchasePoints = data.purchase_points || [];
+                const sellingPoints = data.selling_points || [];
+
+                // 合并进价与售价的所有日期作为统一时间轴（去重 + 排序）
+                const dateSet = new Set();
+                purchasePoints.forEach(p => dateSet.add(p.date.substring(0, 10)));
+                sellingPoints.forEach(p => {
+                    const d = (p.date || '').substring(0, 10);
+                    if (d) dateSet.add(d);
+                });
+                const labels = Array.from(dateSet).sort();
+                const purchaseMap = new Map();
+                purchasePoints.forEach(p => purchaseMap.set(p.date.substring(0, 10), p.price));
+                const sellingMap = new Map();
+                sellingPoints.forEach(p => {
+                    const d = (p.date || '').substring(0, 10);
+                    if (d) sellingMap.set(d, p.price);
+                });
+                const purchaseData = labels.map(l => purchaseMap.has(l) ? purchaseMap.get(l) : null);
+                const sellingData = labels.map(l => sellingMap.has(l) ? sellingMap.get(l) : null);
+
+                const ctx = document.getElementById('trendChart').getContext('2d');
+                if (trendChartObj) trendChartObj.destroy();
+                trendChartObj = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: '进价（基础单位）',
+                                data: purchaseData,
+                                borderColor: '#dc3545',
+                                backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                                tension: 0.2,
+                                pointRadius: 3,
+                                spanGaps: true,
+                                fill: false
+                            },
+                            {
+                                label: '售价',
+                                data: sellingData,
+                                borderColor: '#0d6efd',
+                                backgroundColor: 'rgba(13, 110, 253, 0.1)',
+                                tension: 0.2,
+                                pointRadius: 3,
+                                spanGaps: true,
+                                fill: false
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'top' },
+                            tooltip: { mode: 'index', intersect: false }
+                        },
+                        scales: {
+                            x: { title: { display: true, text: '日期' } },
+                            y: { title: { display: true, text: '价格（元）' }, beginAtZero: false }
+                        }
+                    }
+                });
+            }
             loadPurchasers();
+            // 商品模糊搜索输入监听
+            document.getElementById('productKeyword').addEventListener('input', handleProductSearchInput);
             searchSalesPrice();
         </script>
     "#;
@@ -6506,6 +7605,7 @@ async fn page_query_sales_summary(headers: axum::http::HeaderMap) -> Html<String
                 </div>
             </div>
             <button onclick="searchSalesSummary()" class="btn btn-primary">查询</button>
+            <a href="/api/query/sales_summary/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <h4>按采购单位汇总</h4>
@@ -6657,6 +7757,7 @@ async fn page_query_reimburse_summary(headers: axum::http::HeaderMap) -> Html<St
                 </div>
             </div>
             <button onclick="searchReimburse()" class="btn btn-primary">查询</button>
+            <a href="/api/query/reimburse_summary/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <h4>按采购单位汇总（报销口径）</h4>
@@ -6793,15 +7894,36 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                     <h6 class="mb-0">有变更的订单列表 <span class="badge badge-info" id="adjustedOrdersCount">0</span></h6>
                     <button class="btn btn-xs btn-outline-secondary" onclick="loadAdjustedOrders()">刷新</button>
                 </div>
-                <div style="max-height:220px;overflow-y:auto;border:1px solid #eee;">
+                <div class="row mb-2">
+                    <div class="col-md-4">
+                        <label class="small">订单号搜索：</label>
+                        <input type="text" id="adjOrderKeyword" class="form-control form-control-sm" placeholder="输入订单号搜索" oninput="onAdjOrderFilter()">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="small">采购单位筛选：</label>
+                        <select id="adjPurchaserFilter" class="form-control form-control-sm" onchange="onAdjOrderFilter()">
+                            <option value="">全部单位</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="border:1px solid #eee;">
                     <table class="table table-sm table-bordered mb-0" id="adjustedOrdersTable">
                         <thead class="thead-light"><tr>
-                            <th>订单号</th><th>采购单位</th><th>订单日期</th>
+                            <th>订单号</th><th>采购单位</th>
+                            <th style="cursor:pointer;white-space:nowrap;" onclick="toggleAdjOrderSort()">订单日期 <span id="adjSortArrow"></span></th>
                             <th>真实金额</th><th>调整金额</th><th>调整后金额</th>
                             <th>调整条数</th><th>最近调整日</th><th>操作</th>
                         </tr></thead>
                         <tbody><tr><td colspan="9" class="text-center text-muted small">暂无</td></tr></tbody>
                     </table>
+                </div>
+                <div class="d-flex justify-content-between align-items-center mt-2">
+                    <div class="small text-muted">
+                        合计：真实金额 <strong>¥<span id="adjSumReal">0.00</span></strong>
+                        ｜ 调整金额 <strong>¥<span id="adjSumAdjust">0.00</span></strong>
+                        ｜ 调整后金额 <strong>¥<span id="adjSumAdjusted">0.00</span></strong>
+                    </div>
+                    <nav><ul class="pagination pagination-sm mb-0" id="adjustedOrdersPager"></ul></nav>
                 </div>
             </div>
         </div>
@@ -7314,16 +8436,58 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                 }
             }
 
+            let adjOrdersPage = 1;
+            const adjOrdersPageSize = 10;
+            let adjOrderFilterTimer = null;
+            let adjOrderSortOrder = 'desc'; // 订单日期排序：desc 降序 / asc 升序 / 空串 默认(最近调整日)
+
+            function toggleAdjOrderSort() {
+                adjOrderSortOrder = adjOrderSortOrder === 'desc' ? 'asc' : 'desc';
+                adjOrdersPage = 1;
+                loadAdjustedOrders();
+            }
+
+            function onAdjOrderFilter() {
+                adjOrdersPage = 1;
+                clearTimeout(adjOrderFilterTimer);
+                adjOrderFilterTimer = setTimeout(loadAdjustedOrders, 300);
+            }
+
+            async function initAdjPurchaserFilter() {
+                try {
+                    const res = await fetch('/api/purchaser/list');
+                    const list = await res.json();
+                    const sel = document.getElementById('adjPurchaserFilter');
+                    sel.innerHTML = '<option value="">全部单位</option>';
+                    (list || []).forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p.id;
+                        opt.textContent = p.name;
+                        sel.appendChild(opt);
+                    });
+                } catch (e) { console.error('加载采购单位失败', e); }
+            }
+
             async function loadAdjustedOrders() {
-                const res = await fetch('/api/supplement/adjusted_orders');
-                const list = await res.json();
+                const keyword = document.getElementById('adjOrderKeyword').value.trim();
+                const purchaserId = document.getElementById('adjPurchaserFilter').value;
+                const res = await fetch('/api/supplement/adjusted_orders?page=' + adjOrdersPage + '&page_size=' + adjOrdersPageSize +
+                    '&keyword=' + encodeURIComponent(keyword) + '&purchaser_id=' + encodeURIComponent(purchaserId) +
+                    '&sort_order=' + adjOrderSortOrder);
+                const data = await res.json();
+                const list = data.items || [];
                 window._adjustedOrdersMap = {};
                 list.forEach(o => { window._adjustedOrdersMap[o.id] = o; });
+                document.getElementById('adjustedOrdersCount').textContent = data.total || 0;
+                document.getElementById('adjSortArrow').textContent = adjOrderSortOrder === 'asc' ? '▲' : '▼';
+                document.getElementById('adjSumReal').textContent = (data.total_real_amount || 0).toFixed(2);
+                document.getElementById('adjSumAdjust').textContent = (data.total_adjust_amount || 0).toFixed(2);
+                document.getElementById('adjSumAdjusted').textContent = (data.total_adjusted_amount || 0).toFixed(2);
                 const tbody = document.querySelector('#adjustedOrdersTable tbody');
-                document.getElementById('adjustedOrdersCount').textContent = list.length;
                 tbody.innerHTML = '';
                 if (!list.length) {
                     tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted small">暂无</td></tr>';
+                    renderAdjustedPager(data.total || 0);
                     return;
                 }
                 list.forEach(o => {
@@ -7343,6 +8507,34 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td><button class="btn btn-xs btn-outline-primary" onclick="selectAdjOrderById(' + o.id + ')">查看</button></td>';
                     tbody.appendChild(tr);
                 });
+                renderAdjustedPager(data.total || 0);
+            }
+
+            function renderAdjustedPager(total) {
+                const pages = Math.max(1, Math.ceil(total / adjOrdersPageSize));
+                const ul = document.getElementById('adjustedOrdersPager');
+                ul.innerHTML = '';
+                const prevLi = document.createElement('li');
+                prevLi.className = 'page-item' + (adjOrdersPage <= 1 ? ' disabled' : '');
+                prevLi.innerHTML = '<a class="page-link" href="javascript:void(0)">上一页</a>';
+                prevLi.onclick = () => { if (adjOrdersPage > 1) { adjOrdersPage--; loadAdjustedOrders(); } };
+                ul.appendChild(prevLi);
+                const maxShow = 5;
+                let start = Math.max(1, adjOrdersPage - Math.floor(maxShow / 2));
+                let end = Math.min(pages, start + maxShow - 1);
+                start = Math.max(1, end - maxShow + 1);
+                for (let p = start; p <= end; p++) {
+                    const li = document.createElement('li');
+                    li.className = 'page-item' + (p === adjOrdersPage ? ' active' : '');
+                    li.innerHTML = '<a class="page-link" href="javascript:void(0)">' + p + '</a>';
+                    li.onclick = (() => { const pp = p; return () => { adjOrdersPage = pp; loadAdjustedOrders(); }; })();
+                    ul.appendChild(li);
+                }
+                const nextLi = document.createElement('li');
+                nextLi.className = 'page-item' + (adjOrdersPage >= pages ? ' disabled' : '');
+                nextLi.innerHTML = '<a class="page-link" href="javascript:void(0)">下一页</a>';
+                nextLi.onclick = () => { if (adjOrdersPage < pages) { adjOrdersPage++; loadAdjustedOrders(); } };
+                ul.appendChild(nextLi);
             }
 
             function selectAdjOrderById(id) {
@@ -7350,7 +8542,8 @@ async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
                 if (o) selectAdjOrder(o);
             }
 
-            // 页面初始载入变更订单列表
+            // 页面初始载入采购单位列表与变更订单列表
+            initAdjPurchaserFilter();
             loadAdjustedOrders();
         </script>
     "####;
@@ -7412,8 +8605,8 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
     }
     let content = r#"
         <div class="card p-4">
-            <h3>出入库统计</h3>
-            <p class="text-muted small">按日汇总采购入库金额与销售出库金额，净额 = 入库金额 - 出库金额。</p>
+            <h3>真实出入库统计</h3>
+            <p class="text-muted small">真实账套口径：按日汇总采购入库金额与销售出库金额，下浮后出库金额 = 出库金额 × (1 - 销售订单下浮率/100)，毛利 = 下浮后出库金额 - 入库金额。</p>
             <div class="row mb-3">
                 <div class="col-md-3">
                     <label>开始日期：</label>
@@ -7435,7 +8628,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
             </div>
         </div>
         <div class="row mt-3">
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
                         <div class="small text-muted">合计入库金额</div>
@@ -7443,7 +8636,7 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                     </div>
                 </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
                         <div class="small text-muted">合计出库金额</div>
@@ -7451,11 +8644,19 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                     </div>
                 </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
                 <div class="card bg-light">
                     <div class="card-body py-2 text-center">
-                        <div class="small text-muted">合计净额（入-出）</div>
-                        <div class="h4 mb-0" id="totalNet">0.00</div>
+                        <div class="small text-muted">下浮后合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalDiscountedOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计毛利</div>
+                        <div class="h4 mb-0" id="totalGrossProfit">0.00</div>
                     </div>
                 </div>
             </div>
@@ -7470,9 +8671,10 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                         <th class="text-center">入库单数</th>
                         <th class="text-center">入库条数</th>
                         <th class="text-right">出库金额</th>
+                        <th class="text-right">下浮后出库金额</th>
                         <th class="text-center">出库单数</th>
                         <th class="text-center">出库条数</th>
-                        <th class="text-right">净额</th>
+                        <th class="text-right">毛利</th>
                     </tr>
                 </thead>
                 <tbody id="resultTable"></tbody>
@@ -7500,14 +8702,12 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (!data.rows || data.rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
                 } else {
                     let prevDay = null;
                     data.rows.forEach(it => {
-                        const netCls = (it.net_amount || 0) >= 0 ? 'text-success' : 'text-danger';
-                        // 汇总行加粗背景
+                        const profitCls = (it.gross_profit || 0) >= 0 ? 'text-success' : 'text-danger';
                         const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
-                        // 如果日期变化，加一个可视分隔
                         const dayDisplay = it.day !== prevDay ? it.day : '';
                         prevDay = it.day;
                         tbody.innerHTML += '<tr style="' + rowStyle + '">' +
@@ -7517,18 +8717,20 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
                             '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
                             '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.discounted_out_amount || 0).toFixed(2) + '</td>' +
                             '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
-                            '<td class="text-right ' + netCls + '">' + (it.net_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right ' + profitCls + '">' + (it.gross_profit || 0).toFixed(2) + '</td>' +
                             '</tr>';
                     });
                 }
                 document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
                 document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
-                const net = data.total_net_amount || 0;
-                const netEl = document.getElementById('totalNet');
-                netEl.textContent = net.toFixed(2);
-                netEl.className = 'h4 mb-0 ' + (net >= 0 ? 'text-success' : 'text-danger');
+                document.getElementById('totalDiscountedOut').textContent = (data.total_discounted_out_amount || 0).toFixed(2);
+                const profit = data.total_gross_profit || 0;
+                const profitEl = document.getElementById('totalGrossProfit');
+                profitEl.textContent = profit.toFixed(2);
+                profitEl.className = 'h4 mb-0 ' + (profit >= 0 ? 'text-success' : 'text-danger');
             }
 
             function exportStockSummary() {
@@ -7540,7 +8742,154 @@ async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String
             resetDate('30d');
         </script>
     "#;
-    Html(layout_html("出入库统计", "/query/stock_summary", &content))
+    Html(layout_html("真实出入库统计", "/query/stock_summary", &content))
+}
+
+async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) -> Html<String> {
+    match check_page_permission(&headers, "/query/stock_summary_reimburse").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let content = r#"
+        <div class="card p-4">
+            <h3>报销出入库统计</h3>
+            <p class="text-muted small">报销账套口径：出库金额 = 真实出库 + 分摊增项净额（目标单收到的分摊 − 来源耗材单金额）。入库金额与真实账套一致。下浮后出库金额按各销售订单的下浮率计算，毛利 = 下浮后出库金额 - 入库金额。</p>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>结束日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
+                <div class="col-md-6 d-flex align-items-end">
+                    <button onclick="searchStockSummary()" class="btn btn-primary">查询</button>
+                    <button onclick="exportStockSummary()" class="btn btn-success ml-2">导出Excel</button>
+                    <button onclick="resetDate('today')" class="btn btn-outline-secondary ml-2">今日</button>
+                    <button onclick="resetDate('7d')" class="btn btn-outline-secondary ml-2">近7天</button>
+                    <button onclick="resetDate('30d')" class="btn btn-outline-secondary ml-2">近30天</button>
+                    <button onclick="resetDate('month')" class="btn btn-outline-secondary ml-2">本月</button>
+                    <button onclick="resetDate('all')" class="btn btn-outline-secondary ml-2">全部</button>
+                </div>
+            </div>
+        </div>
+        <div class="row mt-3">
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计入库金额</div>
+                        <div class="h4 text-success mb-0" id="totalIn">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">下浮后合计出库金额</div>
+                        <div class="h4 text-danger mb-0" id="totalDiscountedOut">0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card bg-light">
+                    <div class="card-body py-2 text-center">
+                        <div class="small text-muted">合计毛利</div>
+                        <div class="h4 mb-0" id="totalGrossProfit">0.00</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="card p-3 mt-3">
+            <table class="table table-bordered table-sm">
+                <thead class="thead-light">
+                    <tr>
+                        <th>日期</th>
+                        <th>仓库</th>
+                        <th class="text-right">入库金额</th>
+                        <th class="text-center">入库单数</th>
+                        <th class="text-center">入库条数</th>
+                        <th class="text-right">出库金额</th>
+                        <th class="text-right">下浮后出库金额</th>
+                        <th class="text-center">出库单数</th>
+                        <th class="text-center">出库条数</th>
+                        <th class="text-right">毛利</th>
+                    </tr>
+                </thead>
+                <tbody id="resultTable"></tbody>
+            </table>
+        </div>
+        <script>
+            function resetDate(range) {
+                const today = new Date();
+                const fmt = d => d.toISOString().slice(0, 10);
+                const s = document.getElementById('startDate');
+                const e = document.getElementById('endDate');
+                if (range === 'today') { s.value = fmt(today); e.value = fmt(today); }
+                else if (range === '7d') { const t = new Date(today); t.setDate(today.getDate() - 6); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === '30d') { const t = new Date(today); t.setDate(today.getDate() - 29); s.value = fmt(t); e.value = fmt(today); }
+                else if (range === 'month') { const t = new Date(today.getFullYear(), today.getMonth(), 1); s.value = fmt(t); e.value = fmt(today); }
+                else { s.value = ''; e.value = ''; }
+                searchStockSummary();
+            }
+
+            async function searchStockSummary() {
+                const url = '/api/query/stock_summary_reimburse?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('resultTable');
+                tbody.innerHTML = '';
+                if (!data.rows || data.rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
+                } else {
+                    let prevDay = null;
+                    data.rows.forEach(it => {
+                        const profitCls = (it.gross_profit || 0) >= 0 ? 'text-success' : 'text-danger';
+                        const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
+                        const dayDisplay = it.day !== prevDay ? it.day : '';
+                        prevDay = it.day;
+                        tbody.innerHTML += '<tr style="' + rowStyle + '">' +
+                            '<td>' + dayDisplay + '</td>' +
+                            '<td>' + it.warehouse_name + '</td>' +
+                            '<td class="text-right text-success">' + (it.in_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.in_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.in_item_count || 0) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right text-danger">' + (it.discounted_out_amount || 0).toFixed(2) + '</td>' +
+                            '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
+                            '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
+                            '<td class="text-right ' + profitCls + '">' + (it.gross_profit || 0).toFixed(2) + '</td>' +
+                            '</tr>';
+                    });
+                }
+                document.getElementById('totalIn').textContent = (data.total_in_amount || 0).toFixed(2);
+                document.getElementById('totalOut').textContent = (data.total_out_amount || 0).toFixed(2);
+                document.getElementById('totalDiscountedOut').textContent = (data.total_discounted_out_amount || 0).toFixed(2);
+                const profit = data.total_gross_profit || 0;
+                const profitEl = document.getElementById('totalGrossProfit');
+                profitEl.textContent = profit.toFixed(2);
+                profitEl.className = 'h4 mb-0 ' + (profit >= 0 ? 'text-success' : 'text-danger');
+            }
+
+            function exportStockSummary() {
+                const url = '/api/query/stock_summary_reimburse/export?start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                window.location.href = url;
+            }
+
+            resetDate('30d');
+        </script>
+    "#;
+    Html(layout_html("报销出入库统计", "/query/stock_summary_reimburse", &content))
 }
 
 async fn page_query_stock_warning() -> Html<String> {
@@ -7548,6 +8897,7 @@ async fn page_query_stock_warning() -> Html<String> {
         <div class="card p-4">
             <h3>库存上下限预警</h3>
             <button onclick="searchStockWarning()" class="btn btn-primary">查询</button>
+            <a href="/api/query/stock_warning/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4 border-danger">
             <h4>低于最低库存（缺货）</h4>
@@ -7646,6 +8996,7 @@ async fn page_query_income_expense() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchIncomeExpense()" class="btn btn-primary">查询</button>
+            <a href="/api/query/income_expense/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="row mt-4">
             <div class="col-md-6">
@@ -7704,6 +9055,7 @@ async fn page_query_profit_detail() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchProfitDetail()" class="btn btn-primary">查询</button>
+            <a href="/api/query/profit_detail/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -7779,6 +9131,7 @@ async fn page_query_document_summary() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchDocumentSummary()" class="btn btn-primary">查询</button>
+            <a href="/api/query/document_summary/export" class="btn btn-success ml-2">导出Excel</a>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -7875,10 +9228,32 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
         Err(e) => return e,
         Ok(_) => {}
     }
-    let rows = sqlx::query("SELECT id, username, nickname, role, status, last_login_time, create_at FROM user_account ORDER BY id")
+    let rows = sqlx::query("SELECT u.id, u.username, u.nickname, u.role, u.status, u.last_login_time, u.create_at, COALESCE(u.supplier_id,0) as supplier_id, COALESCE(u.purchaser_id,0) as purchaser_id, COALESCE(s.name,'') as supplier_name, COALESCE(p.name,'') as purchaser_name FROM user_account u LEFT JOIN supplier s ON u.supplier_id = s.id LEFT JOIN purchaser p ON u.purchaser_id = p.id ORDER BY u.id")
         .fetch_all(pool())
         .await
         .unwrap_or_default();
+
+    // 绑定下拉选项：供应商 / 采购方
+    let mut supplier_options = String::from("<option value=\"0\">未绑定</option>");
+    let supplier_rows = sqlx::query("SELECT id, name FROM supplier ORDER BY name")
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    for sr in &supplier_rows {
+        let sid: i64 = sr.get("id");
+        let sname: String = sr.get("name");
+        supplier_options.push_str(&format!(r#"<option value="{}">{}</option>"#, sid, sname));
+    }
+    let mut purchaser_options = String::from("<option value=\"0\">未绑定</option>");
+    let purchaser_rows = sqlx::query("SELECT id, name FROM purchaser ORDER BY name")
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    for pr in &purchaser_rows {
+        let pid: i64 = pr.get("id");
+        let pname: String = pr.get("name");
+        purchaser_options.push_str(&format!(r#"<option value="{}">{}</option>"#, pid, pname));
+    }
 
     let mut table_html = String::new();
     for row in rows {
@@ -7889,6 +9264,10 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
         let status: i32 = row.get("status");
         let last_login_time: Option<String> = row.get("last_login_time");
         let create_at: String = row.get("create_at");
+        let supplier_id: i64 = row.get("supplier_id");
+        let purchaser_id: i64 = row.get("purchaser_id");
+        let supplier_name: String = row.get("supplier_name");
+        let purchaser_name: String = row.get("purchaser_name");
         
         let role_label = match role.as_str() {
             "super_admin" => "超级管理员",
@@ -7904,8 +9283,16 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
             "<span class='badge bg-danger'>禁用</span>"
         };
 
+        // 数据权限展示：供应商角色显示绑定的供应商，采购方角色显示绑定的采购单位
+        let data_scope = match role.as_str() {
+            "supplier" if supplier_id > 0 => format!("供应商：{}", supplier_name),
+            "purchaser" if purchaser_id > 0 => format!("采购方：{}", purchaser_name),
+            _ => "-".to_string(),
+        };
+
         table_html.push_str(&format!(
             r#"<tr>
+                <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
@@ -7923,6 +9310,7 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
             username,
             nickname,
             role_label,
+            data_scope,
             status_label,
             last_login_time.unwrap_or("-".to_string()),
             create_at,
@@ -7946,6 +9334,7 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                         <th>用户名</th>
                         <th>昵称</th>
                         <th>角色</th>
+                        <th>数据权限</th>
                         <th>状态</th>
                         <th>最后登录</th>
                         <th>创建时间</th>
@@ -7981,12 +9370,20 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">角色</label>
-                                <select id="role" class="form-control">
+                                <select id="role" class="form-control" onchange="toggleDataScope()">
                                     <option value="admin">管理员</option>
                                     <option value="supplier">供应商</option>
                                     <option value="purchaser">采购方</option>
                                     <option value="user">普通用户</option>
                                 </select>
+                            </div>
+                            <div class="mb-3" id="supplierBindRow">
+                                <label class="form-label">绑定供应商（供应商角色数据权限）</label>
+                                <select id="supplierId" class="form-control">{}</select>
+                            </div>
+                            <div class="mb-3" id="purchaserBindRow">
+                                <label class="form-label">绑定采购单位（采购方角色数据权限）</label>
+                                <select id="purchaserId" class="form-control">{}</select>
                             </div>
                         </form>
                     </div>
@@ -8001,11 +9398,21 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
         <script>
             let currentUserId = null;
 
+            // 根据角色显示/隐藏数据权限绑定行
+            function toggleDataScope() {{
+                const role = document.getElementById('role').value;
+                document.getElementById('supplierBindRow').style.display = (role === 'supplier') ? '' : 'none';
+                document.getElementById('purchaserBindRow').style.display = (role === 'purchaser') ? '' : 'none';
+            }}
+
             function showAddModal() {{
                 currentUserId = null;
                 document.getElementById('modalTitle').textContent = '添加用户';
                 document.getElementById('userForm').reset();
                 document.getElementById('userId').value = '';
+                document.getElementById('supplierId').value = '0';
+                document.getElementById('purchaserId').value = '0';
+                toggleDataScope();
                 new bootstrap.Modal(document.getElementById('userModal')).show();
             }}
 
@@ -8019,7 +9426,10 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                     document.getElementById('username').value = data.user.username;
                     document.getElementById('nickname').value = data.user.nickname || '';
                     document.getElementById('role').value = data.user.role;
+                    document.getElementById('supplierId').value = String(data.user.supplier_id || 0);
+                    document.getElementById('purchaserId').value = String(data.user.purchaser_id || 0);
                     document.getElementById('password').value = '';
+                    toggleDataScope();
                     new bootstrap.Modal(document.getElementById('userModal')).show();
                 }}
             }}
@@ -8030,7 +9440,9 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                     username: document.getElementById('username').value,
                     nickname: document.getElementById('nickname').value,
                     password: document.getElementById('password').value,
-                    role: document.getElementById('role').value
+                    role: document.getElementById('role').value,
+                    supplier_id: parseInt(document.getElementById('supplierId').value || '0'),
+                    purchaser_id: parseInt(document.getElementById('purchaserId').value || '0')
                 }};
                 
                 const url = id ? '/api/user/' + id : '/api/user';
@@ -8071,7 +9483,7 @@ async fn page_user(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
             }}
         </script>
-    "#, table_html);
+    "#, table_html, supplier_options, purchaser_options);
 
     Html(layout_html("用户管理", "/user", &content))
 }
@@ -9249,6 +10661,10 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         .filter-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
         .filter-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-size: 14px; }
         .filter-bar button.clear { background: #f3f4f6; color: #666; }
+        .history-bar { background: #ecfdf5; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .history-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .history-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #10b981; color: white; font-size: 14px; white-space: nowrap; }
+        .history-bar button.clear { background: #f3f4f6; color: #666; }
         .bottom-bar { background: white; padding: 6px 12px; position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 6px; box-shadow: 0 -2px 8px rgba(0,0,0,0.05); }
         .bottom-bar button { flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; }
         .btn-select-all { background: #f3f4f6; color: #333; }
@@ -9295,6 +10711,12 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         </div>
     </div>
     
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史分拣，留空显示当前待分拣">
+        <button onclick="loadItems()">检索历史分拣</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
     <div class="filter-bar">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
         <button class="clear" onclick="clearSearch()">清除</button>
@@ -9314,6 +10736,7 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
         <button class="btn-clear-all" onclick="clearCorrections()">清除修正</button>
         <button class="btn-print" onclick="saveCorrectionsToServer()">保存修正</button>
         <button class="btn-export" onclick="exportExcel()">导出XLSX</button>
+        <button class="btn-export" onclick="exportExcel(true)">导出(含数值)</button>
     </div>
 
     <script>
@@ -9323,7 +10746,10 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
 
         async function loadItems() {
             try {
-                const res = await fetch('/api/sales_order/sort_items_by_supplier');
+                const date = document.getElementById('historyDate').value;
+                let url = '/api/sales_order/sort_items_by_supplier';
+                if (date) url += '?date=' + encodeURIComponent(date);
+                const res = await fetch(url);
                 suppliers = await res.json();
                 loadCheckedState();
                 loadCorrectedQuantities();
@@ -9332,6 +10758,11 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
             } catch (e) {
                 console.error('加载失败:', e);
             }
+        }
+
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
+            loadItems();
         }
 
         function loadCheckedState() {
@@ -9560,8 +10991,14 @@ async fn page_mobile_sort_by_supplier() -> Html<String> {
             container.innerHTML = html;
         }
 
-        function exportExcel() {
-            window.location.href = '/api/sales_order/sort_items_by_supplier_excel';
+        function exportExcel(withValues) {
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/sales_order/sort_items_by_supplier_excel';
+            let params = [];
+            if (date) params.push('date=' + encodeURIComponent(date));
+            if (withValues) params.push('print_values=1');
+            if (params.length) url += '?' + params.join('&');
+            window.location.href = url;
         }
 
         loadItems();
@@ -9983,8 +11420,27 @@ async fn api_system_config(Json(data): Json<std::collections::HashMap<String, St
     (StatusCode::OK, "设置保存成功".to_string())
 }
 
+async fn api_user_list() -> impl IntoResponse {
+    let rows = sqlx::query("SELECT id, username, nickname, phone, role, status, COALESCE(supplier_id,0) as supplier_id, COALESCE(purchaser_id,0) as purchaser_id FROM user_account WHERE status = 1 ORDER BY id")
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+    let list: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "username": r.get::<String, _>("username"),
+            "nickname": r.get::<Option<String>, _>("nickname").unwrap_or_default(),
+            "phone": r.get::<Option<String>, _>("phone").unwrap_or_default(),
+            "role": r.get::<String, _>("role"),
+            "supplier_id": r.get::<i64, _>("supplier_id"),
+            "purchaser_id": r.get::<i64, _>("purchaser_id"),
+        })
+    }).collect();
+    (StatusCode::OK, serde_json::to_string(&list).unwrap())
+}
+
 async fn api_user_get(Path(id): Path<i64>) -> impl IntoResponse {
-    let rows = sqlx::query("SELECT id, username, nickname, role, status FROM user_account WHERE id = ?")
+    let rows = sqlx::query("SELECT id, username, nickname, role, status, COALESCE(supplier_id,0) as supplier_id, COALESCE(purchaser_id,0) as purchaser_id FROM user_account WHERE id = ?")
         .bind(id)
         .fetch_all(pool())
         .await
@@ -10005,7 +11461,9 @@ async fn api_user_get(Path(id): Path<i64>) -> impl IntoResponse {
             "username": row.get::<String, _>("username"),
             "nickname": row.get::<String, _>("nickname"),
             "role": row.get::<String, _>("role"),
-            "status": row.get::<i32, _>("status")
+            "status": row.get::<i32, _>("status"),
+            "supplier_id": row.get::<i64, _>("supplier_id"),
+            "purchaser_id": row.get::<i64, _>("purchaser_id")
         }
     })).unwrap())
 }
@@ -10015,6 +11473,8 @@ async fn api_user_create(Json(data): Json<serde_json::Value>) -> impl IntoRespon
     let password = data["password"].as_str().unwrap_or("");
     let nickname = data["nickname"].as_str().unwrap_or("");
     let role = data["role"].as_str().unwrap_or("user");
+    let supplier_id = data["supplier_id"].as_i64().unwrap_or(0);
+    let purchaser_id = data["purchaser_id"].as_i64().unwrap_or(0);
     
     if username.is_empty() {
         return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
@@ -10045,11 +11505,13 @@ async fn api_user_create(Json(data): Json<serde_json::Value>) -> impl IntoRespon
     
     let hashed_pwd = bcrypt::hash(password, bcrypt::DEFAULT_COST).unwrap();
     
-    sqlx::query("INSERT INTO user_account (username, password, nickname, role) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO user_account (username, password, nickname, role, supplier_id, purchaser_id) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(username)
         .bind(hashed_pwd)
         .bind(nickname)
         .bind(role)
+        .bind(supplier_id)
+        .bind(purchaser_id)
         .execute(pool())
         .await
         .ok();
@@ -10065,6 +11527,8 @@ async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::Value
     let password = data["password"].as_str().unwrap_or("");
     let nickname = data["nickname"].as_str().unwrap_or("");
     let role = data["role"].as_str().unwrap_or("");
+    let supplier_id = data["supplier_id"].as_i64().unwrap_or(0);
+    let purchaser_id = data["purchaser_id"].as_i64().unwrap_or(0);
     
     if username.is_empty() {
         return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
@@ -10084,18 +11548,22 @@ async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::Value
     }
     
     if role.is_empty() {
-        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, supplier_id = ?, purchaser_id = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(username)
             .bind(nickname)
+            .bind(supplier_id)
+            .bind(purchaser_id)
             .bind(id)
             .execute(pool())
             .await
             .ok();
     } else {
-        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, supplier_id = ?, purchaser_id = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(username)
             .bind(nickname)
             .bind(role)
+            .bind(supplier_id)
+            .bind(purchaser_id)
             .bind(id)
             .execute(pool())
             .await
@@ -11498,7 +12966,7 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
 
     // 分页数据查询
     let data_sql = format!(
-        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.image_url, p.category_id, p.status, c.name as category_name 
+        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.image_url, p.category_id, p.status, c.name as category_name 
          FROM product p LEFT JOIN category c ON p.category_id = c.id
          {}
          ORDER BY p.id DESC LIMIT ? OFFSET ?",
@@ -11589,6 +13057,8 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
             "purchase_price": row.get::<f64, _>("purchase_price"),
             "max_purchase_price": row.get::<f64, _>("max_purchase_price"),
             "min_purchase_price": row.get::<f64, _>("min_purchase_price"),
+            "markup_rate": row.get::<f64, _>("markup_rate"),
+            "auto_update_price": row.get::<i64, _>("auto_update_price"),
             "image_url": row.get::<Option<String>, _>("image_url"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "status": row.get::<i64, _>("status"),
@@ -11773,6 +13243,8 @@ struct ProductUpdateReq {
     purchase_price: Option<f64>,
     image_url: Option<String>,
     category_id: Option<i64>,
+    markup_rate: Option<f64>,
+    auto_update_price: Option<i64>,
 }
 
 async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<ProductUpdateReq>) -> impl IntoResponse {
@@ -11780,8 +13252,28 @@ async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<Prod
         Err(e) => return e,
         Ok(_) => {}
     }
+    // 读取旧值用于日志
+    let old_row = sqlx::query(
+        "SELECT base_price, purchase_price, markup_rate, auto_update_price FROM product WHERE id = ?"
+    )
+    .bind(req.id)
+    .fetch_optional(pool())
+    .await
+    .ok()
+    .flatten();
+    let (old_base, old_purchase, old_markup, old_auto): (f64, f64, f64, i64) = if let Some(r) = &old_row {
+        (
+            r.get::<f64, _>("base_price"),
+            r.get::<f64, _>("purchase_price"),
+            r.get::<f64, _>("markup_rate"),
+            r.get::<i64, _>("auto_update_price"),
+        )
+    } else {
+        (0.0, 0.0, 0.5, 0)
+    };
+
     let result = sqlx::query(
-        "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ? WHERE id = ?"
+        "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ?, markup_rate = ?, auto_update_price = ? WHERE id = ?"
     )
     .bind(&req.name)
     .bind(&req.spec)
@@ -11793,12 +13285,52 @@ async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<Prod
     .bind(&req.purchase_price)
     .bind(&req.image_url)
     .bind(&req.category_id)
+    .bind(&req.markup_rate)
+    .bind(&req.auto_update_price)
     .bind(req.id)
     .execute(pool())
     .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, "更新成功".to_string()),
+        Ok(_) => {
+            let new_purchase = req.purchase_price.unwrap_or(old_purchase);
+            let new_base = req.base_price.unwrap_or(old_base);
+            // 记录进价变更
+            if (old_purchase - new_purchase).abs() >= 0.001 {
+                log_price_change(
+                    req.id,
+                    "purchase_price",
+                    old_purchase,
+                    new_purchase,
+                    "product_update",
+                    None,
+                    Some("商品编辑修改进价"),
+                ).await;
+            }
+            // 记录售价变更
+            if (old_base - new_base).abs() >= 0.001 {
+                log_price_change(
+                    req.id,
+                    "base_price",
+                    old_base,
+                    new_base,
+                    "product_update",
+                    None,
+                    Some("商品编辑修改售价"),
+                ).await;
+            }
+            // 若加成率或 auto_update_price 改变，触发重算
+            let new_markup = req.markup_rate.unwrap_or(old_markup);
+            let new_auto = req.auto_update_price.unwrap_or(old_auto);
+            if (old_markup - new_markup).abs() >= 0.001 || old_auto != new_auto {
+                eprintln!(
+                    "[商品编辑] 商品ID={} 加成率/开关变更 旧加成率={:.4} 新加成率={:.4} 旧开关={} 新开关={} 触发售价重算",
+                    req.id, old_markup, new_markup, old_auto, new_auto
+                );
+                recalc_base_price_by_markup(req.id, "product_update", None).await;
+            }
+            (StatusCode::OK, "更新成功".to_string())
+        }
         Err(e) => {
             eprintln!("更新商品失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string())
@@ -12000,14 +13532,27 @@ async fn api_product_delete_image(
 
 // 销售订单图片上传：type = customer(客户订单) / signed(已验收签字订单)
 async fn api_sales_order_upload_image(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+
     let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
     if order_id.is_none() {
         return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
     }
     let order_id = order_id.unwrap();
+
+    // 行级数据权限：仅可为自己采购单位的销售单上传图片
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(order_id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
 
     let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
     let (folder, prefix, column) = match image_type {
@@ -12085,17 +13630,33 @@ async fn api_sales_order_upload_image(
         .execute(pool())
         .await;
 
+    log_operation(&ctx, "sales_order.upload_image", "sales_order", &order_id.to_string(),
+        &format!("上传{}图片：{}", if image_type == "customer" { "客户订单" } else { "签字验收单" }, file_path)).await;
+
     (StatusCode::OK, serde_json::json!({ "url": file_path }).to_string())
 }
 
 async fn api_sales_order_delete_image(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, String) {
+    let ctx = get_user_ctx(&headers).await;
+
     let order_id = params.get("order_id").and_then(|s| s.parse::<i64>().ok());
     if order_id.is_none() {
         return (StatusCode::BAD_REQUEST, "缺少 order_id 参数".to_string());
     }
     let order_id = order_id.unwrap();
+
+    // 行级数据权限：仅可操作归属自己的销售单
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(order_id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
 
     let image_type = params.get("type").map(|s| s.as_str()).unwrap_or("");
     let column = match image_type {
@@ -12126,14 +13687,24 @@ async fn api_sales_order_delete_image(
         .execute(pool())
         .await;
 
+    log_operation(&ctx, "sales_order.delete_image", "sales_order", &order_id.to_string(),
+        &format!("删除{}图片", if image_type == "customer" { "客户订单" } else { "签字验收单" })).await;
+
     (StatusCode::OK, "删除成功".to_string())
 }
 
 // 采购单据列表：按供应商+日期查询
 async fn api_purchase_document_list(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let supplier_id = params.get("supplier_id").and_then(|s| s.parse::<i64>().ok());
+    // 行级数据权限：supplier 角色只能看自己绑定的供应商单据
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) }
+    } else {
+        params.get("supplier_id").and_then(|s| s.parse::<i64>().ok())
+    };
     let document_date = params.get("document_date").map(|s| s.as_str()).unwrap_or("");
 
     let mut sql = "SELECT id, supplier_id, supplier_name, document_date, image_url, remark, create_at FROM purchase_document WHERE 1=1".to_string();
@@ -12186,7 +13757,13 @@ async fn api_purchase_document_list(
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResponse {
+async fn api_purchase_document_upload(headers: axum::http::HeaderMap, mut multipart: Multipart) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_document/upload").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let mut supplier_id: Option<i64> = None;
     let mut supplier_name: Option<String> = None;
     let mut document_date: Option<String> = None;
@@ -12230,6 +13807,13 @@ async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResp
         return (StatusCode::BAD_REQUEST, "缺少必填参数".to_string());
     }
 
+    // 行级数据权限：supplier 角色只能上传自己绑定的供应商单据
+    if ctx.role == "supplier" {
+        if ctx.supplier_id == 0 || supplier_id != Some(ctx.supplier_id) {
+            return (StatusCode::FORBIDDEN, "供应商账号只能为自己上传单据".to_string());
+        }
+    }
+
     let sname = supplier_name.unwrap();
     let ddate = document_date.unwrap();
     let name_prefix = format!("{}_{}", sanitize_filename_prefix(&sname), ddate);
@@ -12259,24 +13843,38 @@ async fn api_purchase_document_upload(mut multipart: Multipart) -> impl IntoResp
     match result {
         Ok(r) => {
             let id = r.last_insert_rowid();
+            log_operation(&ctx, "purchase_document.upload", "purchase_document", &id.to_string(),
+                &format!("上传采购单据（供应商ID={}，日期={}）：{}", supplier_id.unwrap_or(0), ddate, saved_url)).await;
             (StatusCode::OK, serde_json::json!({ "id": id, "url": saved_url }).to_string())
         },
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "保存失败".to_string()),
     }
 }
 
-async fn api_purchase_document_delete(Path(id): Path<i64>) -> impl IntoResponse {
-    let row = sqlx::query("SELECT image_url FROM purchase_document WHERE id = ?")
+async fn api_purchase_document_delete(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_document/delete").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let row = sqlx::query("SELECT image_url, supplier_id FROM purchase_document WHERE id = ?")
         .bind(id)
         .fetch_optional(pool())
         .await
         .unwrap_or(None);
 
     if let Some(row) = row {
+        // 行级数据权限：supplier 角色只能删除自己供应商的单据
+        if ctx.role == "supplier" && row.get::<i64, _>("supplier_id") != ctx.supplier_id {
+            return (StatusCode::FORBIDDEN, "您没有权限删除此单据".to_string());
+        }
         let url: String = row.get("image_url");
         if let Some(path) = image_url_to_path(&url) {
             let _ = tokio::fs::remove_file(&path).await;
         }
+    } else {
+        return (StatusCode::NOT_FOUND, "单据不存在".to_string());
     }
 
     let result = sqlx::query("DELETE FROM purchase_document WHERE id = ?")
@@ -12285,7 +13883,11 @@ async fn api_purchase_document_delete(Path(id): Path<i64>) -> impl IntoResponse 
         .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "purchase_document.delete", "purchase_document", &id.to_string(),
+                &format!("删除采购单据 ID={}", id)).await;
+            (StatusCode::OK, "删除成功".to_string())
+        },
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
     }
 }
@@ -12776,14 +14378,93 @@ async fn api_product_sync_base_price(Json(req): Json<std::collections::HashMap<S
     };
 
     if selling_price > 0.0 {
+        // 读取旧值用于日志
+        let old_row = sqlx::query("SELECT base_price FROM product WHERE id = ?")
+            .bind(product_id)
+            .fetch_optional(pool())
+            .await
+            .ok()
+            .flatten();
+        let old_base_price: f64 = old_row.as_ref().map(|r| r.get::<f64, _>("base_price")).unwrap_or(0.0);
+
+        // 应用统一尾数规则
+        let normalized = round_to_allowed_last_digit(selling_price);
+        eprintln!(
+            "[售价同步] 商品ID={} 同步原始售价={:.4} 尾数处理后={:.4} 旧售价={:.4}",
+            product_id, selling_price, normalized, old_base_price
+        );
+
         let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
-            .bind(selling_price)
+            .bind(normalized)
             .bind(product_id)
             .execute(pool())
             .await;
+
+        // 若开启了自动售价更新，则该同步值会立即被加成率重算覆盖，这里仅记录日志
+        log_price_change(
+            product_id,
+            "base_price",
+            old_base_price,
+            normalized,
+            "sync_base_price",
+            None,
+            Some("按政府指导价/超市价同步"),
+        ).await;
+
+        // 若开启自动更新售价，则按加成率重算 base_price
+        recalc_base_price_by_markup(product_id, "sync_base_price", None).await;
     }
 
     StatusCode::OK
+}
+
+// 查询商品价格变更日志（支持按商品ID过滤，可选 limit）
+async fn api_product_price_log_list(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let product_id: Option<i64> = params.get("product_id").and_then(|s| s.parse().ok());
+    let limit: i64 = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(100);
+
+    let rows = if let Some(pid) = product_id {
+        sqlx::query(
+            "SELECT ppl.id, ppl.product_id, p.name as product_name, ppl.price_type, ppl.old_price, ppl.new_price, ppl.source, ppl.ref_id, ppl.remark, ppl.changed_at
+             FROM product_price_log ppl LEFT JOIN product p ON ppl.product_id = p.id
+             WHERE ppl.product_id = ? ORDER BY ppl.changed_at DESC LIMIT ?"
+        )
+        .bind(pid)
+        .bind(limit)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query(
+            "SELECT ppl.id, ppl.product_id, p.name as product_name, ppl.price_type, ppl.old_price, ppl.new_price, ppl.source, ppl.ref_id, ppl.remark, ppl.changed_at
+             FROM product_price_log ppl LEFT JOIN product p ON ppl.product_id = p.id
+             ORDER BY ppl.changed_at DESC LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+    };
+
+    let logs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "product_id": r.get::<i64, _>("product_id"),
+            "product_name": r.get::<Option<String>, _>("product_name"),
+            "price_type": r.get::<String, _>("price_type"),
+            "old_price": r.get::<f64, _>("old_price"),
+            "new_price": r.get::<f64, _>("new_price"),
+            "source": r.get::<Option<String>, _>("source"),
+            "ref_id": r.get::<Option<i64>, _>("ref_id"),
+            "remark": r.get::<Option<String>, _>("remark"),
+            "changed_at": r.get::<Option<String>, _>("changed_at"),
+        }))
+        .collect();
+
+    (StatusCode::OK, serde_json::to_string(&logs).unwrap())
 }
 
 async fn api_category_list() -> impl IntoResponse {
@@ -13108,6 +14789,362 @@ async fn api_order_generate_no(axum::extract::Query(params): axum::extract::Quer
 // 采购入库后，按商品ID更新当前进价/历史最高进价/历史最低进价
 // unit_price 为该采购明细单位单价，需换算回基础单位单价：base_unit_price = unit_price / ratio
 // 这里 base_quantity/quantity 可近似换算比例，但为稳妥直接用 unit_price 与商品当前记录比较（明细已按下单单位存储）。
+// 售价自动更新专用取整：保留两位小数，最末位仅允许 0/5/6/8/9
+// 就近取值（不向上靠）：末位与允许集合中最近者匹配
+// 映射表（百位百分位）：0→0, 1→0, 2→0, 3→5, 4→5, 5→5, 6→6, 7→8, 8→8, 9→9
+fn round_to_allowed_last_digit(price: f64) -> f64 {
+    if price <= 0.0 {
+        return price;
+    }
+    // 截断到分
+    let cents = (price * 100.0).round() / 100.0;
+    // 取出末位
+    let last = (cents * 100.0).round() as i64 % 10;
+    let mapped = match last {
+        0 | 1 | 2 => 0,
+        3 | 4 | 5 => 5,
+        6 => 6,
+        7 | 8 => 8,
+        9 => 9,
+        _ => last,
+    };
+    let integer_cents = (cents * 100.0).round() as i64;
+    let tens = integer_cents / 10;
+    let new_cents = tens * 10 + mapped;
+    new_cents as f64 / 100.0
+}
+
+#[cfg(test)]
+mod price_rounding_tests {
+    use super::round_to_allowed_last_digit;
+
+    // 末位映射表：0/1/2→0, 3/4/5→5, 6→6, 7/8→8, 9→9
+    fn expected(whole: i64, last: i64) -> f64 {
+        let mapped = match last {
+            0 | 1 | 2 => 0,
+            3 | 4 | 5 => 5,
+            6 => 6,
+            7 | 8 => 8,
+            9 => 9,
+            _ => last,
+        };
+        (whole * 10 + mapped) as f64 / 100.0
+    }
+
+    #[test]
+    fn test_last_digit_zero_to_two_rounds_to_zero() {
+        for last in 0..=2 {
+            let price = 8.30 + (last as f64) * 0.01;
+            let r = round_to_allowed_last_digit(price);
+            assert!(
+                (r - expected(83, last)).abs() < 0.0001,
+                "末位 {} 输入 {} 期望 {} 实际 {}",
+                last, price, expected(83, last), r
+            );
+        }
+    }
+
+    #[test]
+    fn test_last_digit_three_to_five_rounds_to_five() {
+        for last in 3..=5 {
+            let price = 8.30 + (last as f64) * 0.01;
+            let r = round_to_allowed_last_digit(price);
+            assert!(
+                (r - expected(83, last)).abs() < 0.0001,
+                "末位 {} 输入 {} 期望 {} 实际 {}",
+                last, price, expected(83, last), r
+            );
+        }
+    }
+
+    #[test]
+    fn test_last_digit_six_unchanged() {
+        let r = round_to_allowed_last_digit(8.36);
+        assert!((r - 8.36).abs() < 0.0001, "8.36 期望 8.36 实际 {}", r);
+    }
+
+    #[test]
+    fn test_last_digit_seven_eight_rounds_to_eight() {
+        let r7 = round_to_allowed_last_digit(8.37);
+        assert!((r7 - 8.38).abs() < 0.0001, "8.37 期望 8.38 实际 {}", r7);
+        let r8 = round_to_allowed_last_digit(8.38);
+        assert!((r8 - 8.38).abs() < 0.0001, "8.38 期望 8.38 实际 {}", r8);
+    }
+
+    #[test]
+    fn test_last_digit_nine_unchanged() {
+        let r = round_to_allowed_last_digit(8.39);
+        assert!((r - 8.39).abs() < 0.0001, "8.39 期望 8.39 实际 {}", r);
+    }
+
+    #[test]
+    fn test_full_ten_cent_coverage() {
+        // 覆盖 0.00-0.09 共 10 个尾数，期望结果末位必须属于 {0,5,6,8,9}
+        let allowed = [0, 5, 6, 8, 9];
+        for last in 0..=9 {
+            let price = 12.30 + (last as f64) * 0.01;
+            let r = round_to_allowed_last_digit(price);
+            // 用 100 倍还原分
+            let cents = (r * 100.0).round() as i64;
+            let actual_last = cents % 10;
+            assert!(
+                allowed.contains(&actual_last),
+                "尾数 {} 输入 {} 得到 {}，末位 {} 不在允许集合",
+                last, price, r, actual_last
+            );
+        }
+    }
+
+    #[test]
+    fn test_realistic_purchase_markup_scenarios() {
+        // 模拟一批进价 × (1 + 0.5) 后的尾数
+        for purchase_cents in [350i64, 437, 562, 689, 715, 832, 999, 1024, 1280, 1567, 2034] {
+            let purchase = purchase_cents as f64 / 100.0;
+            let raw = purchase * 1.5;
+            let r = round_to_allowed_last_digit(raw);
+            let cents = (r * 100.0).round() as i64;
+            let last = cents % 10;
+            let allowed = [0, 5, 6, 8, 9];
+            assert!(
+                allowed.contains(&last),
+                "进价 {} → 原始售价 {} → 调整后 {} 末位 {} 不在允许集合",
+                purchase, raw, r, last
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_or_negative_returns_as_is() {
+        assert_eq!(round_to_allowed_last_digit(0.0), 0.0);
+        assert_eq!(round_to_allowed_last_digit(-1.5), -1.5);
+    }
+
+    #[test]
+    fn test_floating_edge_cases() {
+        // 浮点 8.57000000000001 应等同 8.57
+        let r = round_to_allowed_last_digit(8.570_000_000_000_007);
+        assert!((r - 8.58).abs() < 0.0001, "8.57(浮点) 期望 8.58 实际 {}", r);
+    }
+}
+
+// 记录价格变更日志（price_type: purchase_price / base_price）
+async fn log_price_change(
+    product_id: i64,
+    price_type: &str,
+    old_price: f64,
+    new_price: f64,
+    source: &str,
+    ref_id: Option<i64>,
+    remark: Option<&str>,
+) {
+    // 仅当价格实际变化时记录
+    if (old_price - new_price).abs() < 0.001 {
+        return;
+    }
+    let _ = sqlx::query(
+        "INSERT INTO product_price_log(product_id, price_type, old_price, new_price, source, ref_id, remark) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(product_id)
+    .bind(price_type)
+    .bind(old_price)
+    .bind(new_price)
+    .bind(source)
+    .bind(ref_id)
+    .bind(remark)
+    .execute(pool())
+    .await;
+}
+
+// 根据加成率自动重算 base_price；返回是否实际更新了售价及旧/新值
+// 当商品开启 auto_update_price 且 purchase_price > 0 时生效
+async fn recalc_base_price_by_markup(
+    product_id: i64,
+    source: &str,
+    ref_id: Option<i64>,
+) {
+    let row = sqlx::query(
+        "SELECT purchase_price, base_price, markup_rate, auto_update_price FROM product WHERE id = ?"
+    )
+    .bind(product_id)
+    .fetch_optional(pool())
+    .await
+    .unwrap_or(None);
+
+    if let Some(r) = row {
+        let purchase_price: f64 = r.get("purchase_price");
+        let old_base_price: f64 = r.get("base_price");
+        let markup_rate: f64 = r.get("markup_rate");
+        let auto_update: i64 = r.get("auto_update_price");
+
+        if auto_update == 0 || purchase_price <= 0.0 {
+            eprintln!(
+                "[售价自动更新] 商品ID={} 跳过：auto_update_price={}, purchase_price={}",
+                product_id, auto_update, purchase_price
+            );
+            return;
+        }
+
+        let raw_price = purchase_price * (1.0 + markup_rate);
+        let new_base_price = round_to_allowed_last_digit(raw_price);
+        eprintln!(
+            "[售价自动更新] 商品ID={} source={} 进价={:.4} 加成率={:.4} 原始售价={:.6} 取整后售价={:.4} 旧售价={:.4}",
+            product_id, source, purchase_price, markup_rate, raw_price, new_base_price, old_base_price
+        );
+        if (old_base_price - new_base_price).abs() < 0.001 {
+            eprintln!("[售价自动更新] 商品ID={} 售价未变化，跳过写库", product_id);
+            return;
+        }
+
+        let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
+            .bind(new_base_price)
+            .bind(product_id)
+            .execute(pool())
+            .await;
+
+        log_price_change(
+            product_id,
+            "base_price",
+            old_base_price,
+            new_base_price,
+            source,
+            ref_id,
+            Some("按加成率自动重算"),
+        ).await;
+    }
+}
+
+// 单个商品开启/关闭自动更新售价，并立即按加成率重算 base_price
+async fn api_product_set_auto_update_price(
+    Json(req): Json<std::collections::HashMap<String, i64>>,
+) -> impl IntoResponse {
+    let product_id = match req.get("product_id") {
+        Some(&id) => id,
+        None => return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "missing product_id"}).to_string()).into_response(),
+    };
+    let auto = req.get("auto_update_price").copied().unwrap_or(1);
+
+    let _ = sqlx::query("UPDATE product SET auto_update_price = ? WHERE id = ?")
+        .bind(auto)
+        .bind(product_id)
+        .execute(pool())
+        .await;
+
+    recalc_base_price_by_markup(product_id, "set_auto_update_price", None).await;
+
+    (StatusCode::OK, serde_json::json!({"ok": true}).to_string()).into_response()
+}
+
+// 批量：对所有商品开启/关闭自动更新售价，并对开启的商品立即按加成率重算 base_price
+async fn api_product_batch_set_auto_update_price(
+    Json(req): Json<std::collections::HashMap<String, i64>>,
+) -> impl IntoResponse {
+    let auto = req.get("auto_update_price").copied().unwrap_or(1);
+    let _ = sqlx::query("UPDATE product SET auto_update_price = ?")
+        .bind(auto)
+        .execute(pool())
+        .await;
+
+    if auto == 1 {
+        eprintln!("[批量售价自动更新] 开始处理所有商品（auto=开启）");
+        // 开启时，对所有进价>0 的商品按加成率重算售价
+        let rows = sqlx::query("SELECT id, purchase_price, base_price, markup_rate FROM product WHERE purchase_price > 0")
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default();
+        eprintln!("[批量售价自动更新] 共 {} 个商品需要重算", rows.len());
+        for r in rows {
+            let pid: i64 = r.get("id");
+            let old_base: f64 = r.get("base_price");
+            let purchase: f64 = r.get("purchase_price");
+            let markup: f64 = r.get("markup_rate");
+            let raw = purchase * (1.0 + markup);
+            let new_base = round_to_allowed_last_digit(raw);
+            eprintln!(
+                "[批量售价自动更新] 商品ID={} 进价={:.4} 加成率={:.4} 原始售价={:.6} 取整后={:.4} 旧售价={:.4}",
+                pid, purchase, markup, raw, new_base, old_base
+            );
+            if (old_base - new_base).abs() >= 0.001 {
+                let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
+                    .bind(new_base)
+                    .bind(pid)
+                    .execute(pool())
+                    .await;
+                log_price_change(
+                    pid,
+                    "base_price",
+                    old_base,
+                    new_base,
+                    "batch_set_auto_update_price",
+                    None,
+                    Some("批量开启自动更新售价"),
+                ).await;
+            }
+        }
+    }
+
+    (StatusCode::OK, serde_json::json!({"ok": true}).to_string()).into_response()
+}
+
+// 获取某商品最近一次采购的基础单位单价（按 purchase_order_item 的 base_unit 维度的同基础单位）
+// 通过该商品最近的采购单明细反推：unit_price 为下单单位价，乘以 ratio 得基础单位价
+async fn api_product_last_purchase_price(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let product_id: i64 = match params.get("product_id").and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "missing product_id"}).to_string()).into_response(),
+    };
+
+    // 优先用商品表里维护的 purchase_price（每次采购后已同步）
+    let row = sqlx::query(
+        "SELECT purchase_price, base_unit FROM product WHERE id = ?"
+    )
+    .bind(product_id)
+    .fetch_optional(pool())
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(r) = row {
+        let purchase_price: f64 = r.get("purchase_price");
+        let base_unit: String = r.get("base_unit");
+        // 同时取出最近一次采购的原始下单单价及单位，便于前端核对是否同基础单位
+        let last_row = sqlx::query(
+            "SELECT poi.unit_price, poi.unit, p.base_unit
+             FROM purchase_order_item poi
+             JOIN purchase_order po ON poi.order_id = po.id
+             JOIN product p ON poi.product_id = p.id
+             WHERE poi.product_id = ?
+             ORDER BY po.order_date DESC, po.id DESC
+             LIMIT 1"
+        )
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+
+        let (last_unit_price, last_unit) = if let Some(lr) = last_row {
+            (
+                lr.get::<f64, _>("unit_price"),
+                lr.get::<String, _>("unit"),
+            )
+        } else {
+            (0.0, base_unit.clone())
+        };
+
+        let payload = serde_json::json!({
+            "purchase_price": purchase_price,
+            "base_unit": base_unit,
+            "last_unit_price": last_unit_price,
+            "last_unit": last_unit,
+        });
+        return (StatusCode::OK, serde_json::to_string(&payload).unwrap()).into_response();
+    }
+
+    (StatusCode::NOT_FOUND, serde_json::json!({"error": "product not found"}).to_string()).into_response()
+}
+
 // 规则：当前进价 = 最近一次采购价；最高进价 = 历史最高；最低进价 = 历史最低（新品或价格为0时初始化）。
 async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
     for item in items {
@@ -13139,6 +15176,7 @@ async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
         .unwrap_or(None);
 
         if let Some(r) = row {
+            let old_purchase: f64 = r.get::<f64, _>("purchase_price");
             let old_max: f64 = r.get::<f64, _>("max_purchase_price");
             let old_min: f64 = r.get::<f64, _>("min_purchase_price");
 
@@ -13155,13 +15193,45 @@ async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
             .bind(item.product_id)
             .execute(pool())
             .await;
+
+            // 记录进价变更日志
+            log_price_change(
+                item.product_id,
+                "purchase_price",
+                old_purchase,
+                base_unit_price,
+                "purchase_order",
+                None,
+                Some("采购单更新进价"),
+            ).await;
+
+            // 进价变化后，若开启自动售价更新则按加成率重算 base_price
+            eprintln!(
+                "[采购单进价更新] 商品ID={} 基础单位进价={:.4} 触发售价重算",
+                item.product_id, base_unit_price
+            );
+            recalc_base_price_by_markup(item.product_id, "purchase_order", None).await;
         }
     }
 }
 
-async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
+async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req): Json<PurchaseOrderReq>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_order/create").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限：supplier 只能为自己绑定的供应商创建采购单
+    if ctx.role == "supplier" {
+        let effective_supplier_id = if req.supplier_id != 0 { req.supplier_id } else { ctx.supplier_id };
+        if ctx.supplier_id == 0 || effective_supplier_id != ctx.supplier_id {
+            return (StatusCode::FORBIDDEN, "供应商账号只能为自己创建采购单".to_string());
+        }
+    }
+
     let result = sqlx::query(
-        "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, user_id, handler_phone, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -13172,6 +15242,8 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
     .bind(req.final_amount)
     .bind(req.warehouse_id)
     .bind(&req.warehouse_name)
+    .bind(req.user_id.unwrap_or(0))
+    .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
     .execute(pool())
     .await;
@@ -13181,10 +15253,10 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
             let order_id = res.last_insert_rowid();
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES {}",
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -13202,26 +15274,35 @@ async fn api_purchase_order_create(Json(req): Json<PurchaseOrderReq>) -> impl In
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.ordered_quantity.unwrap_or(0.0))
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
                 // 采购入库后更新商品进价（当前/最高/最低）
                 update_product_purchase_prices(&req.items).await;
             }
-            StatusCode::OK
+            log_operation(&ctx, "purchase_order.create", "purchase_order", &order_id.to_string(),
+                &format!("创建采购单 {}（供应商ID={}）", req.order_no, req.supplier_id)).await;
+            (StatusCode::OK, "创建成功".to_string())
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "创建失败".to_string()),
     }
 }
 
-async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let keyword_pattern = parse_keyword_pattern(&params);
     
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
-    let supplier_id: Option<i64> = params.get("supplier_id").and_then(|s| s.parse().ok());
+    // 行级数据权限：supplier 角色强制只看自己绑定的供应商
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) /* 未绑定则查不到任何数据 */ }
+    } else {
+        params.get("supplier_id").and_then(|s| s.parse().ok())
+    };
     
     // 排序处理
     let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
@@ -13315,9 +15396,10 @@ async fn api_purchase_order_list(axum::extract::Query(params): axum::extract::Qu
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
+async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
     let order_row = sqlx::query(
-        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name
+        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, s.name as supplier_name
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id WHERE po.id = ?"
     )
     .bind(id)
@@ -13330,9 +15412,14 @@ async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     }
     
     let row = order_row.unwrap();
+    // 行级数据权限：supplier 只能看自己的
+    let order_supplier_id: i64 = row.get("supplier_id");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string());
+    }
     
     let item_rows = sqlx::query(
-        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark FROM purchase_order_item WHERE order_id = ?"
+        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark FROM purchase_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
@@ -13353,6 +15440,7 @@ async fn api_purchase_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "base_quantity": r.get::<Option<f64>, _>("base_quantity"),
             "amount": r.get::<f64, _>("amount"),
+            "ordered_quantity": r.get::<Option<f64>, _>("ordered_quantity"),
             "remark": r.get::<Option<String>, _>("remark"),
         }))
         .collect();
@@ -13382,8 +15470,31 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 状态约束 + 行级数据权限：先查订单当前状态与所属供应商
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+        .bind(req.id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    // 已确认/已作废的订单不允许修改（防篡改）
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，已确认或作废的订单不允许修改", order_status));
+    }
+
     let result = sqlx::query(
-        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ? WHERE id = ?"
+        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ? WHERE id = ?"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -13394,6 +15505,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
     .bind(req.final_amount)
     .bind(req.warehouse_id)
     .bind(&req.warehouse_name)
+    .bind(req.user_id.unwrap_or(0))
+    .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
     .bind(req.id)
     .execute(pool())
@@ -13409,10 +15522,10 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
             
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES {}",
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -13431,12 +15544,15 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.ordered_quantity.unwrap_or(0.0))
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
                 // 采购单更新后同步商品进价（当前/最高/最低）
                 update_product_purchase_prices(&req.items).await;
             }
+            log_operation(&ctx, "purchase_order.update", "purchase_order", &req.id.unwrap_or(0).to_string(),
+                &format!("更新采购单 {}（供应商ID={}）", req.order_no, req.supplier_id)).await;
             (StatusCode::OK, "更新成功".to_string())
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string()),
@@ -13448,6 +15564,28 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限 + 状态约束
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
+    if !can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，已确认或作废的订单不允许删除", order_status));
+    }
+
     sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
         .bind(id)
         .execute(pool())
@@ -13460,23 +15598,37 @@ async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Pat
         .await;
     
     match result {
-        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "purchase_order.delete", "purchase_order", &id.to_string(),
+                &format!("删除采购单 ID={}", id)).await;
+            (StatusCode::OK, "删除成功".to_string())
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
     }
 }
 
-async fn api_purchase_order_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_purchase_order_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：supplier 只能导出自己的
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.final_amount, po.status, po.remark, s.name as supplier_name,
-                poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.unit_price, poi.quantity, poi.base_quantity, poi.amount, poi.remark as item_remark
+                poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.ordered_quantity, poi.quantity, poi.unit_price, poi.base_quantity, poi.amount, poi.remark as item_remark
          FROM purchase_order po 
          JOIN supplier s ON po.supplier_id = s.id
-         LEFT JOIN purchase_order_item poi ON po.id = poi.order_id
-         ORDER BY po.id, poi.id"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN purchase_order_item poi ON po.id = poi.order_id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "supplier" {
+        sql.push_str(" WHERE po.supplier_id = ?");
+        binds.push(ctx.supplier_id);
+    }
+    sql.push_str(" ORDER BY po.id, poi.id");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
@@ -13487,7 +15639,7 @@ async fn api_purchase_order_export() -> impl IntoResponse {
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
         
-        let headers = ["订单ID", "订单号", "订单日期", "供应商", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "数量", "单价", "基本数量", "金额", "商品备注"];
+        let headers = ["订单ID", "订单号", "订单日期", "供应商", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "订购数量", "数量", "单价", "基本数量", "金额", "商品备注"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
@@ -13508,11 +15660,12 @@ async fn api_purchase_order_export() -> impl IntoResponse {
             worksheet.write(row_idx, 11, row.get::<Option<String>, _>("alias2").unwrap_or_default())?;
             worksheet.write(row_idx, 12, row.get::<Option<String>, _>("spec").unwrap_or_default())?;
             worksheet.write(row_idx, 13, row.get::<Option<String>, _>("unit").unwrap_or_default())?;
-            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 18, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
+            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("ordered_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 18, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 19, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
             row_idx += 1;
         }
         
@@ -13523,18 +15676,19 @@ async fn api_purchase_order_export() -> impl IntoResponse {
         worksheet.set_column_width(4, 10)?;
         worksheet.set_column_width(5, 12)?;
         worksheet.set_column_width(6, 12)?;
-        worksheet.set_column_width(7, 8)?;
-        worksheet.set_column_width(8, 15)?;
+        worksheet.set_column_width(7, 10)?;
+        worksheet.set_column_width(8, 12)?;
         worksheet.set_column_width(9, 15)?;
         worksheet.set_column_width(10, 15)?;
         worksheet.set_column_width(11, 15)?;
         worksheet.set_column_width(12, 10)?;
         worksheet.set_column_width(13, 8)?;
-        worksheet.set_column_width(14, 8)?;
+        worksheet.set_column_width(14, 10)?;
         worksheet.set_column_width(15, 8)?;
-        worksheet.set_column_width(16, 10)?;
+        worksheet.set_column_width(16, 8)?;
         worksheet.set_column_width(17, 10)?;
-        worksheet.set_column_width(18, 15)?;
+        worksheet.set_column_width(18, 10)?;
+        worksheet.set_column_width(19, 15)?;
         
         workbook.save_to_buffer()
     })();
@@ -13552,7 +15706,280 @@ async fn api_purchase_order_export() -> impl IntoResponse {
     }
 }
 
-async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
+// 导出采购单（打印模板样式）：单张采购单按打印模板格式导出
+async fn api_purchase_order_print_excel(
+    Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let (order, items) = match get_purchase_order_with_items(id).await {
+        Some(v) => v,
+        None => return (StatusCode::NOT_FOUND, "采购订单不存在".to_string()).into_response(),
+    };
+
+    // 如果传入了 user_id 则优先使用参数里的；否则使用订单里存的
+    let (mut handler_name, mut handler_phone) = (
+        order.user_name.clone().unwrap_or_default(),
+        order.handler_phone.clone().unwrap_or_default(),
+    );
+    if let Some(uid_str) = params.get("user_id").or(params.get("userId")) {
+        if let Ok(uid) = uid_str.parse::<i64>() {
+            if uid > 0 {
+                if let Some(u) = get_user_by_id(uid).await {
+                    handler_name = u.nickname;
+                    handler_phone = u.phone;
+                }
+            }
+        }
+    }
+    let export_filename = format!("采购单_{}.xlsx", order.order_no);
+
+    let title_format = Format::new()
+        .set_bold()
+        .set_font_size(16)
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter);
+    let header_format = Format::new()
+        .set_bold()
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    let cell_center = Format::new()
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    // 合并单元格左对齐格式
+    let info_left = Format::new()
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter);
+    let sum_left_noline = Format::new()
+        .set_bold()
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter);
+    // 货币格式（¥ 前缀，右对齐）
+    let currency_right = Format::new()
+        .set_num_format("¥#,##0.00")
+        .set_align(FormatAlign::Right)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    let cell_left = Format::new()
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    let cell_right = Format::new()
+        .set_align(FormatAlign::Right)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+
+    let result: Result<Vec<u8>, XlsxError> = (move || {
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.set_name("采购单")?;
+        // 页面设置：241-2S 两层两等份，0 页眉页脚，0 左右边距，水平居中，横向
+        ws.set_landscape();
+        ws.set_margins(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        ws.set_print_center_horizontally(true);
+
+        // 列宽：A(28:品名规格/标签+值) B(8)+C(10)+D(12)=30 E(12)+F(18)=30
+        ws.set_column_width(0, 20)?;
+        ws.set_column_width(1, 5)?;
+        ws.set_column_width(2, 6)?;
+        ws.set_column_width(3, 8)?;
+        ws.set_column_width(4, 10)?;
+        ws.set_column_width(5, 18)?;
+
+        // 行 0: 标题（采购单），合并 A-F
+        ws.merge_range(0, 0, 0, 5, "采购单", &title_format)?;
+        ws.set_row_height(0, 28)?;
+
+        // ---- 排版：B2+C2+D2 / B3+C3+D3 / B4+C4+D4 合并 ----
+        // A列="标签：值", B+C+D="标签：值", E+F="标签：值"
+        // ---- 241-2S 两层两等份，横向，0 边距，水平居中 ----
+        // ---------------------
+
+        let warehouse = order.warehouse_name.clone().unwrap_or_default();
+        let order_no = order.order_no.clone();
+        let order_date = order.order_date.clone();
+        let supplier_name = order.supplier_name.clone().unwrap_or_default();
+        let supplier_phone = order.supplier_phone.clone().unwrap_or_default();
+        let supplier_addr = order.supplier_address.clone().unwrap_or_default();
+        let remark_val = order.remark.clone().unwrap_or_default();
+
+        // 行 2: A="订单号：POxxx", B+C+D="日期：2026-08-01", E+F="仓库：仓库名"
+        let cell_a2 = format!("订单号：{}", order_no);
+        let cell_bcd2 = format!("日期：{}", order_date);
+        let cell_ef2 = format!("仓库：{}", warehouse);
+        ws.write_with_format(2, 0, cell_a2.as_str(), &info_left)?;
+        ws.merge_range(2, 1, 2, 3, cell_bcd2.as_str(), &info_left)?;
+        ws.merge_range(2, 4, 2, 5, cell_ef2.as_str(), &info_left)?;
+
+        // 行 3: A="供应商：马彪蔬果批发", B+C+D="联系：138xxxx", E+F="地址：xxx"
+        let cell_a3 = format!("供应商：{}", supplier_name);
+        let cell_bcd3 = format!("联系：{}", supplier_phone);
+        let cell_ef3 = format!("地址：{}", supplier_addr);
+        ws.write_with_format(3, 0, cell_a3.as_str(), &info_left)?;
+        ws.merge_range(3, 1, 3, 3, cell_bcd3.as_str(), &info_left)?;
+        ws.merge_range(3, 4, 3, 5, cell_ef3.as_str(), &info_left)?;
+
+        // 行 4: A="经手人：管理员", B+C+D="联系：xxx", E+F="备注：xxx"
+        let cell_a4 = format!("经手人：{}", handler_name);
+        let cell_bcd4 = format!("联系：{}", handler_phone);
+        let cell_ef4 = format!("备注：{}", remark_val);
+        ws.write_with_format(4, 0, cell_a4.as_str(), &info_left)?;
+        ws.merge_range(4, 1, 4, 3, cell_bcd4.as_str(), &info_left)?;
+        ws.merge_range(4, 4, 4, 5, cell_ef4.as_str(), &info_left)?;
+
+        // 行 5: 间隔行，行高 6
+        ws.set_row_height(5, 6)?;
+
+        // 行 6: 表头（与信息行间隔 1 行）
+        let header_row = 6u32;
+        let headers = ["品名规格", "单位", "数量", "单价", "金额", "备注"];
+        for (i, h) in headers.iter().enumerate() {
+            ws.write_with_format(header_row, i as u16, *h, &header_format)?;
+        }
+        ws.set_row_height(header_row, 22)?;
+
+        // 明细行（至少留 8 行空行便于填写）
+        let total_rows = if items.len() > 8 { items.len() } else { 8 };
+        let data_start = 7usize;
+        for i in 0..total_rows {
+            let row = data_start + i;
+            if i < items.len() {
+                let it = &items[i];
+                let name_spec = if let Some(spec) = it.spec.clone() {
+                    if spec.trim().is_empty() { it.product_name.clone() } else { format!("{} {}", it.product_name, spec) }
+                } else { it.product_name.clone() };
+                ws.write_with_format(row as u32, 0, name_spec, &cell_left)?;
+                ws.write_with_format(row as u32, 1, it.unit.clone().unwrap_or_default(), &cell_center)?;
+                ws.write_with_format(row as u32, 2, it.quantity, &cell_right)?;
+                ws.write_with_format(row as u32, 3, it.unit_price, &currency_right)?;
+                ws.write_with_format(row as u32, 4, it.amount, &currency_right)?;
+                ws.write_with_format(row as u32, 5, it.remark.clone().unwrap_or_default(), &cell_left)?;
+            } else {
+                for c in 0u16..6 {
+                    ws.write_with_format(row as u32, c, "", &cell_center)?;
+                }
+            }
+            ws.set_row_height(row as u32, 22)?;
+        }
+
+        let sum_row = (data_start + total_rows) as u32;
+
+        // ---- 合计排版（A*+B* | C*+D* | E*+F* 同一行，全部靠左）----
+        let cell_sum = format!("合计金额: ¥{:.2}", order.total_amount);
+        let cell_discount = format!("折减金额: ¥{:.2}", order.amount_reduction);
+        let cell_final = format!("最终合计: ¥{:.2}", order.final_amount);
+        ws.merge_range(sum_row, 0, sum_row, 1, cell_sum.as_str(), &sum_left_noline)?;
+        ws.merge_range(sum_row, 2, sum_row, 3, cell_discount.as_str(), &sum_left_noline)?;
+        ws.merge_range(sum_row, 4, sum_row, 5, cell_final.as_str(), &sum_left_noline)?;
+
+        wb.save_to_buffer()
+    })();
+
+    match result {
+        Ok(data) => xlsx_response(data, export_filename.as_str()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("导出失败: {}", e)).into_response(),
+    }
+}
+
+#[derive(Debug)]
+struct PurchaseOrderPrint {
+    order_no: String,
+    order_date: String,
+    total_amount: f64,
+    amount_reduction: f64,
+    final_amount: f64,
+    warehouse_name: Option<String>,
+    remark: Option<String>,
+    supplier_name: Option<String>,
+    supplier_phone: Option<String>,
+    supplier_address: Option<String>,
+    user_name: Option<String>,
+    handler_phone: Option<String>,
+}
+
+#[derive(Debug)]
+struct PurchaseOrderPrintItem {
+    product_name: String,
+    spec: Option<String>,
+    unit: Option<String>,
+    quantity: f64,
+    unit_price: f64,
+    amount: f64,
+    remark: Option<String>,
+}
+
+struct UserSimple { nickname: String, phone: String }
+
+async fn get_purchase_order_with_items(id: i64) -> Option<(PurchaseOrderPrint, Vec<PurchaseOrderPrintItem>)> {
+    let order = sqlx::query_as::<_, (
+        String, String, f64, f64, f64, Option<String>, Option<String>,
+        Option<String>, Option<String>, Option<String>, Option<String>, Option<String>,
+    )>(
+        "SELECT po.order_no, po.order_date, po.total_amount, po.amount_reduction, po.final_amount,
+                po.warehouse_name, po.remark,
+                s.name, s.phone, s.address,
+                u.nickname, po.handler_phone
+         FROM purchase_order po
+         JOIN supplier s ON po.supplier_id = s.id
+         LEFT JOIN user_account u ON po.user_id = u.id
+         WHERE po.id = ?"
+    )
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()?;
+
+    let (order_no, order_date, total_amount, amount_reduction, final_amount, warehouse_name, remark,
+         supplier_name, supplier_phone, supplier_address, user_name, handler_phone) = order;
+
+    let item_rows = sqlx::query_as::<_, (
+        String, Option<String>, Option<String>, f64, f64, f64, Option<String>
+    )>(
+        "SELECT product_name, spec, unit, quantity, unit_price, amount, remark FROM purchase_order_item WHERE order_id = ? ORDER BY id"
+    )
+        .bind(id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    let items: Vec<PurchaseOrderPrintItem> = item_rows
+        .into_iter()
+        .map(|(product_name, spec, unit, quantity, unit_price, amount, remark)| {
+            PurchaseOrderPrintItem { product_name, spec, unit, quantity, unit_price, amount, remark }
+        })
+        .collect();
+
+    Some((
+        PurchaseOrderPrint {
+            order_no, order_date, total_amount, amount_reduction, final_amount,
+            warehouse_name, remark, supplier_name, supplier_phone, supplier_address,
+            user_name, handler_phone,
+        },
+        items,
+    ))
+}
+
+async fn get_user_by_id(id: i64) -> Option<UserSimple> {
+    sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT nickname, COALESCE(NULLIF(phone, ''), '') as phone FROM user_account WHERE id = ?"
+    )
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()
+        .map(|(nickname, phone)| UserSimple { nickname, phone: phone.unwrap_or_default() })
+}
+
+async fn api_purchase_order_import(headers: axum::http::HeaderMap, content: Bytes) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/purchase_order/import").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let rows: Vec<Vec<String>>;
     
     if content.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
@@ -13697,7 +16124,7 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
                             .unwrap_or(0);
                         
                         sqlx::query(
-                            "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .bind(order_id)
                         .bind(product_id)
@@ -13710,6 +16137,7 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
                         .bind(quantity)
                         .bind(base_quantity)
                         .bind(amount)
+                        .bind(0.0f64)
                         .bind(item_remark)
                         .execute(pool())
                         .await
@@ -13726,15 +16154,31 @@ async fn api_purchase_order_import(content: Bytes) -> impl IntoResponse {
         }
     }
     
+    log_operation(&ctx, "purchase_order.import", "purchase_order", "",
+        &format!("导入采购单：成功 {} 条，失败 {} 条", success, failed)).await;
+
     (StatusCode::OK, format!("导入完成：成功 {} 条，失败 {} 条", success, failed)).into_response()
 }
 
-async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限：先确认订单存在并校验归属
+    let exists_row: Option<(i64,)> = sqlx::query_as("SELECT purchaser_id FROM sales_order WHERE id = ?")
         .bind(id)
-        .fetch_one(pool())
+        .fetch_optional(pool())
         .await
-        .unwrap_or(false);
+        .unwrap_or(None);
+
+    let exists = match exists_row {
+        Some((pid,)) => {
+            if !can_access_sales_order(&ctx, pid) {
+                return (StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string());
+            }
+            true
+        }
+        None => false,
+    };
 
     if !exists {
         return (StatusCode::NOT_FOUND, format!("订单不存在 (ID: {})", id).to_string());
@@ -13759,7 +16203,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
     };
     
     let item_rows = match sqlx::query(
-        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark FROM sales_order_item WHERE order_id = ?"
+        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark FROM sales_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
@@ -13784,6 +16228,7 @@ async fn api_sales_order_detail(Path(id): Path<i64>) -> impl IntoResponse {
             "quantity": r.get::<f64, _>("quantity"),
             "base_quantity": r.get::<Option<f64>, _>("base_quantity"),
             "amount": r.get::<f64, _>("amount"),
+            "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity"),
             "supplier_id": r.get::<Option<i64>, _>("supplier_id"),
             "supplier_name": r.get::<Option<String>, _>("supplier_name"),
             "remark": r.get::<Option<String>, _>("remark"),
@@ -13820,6 +16265,29 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 状态约束 + 行级数据权限：先查订单当前状态与所属采购单位
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+        .bind(req.id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    // 仅待配单（pending）状态允许修改，防止对已流转订单篡改
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许修改", order_status));
+    }
+
     let result = sqlx::query(
         "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ? WHERE id = ?"
     )
@@ -13836,7 +16304,7 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
     .bind(req.id)
     .execute(pool())
     .await;
-    
+
     match result {
         Ok(_) => {
             sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
@@ -13844,13 +16312,13 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                 .execute(pool())
                 .await
                 .ok();
-            
+
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES {}",
+                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -13869,16 +16337,128 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.pre_sale_quantity.unwrap_or(0.0))
                         .bind(item.supplier_id)
                         .bind(&item.supplier_name)
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
             }
+            log_operation(&ctx, "sales_order.update", "sales_order", &req.id.unwrap_or(0).to_string(),
+                &format!("更新销售单 {}（采购单位ID={}）", req.order_no, req.purchaser_id)).await;
             (StatusCode::OK, "更新成功".to_string())
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string()),
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e))
+        }
     }
+}
+
+// 一键获取订单明细的最新售价（不写入数据库），返回给前端供用户手动保存
+async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/update_prices").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 状态约束 + 行级数据权限：调价仅限待配单且归属自己的订单
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许调整价格", order_status));
+    }
+
+    let items = sqlx::query(
+        "SELECT id, product_id, quantity, base_quantity FROM sales_order_item WHERE order_id = ?"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    if items.is_empty() {
+        return (StatusCode::NOT_FOUND, "订单不存在或无明细".to_string());
+    }
+
+    let mut result_items = Vec::new();
+    let mut errors = Vec::new();
+    let mut new_total = 0.0;
+
+    for item in &items {
+        let item_id: i64 = item.get("id");
+        let product_id: i64 = item.get("product_id");
+        let quantity: f64 = item.get("quantity");
+
+        let price_row: Option<(f64,)> = sqlx::query_as(
+            "SELECT COALESCE(base_price, 0) FROM product WHERE id = ?"
+        )
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None);
+
+        match price_row {
+            Some((new_price,)) if new_price > 0.0 => {
+                let new_amount = new_price * quantity;
+                new_total += new_amount;
+                result_items.push(serde_json::json!({
+                    "item_id": item_id,
+                    "product_id": product_id,
+                    "unit_price": new_price,
+                    "amount": new_amount,
+                }));
+            }
+            Some((_,)) => {
+                errors.push(format!("商品ID {} 售价为0，跳过", product_id));
+            }
+            None => {
+                errors.push(format!("商品ID {} 未找到", product_id));
+            }
+        }
+    }
+
+    let discount_rate: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(discount_rate, 0) FROM sales_order WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+
+    let amount_reduction: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(amount_reduction, 0) FROM sales_order WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_one(pool())
+    .await
+    .unwrap_or(0.0);
+
+    let discount_amount = new_total * (1.0 - discount_rate / 100.0);
+    let new_final = discount_amount - amount_reduction;
+
+    let resp = serde_json::json!({
+        "items": result_items,
+        "total_amount": new_total,
+        "final_amount": new_final.max(0.0),
+        "errors": errors,
+    });
+    log_operation(&ctx, "sales_order.adjust_price", "sales_order", &id.to_string(),
+        &format!("一键获取销售单 {} 最新售价，新合计={}，错误数={}", id, new_total, errors.len())).await;
+    (StatusCode::OK, serde_json::to_string(&resp).unwrap())
 }
 
 async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
@@ -13886,15 +16466,26 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
         Err(e) => return e,
         Ok(_) => {}
     }
+    let ctx = get_user_ctx(&headers).await;
 
-    let order_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sales_order WHERE id = ?)")
+    // 行级数据权限 + 状态约束
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
         .bind(id)
-        .fetch_one(pool())
+        .fetch_optional(pool())
         .await
-        .unwrap_or(false);
-
-    if !order_exists {
-        return (StatusCode::NOT_FOUND, "订单不存在".to_string());
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    if order_status != "pending" {
+        return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待配单状态的订单允许删除", order_status));
     }
 
     let delete_items_result = sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
@@ -13916,7 +16507,11 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
         .await;
     
     match result {
-        Ok(_) => (StatusCode::OK, "删除成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "sales_order.delete", "sales_order", &id.to_string(),
+                &format!("删除销售单 ID={}", id)).await;
+            (StatusCode::OK, "删除成功".to_string())
+        }
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("foreign key constraint") || err_str.contains("FOREIGN KEY") {
@@ -13928,18 +16523,28 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
     }
 }
 
-async fn api_sales_order_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：purchaser 只能导出自己采购单位的销售单
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name,
-                soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.base_quantity, soi.amount, soi.remark as item_remark
+                soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.pre_sale_quantity, soi.quantity, soi.unit_price, soi.base_quantity, soi.amount, soi.remark as item_remark
          FROM sales_order so 
          JOIN purchaser p ON so.purchaser_id = p.id
-         LEFT JOIN sales_order_item soi ON so.id = soi.order_id
-         ORDER BY so.id, soi.id"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN sales_order_item soi ON so.id = soi.order_id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "purchaser" {
+        sql.push_str(" WHERE so.purchaser_id = ?");
+        binds.push(ctx.purchaser_id);
+    }
+    sql.push_str(" ORDER BY so.id, soi.id");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
@@ -13950,7 +16555,7 @@ async fn api_sales_order_export() -> impl IntoResponse {
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
         
-        let headers = ["订单ID", "订单号", "订单日期", "采购单位", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "数量", "单价", "基本数量", "金额", "商品备注"];
+        let headers = ["订单ID", "订单号", "订单日期", "采购单位", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "预售数量", "数量", "单价", "基本数量", "金额", "商品备注"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
@@ -13971,11 +16576,12 @@ async fn api_sales_order_export() -> impl IntoResponse {
             worksheet.write(row_idx, 11, row.get::<Option<String>, _>("alias2").unwrap_or_default())?;
             worksheet.write(row_idx, 12, row.get::<Option<String>, _>("spec").unwrap_or_default())?;
             worksheet.write(row_idx, 13, row.get::<Option<String>, _>("unit").unwrap_or_default())?;
-            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
-            worksheet.write(row_idx, 18, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
+            worksheet.write(row_idx, 14, row.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 15, row.get::<Option<f64>, _>("quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 16, row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 17, row.get::<Option<f64>, _>("base_quantity").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 18, row.get::<Option<f64>, _>("amount").unwrap_or(0.0))?;
+            worksheet.write(row_idx, 19, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
             row_idx += 1;
         }
         
@@ -13993,11 +16599,12 @@ async fn api_sales_order_export() -> impl IntoResponse {
         worksheet.set_column_width(11, 15)?;
         worksheet.set_column_width(12, 10)?;
         worksheet.set_column_width(13, 8)?;
-        worksheet.set_column_width(14, 8)?;
+        worksheet.set_column_width(14, 10)?;
         worksheet.set_column_width(15, 8)?;
-        worksheet.set_column_width(16, 10)?;
+        worksheet.set_column_width(16, 8)?;
         worksheet.set_column_width(17, 10)?;
-        worksheet.set_column_width(18, 15)?;
+        worksheet.set_column_width(18, 10)?;
+        worksheet.set_column_width(19, 15)?;
         
         workbook.save_to_buffer()
     })();
@@ -14015,7 +16622,13 @@ async fn api_sales_order_export() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
+async fn api_sales_order_import(headers: axum::http::HeaderMap, content: Bytes) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/import").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let rows: Vec<Vec<String>>;
     
     if content.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
@@ -14160,7 +16773,7 @@ async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
                             .unwrap_or(0);
                         
                         sqlx::query(
-                            "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .bind(order_id)
                         .bind(product_id)
@@ -14173,6 +16786,7 @@ async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
                         .bind(quantity)
                         .bind(base_quantity)
                         .bind(amount)
+                        .bind(0.0f64)
                         .bind(item_remark)
                         .execute(pool())
                         .await
@@ -14189,11 +16803,20 @@ async fn api_sales_order_import(content: Bytes) -> impl IntoResponse {
         }
     }
     
+    log_operation(&ctx, "sales_order.import", "sales_order", "",
+        &format!("导入销售单：成功 {} 条，失败 {} 条", success, failed)).await;
+
     (StatusCode::OK, format!("导入完成：成功 {} 条，失败 {} 条", success, failed)).into_response()
 }
 
-async fn api_query_purchase_order(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_purchase_order(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色强制只看自己绑定的供应商
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { ctx.supplier_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("supplier_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -14277,8 +16900,14 @@ async fn api_query_purchase_order(axum::extract::Query(params): axum::extract::Q
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_purchase_order_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_purchase_order_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色只能导出自己供应商的数据
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { ctx.supplier_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("supplier_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -14509,19 +17138,28 @@ async fn api_query_purchase_summary(axum::extract::Query(params): axum::extract:
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_supplier_balance() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_supplier_balance(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色只能看自己绑定的供应商往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT s.id, s.name, 
                 COALESCE(SUM(po.final_amount), 0.0) as purchase_total,
                 COALESCE(SUM(po.final_amount), 0.0) as unpaid
          FROM supplier s 
-         LEFT JOIN purchase_order po ON po.supplier_id = s.id 
-         GROUP BY s.id, s.name 
-         ORDER BY purchase_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN purchase_order po ON po.supplier_id = s.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "supplier" {
+        sql.push_str(" WHERE s.id = ?");
+        binds.push(ctx.supplier_id);
+    }
+    sql.push_str(" GROUP BY s.id, s.name ORDER BY purchase_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let balances: Vec<serde_json::Value> = rows
         .iter()
@@ -14542,19 +17180,28 @@ async fn api_query_supplier_balance() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&balances).unwrap())
 }
 
-async fn api_query_supplier_balance_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_supplier_balance_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：supplier 角色只能导出自己绑定的供应商往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT s.id, s.name, 
                 COALESCE(SUM(po.final_amount), 0.0) as purchase_total,
                 COALESCE(SUM(po.final_amount), 0.0) as unpaid
          FROM supplier s 
-         LEFT JOIN purchase_order po ON po.supplier_id = s.id 
-         GROUP BY s.id, s.name 
-         ORDER BY purchase_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN purchase_order po ON po.supplier_id = s.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "supplier" {
+        sql.push_str(" WHERE s.id = ?");
+        binds.push(ctx.supplier_id);
+    }
+    sql.push_str(" GROUP BY s.id, s.name ORDER BY purchase_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -14593,8 +17240,14 @@ async fn api_query_supplier_balance_export() -> impl IntoResponse {
     ).into_response()
 }
 
-async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_sales_order(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色强制只看自己绑定的采购单位
+    let ctx = get_user_ctx(&headers).await;
+    let purchaser_id = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { ctx.purchaser_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -14689,8 +17342,14 @@ async fn api_query_sales_order(axum::extract::Query(params): axum::extract::Quer
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_sales_order_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
+async fn api_query_sales_order_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能导出自己采购单位的数据
+    let ctx = get_user_ctx(&headers).await;
+    let purchaser_id = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { ctx.purchaser_id.to_string() } else { "-1".to_string() }
+    } else {
+        params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("").to_string()
+    };
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let status = params.get("status").map(|s| s.as_str()).unwrap_or("");
@@ -14772,8 +17431,148 @@ async fn api_query_sales_order_export(axum::extract::Query(params): axum::extrac
     ).into_response()
 }
 
+// 商品价格同期走势：返回指定商品在时间段内的进价点（来自采购单实际成交价）和售价点（来自价格变更日志）
+// 不应用尾数取整规则——历史原值
+async fn api_query_product_price_trend(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let product_id: i64 = match params.get("product_id").and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "missing product_id"}).to_string()).into_response(),
+    };
+    let start_date = params.get("start_date").cloned().unwrap_or_default();
+    let end_date = params.get("end_date").cloned().unwrap_or_default();
+
+    // 1) 取商品信息（基础单位）
+    let product_row = sqlx::query("SELECT id, name, spec, base_unit FROM product WHERE id = ?")
+        .bind(product_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten();
+    if product_row.is_none() {
+        return (StatusCode::NOT_FOUND, serde_json::json!({"error": "product not found"}).to_string()).into_response();
+    }
+    let product = product_row.unwrap();
+    let product_name: String = product.get("name");
+    let base_unit: String = product.get("base_unit");
+
+    // 2) 同一商品可能因别名/规格存在多个 product_id，需要一并查询（仅当同 base_unit 时聚合）
+    // 简化处理：只查主 product_id；如 spec 不同则按名称+基础单位匹配
+    let same_base_products: Vec<i64> = {
+        let rows = sqlx::query("SELECT id FROM product WHERE name = ? AND base_unit = ?")
+            .bind(&product_name)
+            .bind(&base_unit)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default();
+        rows.iter().map(|r| r.get::<i64, _>("id")).collect()
+    };
+    if same_base_products.is_empty() {
+        return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+            "product_id": product_id,
+            "product_name": product_name,
+            "base_unit": base_unit,
+            "purchase_points": [],
+            "selling_points": [],
+        })).unwrap()).into_response();
+    }
+
+    // 构造 IN 列表
+    let placeholders = same_base_products.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    // 备注：早期版本曾尝试在 SQL 内做单位换算匹配，因实现复杂改为在应用层按 base_unit 过滤
+    let purchase_sql = format!(
+        "SELECT po.order_date as date, poi.unit_price as price, poi.unit as unit, poi.base_quantity as bq, poi.quantity as qty, poi.amount as amount
+         FROM purchase_order_item poi
+         JOIN purchase_order po ON poi.order_id = po.id
+         WHERE poi.product_id IN ({})
+         {} {}
+         ORDER BY po.order_date ASC",
+        placeholders,
+        if start_date.is_empty() { String::new() } else { format!("AND po.order_date >= '{}'", start_date.replace('\'', "''")) },
+        if end_date.is_empty() { String::new() } else { format!("AND po.order_date <= '{}'", end_date.replace('\'', "''")) },
+    );
+    let mut purchase_q = sqlx::query(AssertSqlSafe(purchase_sql));
+    for pid in &same_base_products {
+        purchase_q = purchase_q.bind(pid);
+    }
+    let purchase_rows = purchase_q.fetch_all(pool()).await.unwrap_or_default();
+
+    // 换算为基础单位单价：基础单位单价 = amount / base_quantity（若 base_quantity>0）；否则 unit_price（仅在 unit == base_unit 时）
+    let mut purchase_points: Vec<serde_json::Value> = Vec::new();
+    for r in &purchase_rows {
+        let date: String = r.get("date");
+        let unit: String = r.get("unit");
+        let unit_price: f64 = r.get("price");
+        let bq: Option<f64> = r.get("bq");
+        let qty: Option<f64> = r.get("qty");
+        let amount: Option<f64> = r.get("amount");
+        let base_unit_price = if unit == base_unit {
+            unit_price
+        } else if let (Some(bqv), Some(_qv), Some(av)) = (bq, qty, amount) {
+            if bqv > 0.0 { av / bqv } else { unit_price }
+        } else {
+            // 没有 base_quantity 字段时跳过（避免与不同单位数据混淆）
+            continue;
+        };
+        purchase_points.push(serde_json::json!({
+            "date": date,
+            "price": base_unit_price,
+        }));
+    }
+
+    // 3) 售价点：来自销售订单明细的实际成交价（sales_order_item），与查询列表数据源一致
+    //    换算为基础单位单价，与进价同口径比较
+    let selling_sql = format!(
+        "SELECT so.order_date as date, soi.unit_price as price, soi.unit as unit, soi.base_quantity as bq, soi.quantity as qty, soi.amount as amount
+         FROM sales_order_item soi
+         JOIN sales_order so ON soi.order_id = so.id
+         WHERE soi.product_id IN ({})
+         {} {}
+         ORDER BY so.order_date ASC",
+        placeholders,
+        if start_date.is_empty() { String::new() } else { format!("AND so.order_date >= '{}'", start_date.replace('\'', "''")) },
+        if end_date.is_empty() { String::new() } else { format!("AND so.order_date <= '{}'", end_date.replace('\'', "''")) },
+    );
+    let mut selling_q = sqlx::query(AssertSqlSafe(selling_sql));
+    for pid in &same_base_products {
+        selling_q = selling_q.bind(pid);
+    }
+    let selling_rows = selling_q.fetch_all(pool()).await.unwrap_or_default();
+    // 换算为基础单位单价：同进价口径
+    let mut selling_points: Vec<serde_json::Value> = Vec::new();
+    for r in &selling_rows {
+        let date: String = r.get("date");
+        let unit: String = r.get("unit");
+        let unit_price: f64 = r.get("price");
+        let bq: Option<f64> = r.get("bq");
+        let qty: Option<f64> = r.get("qty");
+        let amount: Option<f64> = r.get("amount");
+        let base_unit_price = if unit == base_unit {
+            unit_price
+        } else if let (Some(bqv), Some(_qv), Some(av)) = (bq, qty, amount) {
+            if bqv > 0.0 { av / bqv } else { unit_price }
+        } else {
+            continue;
+        };
+        selling_points.push(serde_json::json!({
+            "date": date,
+            "price": base_unit_price,
+        }));
+    }
+
+    (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+        "product_id": product_id,
+        "product_name": product_name,
+        "base_unit": base_unit,
+        "purchase_points": purchase_points,
+        "selling_points": selling_points,
+    })).unwrap()).into_response()
+}
+
 async fn api_query_sales_price(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
+    let product_id = params.get("product_id").map(|s| s.as_str()).unwrap_or("");
     let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
     
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -14790,6 +17589,10 @@ async fn api_query_sales_price(axum::extract::Query(params): axum::extract::Quer
     if !product_name.is_empty() {
         base_sql.push_str(" AND soi.product_name LIKE ?");
         binds.push(format!("%{}%", product_name));
+    }
+    if !product_id.is_empty() {
+        base_sql.push_str(" AND soi.product_id = ?");
+        binds.push(product_id.to_string());
     }
     if !purchaser_id.is_empty() {
         base_sql.push_str(" AND so.purchaser_id = ?");
@@ -14950,14 +17753,14 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
         binds.push(end_date.to_string());
     }
 
-    // 1) 真实明细：按采购单位 & 商品聚合
+    // 1) 真实明细：按采购单位聚合（真实账套口径，含全部订单，不排除来源耗材单）
     let real_purchaser_sql = format!(
-        "SELECT so.purchaser_id, p.name, so.id as order_id, SUM(soi.amount) as amount, SUM(soi.quantity) as qty
+        "SELECT so.purchaser_id, p.name, SUM(soi.amount) as amount
          FROM sales_order_item soi
          JOIN sales_order so ON soi.order_id = so.id
          JOIN purchaser p ON so.purchaser_id = p.id
          WHERE 1=1 {}
-         GROUP BY so.id", date_cond
+         GROUP BY so.purchaser_id", date_cond
     );
     let mut q = sqlx::query(AssertSqlSafe(real_purchaser_sql.as_str()));
     for b in &binds { q = q.bind(b); }
@@ -14967,8 +17770,6 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
     // 按采购单位累加：real_amount
     let mut purchaser_map: HashMap<i64, (String, f64, f64)> = HashMap::new(); // id -> (name, real, supp)
     for r in &real_rows {
-        let order_id = r.get::<i64, _>("order_id");
-        if source_set.contains(&order_id) { continue; } // 排除来源耗材单
         let pid = r.get::<i64, _>("purchaser_id");
         let name = r.get::<String, _>("name");
         let amount = r.get::<f64, _>("amount");
@@ -14976,8 +17777,8 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
         entry.1 += amount;
     }
 
-    // 2) 分摊增项净额：按目标订单归属的采购单位聚合（含 replace_remove 负数抵消）
-    let supp_sql = format!(
+    // 2a) 分摊增项：作为「目标单」收到的增项（正），按目标单采购单位聚合
+    let supp_target_sql = format!(
         "SELECT so.purchaser_id, p.name, SUM(osi.amount) as supp_amount
          FROM order_supplement_item osi
          JOIN sales_order so ON osi.target_order_id = so.id
@@ -14985,15 +17786,41 @@ async fn api_query_reimburse_summary(axum::extract::Query(params): axum::extract
          WHERE 1=1 {}
          GROUP BY so.purchaser_id", date_cond
     );
-    let mut q2 = sqlx::query(AssertSqlSafe(supp_sql.as_str()));
+    let mut q2 = sqlx::query(AssertSqlSafe(supp_target_sql.as_str()));
     for b in &binds { q2 = q2.bind(b); }
-    let supp_rows = q2.fetch_all(pool()).await.unwrap_or_default();
-    for r in &supp_rows {
+    let supp_target_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    for r in &supp_target_rows {
         let pid = r.get::<i64, _>("purchaser_id");
         let name = r.get::<String, _>("name");
         let supp_amount = r.get::<f64, _>("supp_amount");
         let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
         entry.2 += supp_amount;
+    }
+
+    // 2b) 分摊减项：来源耗材单在报销口径里不报销，扣除其「真实明细金额」（非已分摊金额）
+    // 净额 = 目标单收到的分摊增项(+) − 来源单真实金额(−)，正好等于分摊尾差（超分为正、少分为负）
+    // 仅针对实际作为分摊来源的订单
+    if !source_set.is_empty() {
+        let source_real_sql = format!(
+            "SELECT so.purchaser_id, p.name, so.id as order_id, SUM(soi.amount) as amount
+             FROM sales_order_item soi
+             JOIN sales_order so ON soi.order_id = so.id
+             JOIN purchaser p ON so.purchaser_id = p.id
+             WHERE 1=1 {}
+             GROUP BY so.id", date_cond
+        );
+        let mut q2b = sqlx::query(AssertSqlSafe(source_real_sql.as_str()));
+        for b in &binds { q2b = q2b.bind(b); }
+        let source_real_rows = q2b.fetch_all(pool()).await.unwrap_or_default();
+        for r in &source_real_rows {
+            let order_id = r.get::<i64, _>("order_id");
+            if !source_set.contains(&order_id) { continue; } // 只扣除来源单
+            let pid = r.get::<i64, _>("purchaser_id");
+            let name = r.get::<String, _>("name");
+            let amount = r.get::<f64, _>("amount");
+            let entry = purchaser_map.entry(pid).or_insert((name, 0.0, 0.0));
+            entry.2 -= amount;
+        }
     }
 
     let mut by_purchaser: Vec<serde_json::Value> = purchaser_map.values().map(|(name, real, supp)| {
@@ -15130,19 +17957,28 @@ async fn api_query_allocation_source(axum::extract::Query(params): axum::extract
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_query_purchaser_balance() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_purchaser_balance(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能看自己绑定的采购单位往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT p.id, p.name, 
                 COALESCE(SUM(so.final_amount), 0) as sales_total,
                 COALESCE(SUM(so.final_amount), 0) as unreceived
          FROM purchaser p 
-         LEFT JOIN sales_order so ON so.purchaser_id = p.id 
-         GROUP BY p.id, p.name 
-         ORDER BY sales_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN sales_order so ON so.purchaser_id = p.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "purchaser" {
+        sql.push_str(" WHERE p.id = ?");
+        binds.push(ctx.purchaser_id);
+    }
+    sql.push_str(" GROUP BY p.id, p.name ORDER BY sales_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let balances: Vec<serde_json::Value> = rows
         .iter()
@@ -15163,19 +17999,28 @@ async fn api_query_purchaser_balance() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&balances).unwrap())
 }
 
-async fn api_query_purchaser_balance_export() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_query_purchaser_balance_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能导出自己绑定的采购单位往来
+    let ctx = get_user_ctx(&headers).await;
+    let mut sql = String::from(
         "SELECT p.id, p.name, 
                 COALESCE(SUM(so.final_amount), 0) as sales_total,
                 COALESCE(SUM(so.final_amount), 0) as unreceived
          FROM purchaser p 
-         LEFT JOIN sales_order so ON so.purchaser_id = p.id 
-         GROUP BY p.id, p.name 
-         ORDER BY sales_total DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         LEFT JOIN sales_order so ON so.purchaser_id = p.id"
+    );
+    let mut binds: Vec<i64> = Vec::new();
+    if ctx.role == "purchaser" {
+        sql.push_str(" WHERE p.id = ?");
+        binds.push(ctx.purchaser_id);
+    }
+    sql.push_str(" GROUP BY p.id, p.name ORDER BY sales_total DESC");
+
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -15214,27 +18059,126 @@ async fn api_query_purchaser_balance_export() -> impl IntoResponse {
     ).into_response()
 }
 
-async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResponse {
+async fn api_sales_order_generate_purchase(
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/generate_purchase").await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    let force = params.get("force").map(|s| s == "1").unwrap_or(false);
+
     let order_row = sqlx::query(
-        "SELECT so.id, so.order_date, so.warehouse_id, so.warehouse_name
+        "SELECT so.id, so.order_date, so.warehouse_id, so.warehouse_name, so.purchaser_id
          FROM sales_order so WHERE so.id = ?"
     )
     .bind(id)
     .fetch_optional(pool())
     .await
     .unwrap_or(None);
-    
+
     if order_row.is_none() {
         return (StatusCode::NOT_FOUND, serde_json::json!({ "message": "销售订单不存在" }).to_string()).into_response();
     }
-    
+
     let row = order_row.unwrap();
+    // 行级数据权限：仅可为自己采购单位的销售单生成采购订单
+    let row_purchaser_id: i64 = row.get("purchaser_id");
+    if !can_access_sales_order(&ctx, row_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string()).into_response();
+    }
     let order_date = row.get::<String, _>("order_date");
     let warehouse_id = row.get::<i64, _>("warehouse_id");
     let warehouse_name = row.get::<Option<String>, _>("warehouse_name").unwrap_or_default();
+
+    // 重复生成检查：是否已存在源自该销售订单的采购订单
+    // 已处理（非 pending）的采购订单受保护，不允许覆盖；
+    // pending 状态的采购订单在用户确认后会先删除再重新生成，避免重复
+    let existed: Vec<(i64, String, String, String)> = sqlx::query(
+        "SELECT po.id, po.order_no, po.status, COALESCE(s.name, '未知供应商') as supplier_name
+         FROM purchase_order po LEFT JOIN supplier s ON po.supplier_id = s.id
+         WHERE po.source_sales_order_id = ? ORDER BY po.id"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| (
+        r.get::<i64, _>("id"),
+        r.get::<String, _>("order_no"),
+        r.get::<String, _>("status"),
+        r.get::<String, _>("supplier_name"),
+    ))
+    .collect();
+
+    if !existed.is_empty() {
+        // 区分可重建（pending）与已处理（非 pending）的采购订单
+        let status_text = |s: &str| match s {
+            "pending" => "待分拣",
+            "sorting" => "分拣中",
+            "sorted" => "已分拣",
+            "delivering" => "配送中",
+            "delivered" => "已送达",
+            "accepted" => "已验收",
+            "settled" => "已结算",
+            _ => "未知",
+        };
+        let pending: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 == "pending").collect();
+        let processed: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 != "pending").collect();
+
+        // 存在已处理的采购订单：不允许重新生成，避免覆盖已发生的业务数据
+        if !processed.is_empty() {
+            let detail = processed.iter()
+                .map(|x| format!("{}（{}，状态：{}）", x.1, x.3, status_text(&x.2)))
+                .collect::<Vec<_>>().join("、");
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                serde_json::json!({
+                    "error": true,
+                    "message": format!("该销售订单已生成过采购订单，其中 {} 张已处理（{}），不能重新生成。\n如需调整，请到采购订单页面手动处理对应单据。", processed.len(), detail)
+                }).to_string(),
+            ).into_response();
+        }
+
+        // 全部为 pending 状态：提示用户确认后删除旧的再重新生成
+        if !force {
+            let detail = pending.iter()
+                .map(|x| format!("{}（{}）", x.1, x.3))
+                .collect::<Vec<_>>().join("、");
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                serde_json::json!({
+                    "warning": true,
+                    "count": pending.len(),
+                    "message": format!("该销售订单已生成过 {} 张采购订单（均为待分拣状态）：{}\n重新生成将删除旧单并按最新销售订单重新生成，是否继续？", pending.len(), detail)
+                }).to_string(),
+            ).into_response();
+        }
+
+        // force=true：删除所有 pending 状态的旧采购订单及其明细
+        for x in &pending {
+            sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
+                .bind(x.0)
+                .execute(pool())
+                .await
+                .ok();
+            sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+                .bind(x.0)
+                .execute(pool())
+                .await
+                .ok();
+        }
+    }
     
     let item_rows = sqlx::query(
-        "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.supplier_id, soi.supplier_name, p.purchase_price, p.base_unit, p.base_price
+        "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.supplier_id, soi.supplier_name, p.purchase_price, p.base_unit, p.base_price
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          WHERE soi.order_id = ?"
     )
@@ -15243,7 +18187,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
     .await
     .unwrap_or_default();
     
-    let mut supplier_items: std::collections::HashMap<i64, Vec<(i64, String, String, String, String, String, f64, f64, String, f64)>> = std::collections::HashMap::new();
+    let mut supplier_items: std::collections::HashMap<i64, Vec<(i64, String, String, String, String, String, f64, f64, f64, String, f64)>> = std::collections::HashMap::new();
     
     for r in &item_rows {
         let supplier_id = r.get::<i64, _>("supplier_id");
@@ -15257,6 +18201,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
         let quantity = r.get::<f64, _>("quantity");
+        let pre_sale_quantity = r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0);
         let purchase_price = r.get::<f64, _>("purchase_price");
         let base_unit = r.get::<Option<String>, _>("base_unit").unwrap_or_default();
         let base_price = r.get::<f64, _>("base_price");
@@ -15264,7 +18209,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         let unit_price = if purchase_price > 0.0 { purchase_price } else { base_price };
         
         supplier_items.entry(supplier_id).or_insert_with(Vec::new).push(
-            (product_id, product_name, alias1, alias2, spec, unit, quantity, unit_price, base_unit, base_price)
+            (product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, base_unit, base_price)
         );
     }
     
@@ -15289,12 +18234,12 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         let order_no = generate_order_no("purchase", &order_date).await;
         
         let mut total_amount = 0.0;
-        for (_, _, _, _, _, _, qty, price, _, _) in &items {
+        for (_, _, _, _, _, _, qty, _, price, _, _) in &items {
             total_amount += qty * price;
         }
         
         let result = sqlx::query(
-            "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(supplier_id)
         .bind(&order_no)
@@ -15306,16 +18251,17 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         .bind(warehouse_id)
         .bind(&warehouse_name)
         .bind(None::<String>)
+        .bind(id)
         .execute(pool())
         .await;
         
         if let Ok(res) = result {
             let po_id = res.last_insert_rowid();
-            for (product_id, product_name, alias1, alias2, spec, unit, quantity, unit_price, _base_unit, _base_price) in items {
+            for (product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, _base_unit, _base_price) in items {
                 let amount = quantity * unit_price;
                 let base_quantity = quantity;
                 sqlx::query(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 .bind(po_id)
                 .bind(product_id)
@@ -15328,6 +18274,7 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
                 .bind(quantity)
                 .bind(base_quantity)
                 .bind(amount)
+                .bind(pre_sale_quantity)
                 .bind(None::<String>)
                 .execute(pool())
                 .await
@@ -15337,6 +18284,9 @@ async fn api_sales_order_generate_purchase(Path(id): Path<i64>) -> impl IntoResp
         }
     }
     
+    log_operation(&ctx, "sales_order.generate_purchase", "sales_order", &id.to_string(),
+        &format!("由销售单生成采购订单，成功 {} 张", created_count)).await;
+
     (StatusCode::OK, serde_json::json!({ "count": created_count, "message": format!("成功生成 {} 张采购订单", created_count) }).to_string()).into_response()
 }
 
@@ -15790,10 +18740,11 @@ struct StockSummaryRow {
     out_amount: f64,
     out_item_count: i64,
     out_order_count: i64,
-    net_amount: f64,
+    discounted_out_amount: f64, // 下浮后出库金额 = 出库金额 × (1 - 下浮率/100)
+    gross_profit: f64,          // 毛利 = 下浮后出库金额 - 入库金额
 }
 
-async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64) {
+async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
     // 采购入库按日+仓库汇总
     let mut purchase_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
@@ -15820,7 +18771,7 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         .await
         .unwrap_or_default();
 
-    // 销售出库按日+仓库汇总
+    // 销售出库按明细行返回，含订单下浮率，在 Rust 端按明细计算下浮后金额
     let mut sales_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
         sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date));
@@ -15832,13 +18783,12 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         "SELECT so.order_date as day,
                 COALESCE(so.warehouse_id, 0) as warehouse_id,
                 COALESCE(so.warehouse_name, '未指定') as warehouse_name,
-                COALESCE(SUM(soi.amount), 0) as out_amount,
-                COUNT(soi.id) as out_item_count,
-                COUNT(DISTINCT so.id) as out_order_count
+                soi.amount as out_amount,
+                so.id as order_id,
+                COALESCE(so.discount_rate, 0) as discount_rate
          FROM sales_order so
          JOIN sales_order_item soi ON soi.order_id = so.id
-         {}
-         GROUP BY so.order_date, so.warehouse_id, so.warehouse_name",
+         {}",
         sales_where
     );
     let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
@@ -15848,8 +18798,8 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
 
     use std::collections::{BTreeMap, HashMap};
 
-    // Key: (day, warehouse_id) -> (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name)
-    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String)>> = HashMap::new();
+    // Key: (day, warehouse_id) -> (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name, discounted_out)
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String, f64)>> = HashMap::new();
 
     // 先收集所有仓库名称用于排序
     let mut warehouse_names: BTreeMap<i64, String> = BTreeMap::new();
@@ -15865,27 +18815,35 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         warehouse_names.insert(wh_id, wh_name.clone());
 
         let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
         e.0 += amount;
         e.1 += items;
         e.2 += orders;
     }
 
+    // 按明细行汇总：out_amount 累加原值，discounted_out 累加下浮后金额
+    // 下浮后金额 = amount × (1 - discount_rate/100)
+    // 订单数与条数通过 Set 去重统计
+    let mut seen_orders: std::collections::HashSet<(String, i64, i64)> = std::collections::HashSet::new();
     for row in &sales_rows {
         let day: String = row.get("day");
         let wh_id: i64 = row.get::<i64, _>("warehouse_id");
         let wh_name: String = row.get::<String, _>("warehouse_name");
         let amount: f64 = row.get::<f64, _>("out_amount");
-        let items: i64 = row.get::<i64, _>("out_item_count");
-        let orders: i64 = row.get::<i64, _>("out_order_count");
+        let order_id: i64 = row.get::<i64, _>("order_id");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
 
         warehouse_names.insert(wh_id, wh_name.clone());
 
-        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
-        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name));
+        let wh_map = day_wh_map.entry(day.clone()).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
         e.3 += amount;
-        e.4 += items;
-        e.5 += orders;
+        e.4 += 1; // 条数
+        e.7 += discounted;
+        if seen_orders.insert((day, wh_id, order_id)) {
+            e.5 += 1; // 单数（去重）
+        }
     }
 
     // 按日期倒序，每天输出仓库明细行 + 汇总行
@@ -15895,11 +18853,13 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
     let mut rows: Vec<StockSummaryRow> = Vec::new();
     let mut total_in = 0.0;
     let mut total_out = 0.0;
+    let mut total_discounted_out = 0.0;
 
     for day in &days {
         if let Some(wh_map) = day_wh_map.get(day) {
             let mut day_in = 0.0;
             let mut day_out = 0.0;
+            let mut day_discounted_out = 0.0;
             let mut day_in_items = 0;
             let mut day_out_items = 0;
             let mut day_in_orders = 0;
@@ -15909,6 +18869,7 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
             for (wh_id, v) in wh_map {
                 day_in += v.0;
                 day_out += v.3;
+                day_discounted_out += v.7;
                 day_in_items += v.1;
                 day_out_items += v.4;
                 day_in_orders += v.2;
@@ -15925,7 +18886,8 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
                     out_amount: v.3,
                     out_item_count: v.4,
                     out_order_count: v.5,
-                    net_amount: v.0 - v.3,
+                    discounted_out_amount: v.7,
+                    gross_profit: v.7 - v.0,
                 });
             }
 
@@ -15941,21 +18903,213 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
                 out_amount: day_out,
                 out_item_count: day_out_items,
                 out_order_count: day_out_orders,
-                net_amount: day_in - day_out,
+                discounted_out_amount: day_discounted_out,
+                gross_profit: day_discounted_out - day_in,
             });
 
             total_in += day_in;
             total_out += day_out;
+            total_discounted_out += day_discounted_out;
         }
     }
 
-    (rows, total_in, total_out)
+    (rows, total_in, total_out, total_discounted_out)
+}
+
+async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
+    // 入库：与真实账套一致
+    let mut purchase_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date)); }
+    if !end_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date <= '{}'", end_date)); }
+    let purchase_sql = format!(
+        "SELECT po.order_date as day,
+                COALESCE(po.warehouse_id, 0) as warehouse_id,
+                COALESCE(po.warehouse_name, '未指定') as warehouse_name,
+                COALESCE(SUM(poi.amount), 0) as in_amount,
+                COUNT(poi.id) as in_item_count,
+                COUNT(DISTINCT po.id) as in_order_count
+         FROM purchase_order po
+         JOIN purchase_order_item poi ON poi.order_id = po.id
+         {}
+         GROUP BY po.order_date, po.warehouse_id, po.warehouse_name",
+        purchase_where
+    );
+    let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 真实出库（按明细行返回，含订单下浮率）
+    let mut sales_where = String::from("WHERE 1=1");
+    if !start_date.is_empty() { sales_where.push_str(&format!(" AND so.order_date >= '{}'", start_date)); }
+    if !end_date.is_empty() { sales_where.push_str(&format!(" AND so.order_date <= '{}'", end_date)); }
+    let sales_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                soi.amount as out_amount,
+                so.id as order_id,
+                COALESCE(so.discount_rate, 0) as discount_rate
+         FROM sales_order so
+         JOIN sales_order_item soi ON soi.order_id = so.id
+         {}",
+        sales_where
+    );
+    let sales_rows = sqlx::query(AssertSqlSafe(sales_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 分摊调整1：目标单收到的增项金额（+出库），按明细行返回，含目标单下浮率
+    let adj1_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                osi.amount as out_amount,
+                COALESCE(so.discount_rate, 0) as discount_rate
+         FROM order_supplement_item osi
+         JOIN sales_order so ON osi.target_order_id = so.id
+         {}",
+        sales_where
+    );
+    let adj1_rows = sqlx::query(AssertSqlSafe(adj1_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    // 分摊调整2：来源耗材单真实金额（−出库），按明细行返回，含来源单下浮率
+    let adj2_sql = format!(
+        "SELECT so.order_date as day,
+                COALESCE(so.warehouse_id, 0) as warehouse_id,
+                COALESCE(so.warehouse_name, '未指定') as warehouse_name,
+                soi.amount as out_amount,
+                so.id as order_id,
+                COALESCE(so.discount_rate, 0) as discount_rate
+         FROM sales_order so
+         JOIN sales_order_item soi ON soi.order_id = so.id
+         {} AND so.id IN (SELECT DISTINCT source_order_id FROM consumable_allocation)",
+        sales_where
+    );
+    let adj2_rows = sqlx::query(AssertSqlSafe(adj2_sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
+
+    use std::collections::{BTreeMap, HashMap};
+    // 元组: (in_amount, in_items, in_orders, out_amount, out_items, out_orders, warehouse_name, discounted_out)
+    let mut day_wh_map: HashMap<String, BTreeMap<i64, (f64, i64, i64, f64, i64, i64, String, f64)>> = HashMap::new();
+
+    for row in &purchase_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("in_amount");
+        let items: i64 = row.get::<i64, _>("in_item_count");
+        let orders: i64 = row.get::<i64, _>("in_order_count");
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.0 += amount; e.1 += items; e.2 += orders;
+    }
+
+    // 真实出库：累加原值与下浮后金额，订单数去重
+    let mut seen_orders: std::collections::HashSet<(String, i64, i64)> = std::collections::HashSet::new();
+    for row in &sales_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let order_id: i64 = row.get::<i64, _>("order_id");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
+        let wh_map = day_wh_map.entry(day.clone()).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.3 += amount; e.4 += 1; e.7 += discounted;
+        if seen_orders.insert((day, wh_id, order_id)) { e.5 += 1; }
+    }
+
+    // 加目标单分摊增项（含下浮）
+    for row in &adj1_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.3 += amount; e.7 += discounted;
+    }
+
+    // 减来源单真实金额（含下浮）
+    for row in &adj2_rows {
+        let day: String = row.get("day");
+        let wh_id: i64 = row.get::<i64, _>("warehouse_id");
+        let wh_name: String = row.get::<String, _>("warehouse_name");
+        let amount: f64 = row.get::<f64, _>("out_amount");
+        let discount_rate: f64 = row.get::<f64, _>("discount_rate");
+        let discounted = amount * (1.0 - discount_rate / 100.0);
+        let wh_map = day_wh_map.entry(day).or_insert_with(BTreeMap::new);
+        let e = wh_map.entry(wh_id).or_insert((0.0, 0, 0, 0.0, 0, 0, wh_name, 0.0));
+        e.3 -= amount; e.7 -= discounted;
+    }
+
+    let mut days: Vec<String> = day_wh_map.keys().cloned().collect();
+    days.sort_by(|a, b| b.cmp(a));
+
+    let mut rows: Vec<StockSummaryRow> = Vec::new();
+    let mut total_in = 0.0;
+    let mut total_out = 0.0;
+    let mut total_discounted_out = 0.0;
+
+    for day in &days {
+        if let Some(wh_map) = day_wh_map.get(day) {
+            let mut day_in = 0.0;
+            let mut day_out = 0.0;
+            let mut day_discounted_out = 0.0;
+            let mut day_in_items = 0;
+            let mut day_out_items = 0;
+            let mut day_in_orders = 0;
+            let mut day_out_orders = 0;
+
+            for (wh_id, v) in wh_map {
+                day_in += v.0; day_out += v.3; day_discounted_out += v.7;
+                day_in_items += v.1; day_out_items += v.4;
+                day_in_orders += v.2; day_out_orders += v.5;
+
+                rows.push(StockSummaryRow {
+                    day: day.clone(),
+                    warehouse_id: *wh_id,
+                    warehouse_name: v.6.clone(),
+                    is_summary: false,
+                    in_amount: v.0,
+                    in_item_count: v.1,
+                    in_order_count: v.2,
+                    out_amount: v.3,
+                    out_item_count: v.4,
+                    out_order_count: v.5,
+                    discounted_out_amount: v.7,
+                    gross_profit: v.7 - v.0,
+                });
+            }
+
+            rows.push(StockSummaryRow {
+                day: day.clone(), warehouse_id: -1, warehouse_name: "当日汇总".to_string(),
+                is_summary: true,
+                in_amount: day_in, in_item_count: day_in_items, in_order_count: day_in_orders,
+                out_amount: day_out, out_item_count: day_out_items, out_order_count: day_out_orders,
+                discounted_out_amount: day_discounted_out,
+                gross_profit: day_discounted_out - day_in,
+            });
+            total_in += day_in; total_out += day_out; total_discounted_out += day_discounted_out;
+        }
+    }
+    (rows, total_in, total_out, total_discounted_out)
 }
 
 async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary(start_date, end_date).await;
 
     // 收集所有仓库列表（保持原有兼容性，虽然导出不再需要）
     use std::collections::BTreeMap;
@@ -15982,7 +19136,8 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
             "out_amount": r.out_amount,
             "out_item_count": r.out_item_count,
             "out_order_count": r.out_order_count,
-            "net_amount": r.net_amount,
+            "discounted_out_amount": r.discounted_out_amount,
+            "gross_profit": r.gross_profit,
         })
     }).collect();
 
@@ -15991,7 +19146,8 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
         "warehouses": warehouse_list,
         "total_in_amount": total_in,
         "total_out_amount": total_out,
-        "total_net_amount": total_in - total_out,
+        "total_discounted_out_amount": total_discounted_out,
+        "total_gross_profit": total_discounted_out - total_in,
     });
 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
@@ -16000,7 +19156,7 @@ async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Qu
 async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let (rows, total_in, total_out) = compute_stock_summary(start_date, end_date).await;
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary(start_date, end_date).await;
 
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -16028,7 +19184,8 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
         .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
         .set_align(rust_xlsxwriter::FormatAlign::Right);
 
-    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "出库单数", "出库条数", "净额"];
+    // 列顺序：日期、仓库、入库金额、入库单数、入库条数、出库金额、下浮后出库金额、出库单数、出库条数、毛利
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "下浮后出库金额", "出库单数", "出库条数", "毛利"];
     for (col, header) in headers.iter().enumerate() {
         worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
     }
@@ -16036,13 +19193,14 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
     // 设置列宽
     worksheet.set_column_width(0, 14).unwrap(); // 日期
     worksheet.set_column_width(1, 16).unwrap(); // 仓库
-    worksheet.set_column_width_pixels(2, 90).unwrap(); // 金额列统一
-    worksheet.set_column_width_pixels(3, 70).unwrap();
-    worksheet.set_column_width_pixels(4, 70).unwrap();
-    worksheet.set_column_width_pixels(5, 90).unwrap();
-    worksheet.set_column_width_pixels(6, 70).unwrap();
-    worksheet.set_column_width_pixels(7, 70).unwrap();
-    worksheet.set_column_width_pixels(8, 90).unwrap();
+    worksheet.set_column_width_pixels(2, 90).unwrap();  // 入库金额
+    worksheet.set_column_width_pixels(3, 70).unwrap();  // 入库单数
+    worksheet.set_column_width_pixels(4, 70).unwrap();  // 入库条数
+    worksheet.set_column_width_pixels(5, 90).unwrap();  // 出库金额
+    worksheet.set_column_width_pixels(6, 90).unwrap();  // 下浮后出库金额
+    worksheet.set_column_width_pixels(7, 70).unwrap();  // 出库单数
+    worksheet.set_column_width_pixels(8, 70).unwrap();  // 出库条数
+    worksheet.set_column_width_pixels(9, 90).unwrap();  // 毛利
 
     let mut prev_day = String::new();
     for (row_idx, row) in rows.iter().enumerate() {
@@ -16058,9 +19216,10 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
             worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
             worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
             worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
-            worksheet.write_with_format(sheet_row, 6, row.out_order_count, &summary_format).unwrap();
-            worksheet.write_with_format(sheet_row, 7, row.out_item_count, &summary_format).unwrap();
-            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format_sum).unwrap();
         } else {
             worksheet.write(sheet_row, 0, day_display).unwrap();
             worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
@@ -16068,9 +19227,10 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
             worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
             worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
             worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
-            worksheet.write(sheet_row, 6, row.out_order_count).unwrap();
-            worksheet.write(sheet_row, 7, row.out_item_count).unwrap();
-            worksheet.write_with_format(sheet_row, 8, row.net_amount, &num_format).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 7, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 8, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format).unwrap();
         }
     }
 
@@ -16079,13 +19239,138 @@ async fn api_query_stock_summary_export(axum::extract::Query(params): axum::extr
     worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
     worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
     worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
-    worksheet.write_with_format(total_row, 8, total_in - total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 6, total_discounted_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 9, total_discounted_out - total_in, &num_format_sum).unwrap();
 
     let buf = workbook.save_to_buffer().unwrap();
     (
         [
             (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
             (header::CONTENT_DISPOSITION, "attachment; filename=\"stock_summary.xlsx\""),
+        ],
+        buf,
+    ).into_response()
+}
+
+async fn api_query_stock_summary_reimburse(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary_reimburse(start_date, end_date).await;
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "day": r.day,
+            "warehouse_id": r.warehouse_id,
+            "warehouse_name": r.warehouse_name,
+            "is_summary": r.is_summary,
+            "in_amount": r.in_amount,
+            "in_item_count": r.in_item_count,
+            "in_order_count": r.in_order_count,
+            "out_amount": r.out_amount,
+            "out_item_count": r.out_item_count,
+            "out_order_count": r.out_order_count,
+            "discounted_out_amount": r.discounted_out_amount,
+            "gross_profit": r.gross_profit,
+        })
+    }).collect();
+
+    let result = serde_json::json!({
+        "rows": items,
+        "total_in_amount": total_in,
+        "total_out_amount": total_out,
+        "total_discounted_out_amount": total_discounted_out,
+        "total_gross_profit": total_discounted_out - total_in,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+async fn api_query_stock_summary_reimburse_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let (rows, total_in, total_out, total_discounted_out) = compute_stock_summary_reimburse(start_date, end_date).await;
+
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("报销出入库统计").unwrap();
+
+    let header_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0x2E75B6))
+        .set_font_color(rust_xlsxwriter::Color::White)
+        .set_align(rust_xlsxwriter::FormatAlign::Center)
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+    let summary_format = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_border(rust_xlsxwriter::FormatBorder::Thin);
+    let num_format = rust_xlsxwriter::Format::new()
+        .set_num_format("#,##0.00")
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+    let num_format_sum = rust_xlsxwriter::Format::new()
+        .set_bold()
+        .set_num_format("#,##0.00")
+        .set_background_color(rust_xlsxwriter::Color::RGB(0xFFF2CC))
+        .set_align(rust_xlsxwriter::FormatAlign::Right);
+
+    // 列顺序：日期、仓库、入库金额、入库单数、入库条数、出库金额、下浮后出库金额、出库单数、出库条数、毛利
+    let headers = ["日期", "仓库", "入库金额", "入库单数", "入库条数", "出库金额", "下浮后出库金额", "出库单数", "出库条数", "毛利"];
+    for (col, header) in headers.iter().enumerate() {
+        worksheet.write_with_format(0, col as u16, *header, &header_format).unwrap();
+    }
+    worksheet.set_column_width(0, 14).unwrap();
+    worksheet.set_column_width(1, 16).unwrap();
+    worksheet.set_column_width_pixels(2, 90).unwrap();
+    worksheet.set_column_width_pixels(3, 70).unwrap();
+    worksheet.set_column_width_pixels(4, 70).unwrap();
+    worksheet.set_column_width_pixels(5, 90).unwrap();
+    worksheet.set_column_width_pixels(6, 90).unwrap();
+    worksheet.set_column_width_pixels(7, 70).unwrap();
+    worksheet.set_column_width_pixels(8, 70).unwrap();
+    worksheet.set_column_width_pixels(9, 90).unwrap();
+
+    let mut prev_day = String::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let sheet_row = (row_idx + 1) as u32;
+        let day_display = if row.day != prev_day { row.day.as_str() } else { "" };
+        prev_day = row.day.clone();
+        if row.is_summary {
+            worksheet.write_with_format(sheet_row, 0, day_display, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 1, &row.warehouse_name, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 3, row.in_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 4, row.in_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format_sum).unwrap();
+            worksheet.write_with_format(sheet_row, 7, row.out_order_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 8, row.out_item_count, &summary_format).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format_sum).unwrap();
+        } else {
+            worksheet.write(sheet_row, 0, day_display).unwrap();
+            worksheet.write(sheet_row, 1, &row.warehouse_name).unwrap();
+            worksheet.write_with_format(sheet_row, 2, row.in_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 3, row.in_order_count).unwrap();
+            worksheet.write(sheet_row, 4, row.in_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 5, row.out_amount, &num_format).unwrap();
+            worksheet.write_with_format(sheet_row, 6, row.discounted_out_amount, &num_format).unwrap();
+            worksheet.write(sheet_row, 7, row.out_order_count).unwrap();
+            worksheet.write(sheet_row, 8, row.out_item_count).unwrap();
+            worksheet.write_with_format(sheet_row, 9, row.gross_profit, &num_format).unwrap();
+        }
+    }
+
+    let total_row = (rows.len() + 2) as u32;
+    worksheet.write_with_format(total_row, 0, "合计", &summary_format).unwrap();
+    worksheet.write_with_format(total_row, 2, total_in, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 5, total_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 6, total_discounted_out, &num_format_sum).unwrap();
+    worksheet.write_with_format(total_row, 9, total_discounted_out - total_in, &num_format_sum).unwrap();
+
+    let buf = workbook.save_to_buffer().unwrap();
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"stock_summary_reimburse.xlsx\""),
         ],
         buf,
     ).into_response()
@@ -16270,7 +19555,305 @@ async fn api_query_profit_detail(axum::extract::Query(params): axum::extract::Qu
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
-async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
+// ===== 导出函数 =====
+
+async fn api_query_purchase_price_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or(""); let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
+    let mut base_sql = String::from(" FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new();
+    if !product_name.is_empty() { base_sql.push_str(" AND poi.product_name LIKE ?"); binds.push(format!("%{}%", product_name)); }
+    if !supplier_id.is_empty() { base_sql.push_str(" AND po.supplier_id = ?"); binds.push(supplier_id.to_string()); }
+    let data_sql = format!("SELECT poi.product_name, poi.spec, poi.unit, poi.unit_price, poi.quantity, po.order_date, s.name as supplier_name {} ORDER BY po.order_date DESC", base_sql);
+    let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str())); for b in &binds { query = query.bind(b); }
+    let rows = query.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("采购价格").unwrap();
+    let hf = xlsx_header_format(0x4472C4);
+    for (col, h) in ["商品名称", "规格", "供应商", "采购单价", "采购日期", "采购数量"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws.set_column_width(0, 20).unwrap(); ws.set_column_width(1, 14).unwrap(); ws.set_column_width(2, 16).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap(); ws.set_column_width(5, 14).unwrap();
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("supplier_name")).unwrap(); ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购价格查询.xlsx")
+}
+
+async fn api_query_purchase_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut supplier_sql = String::from("SELECT s.name, SUM(poi.quantity) as quantity, SUM(poi.amount) as amount FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id WHERE 1=1");
+    let mut product_sql = String::from("SELECT poi.product_name, poi.spec, SUM(poi.quantity) as quantity, SUM(poi.amount) as amount FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { supplier_sql.push_str(" AND po.order_date >= ?"); product_sql.push_str(" AND po.order_date >= ?"); binds.push(start_date.to_string()); }
+    let mut binds2 = binds.clone(); if !end_date.is_empty() { supplier_sql.push_str(" AND po.order_date <= ?"); product_sql.push_str(" AND po.order_date <= ?"); binds.push(end_date.to_string()); binds2.push(end_date.to_string()); }
+    supplier_sql.push_str(" GROUP BY s.id ORDER BY amount DESC"); product_sql.push_str(" GROUP BY poi.product_name, poi.spec ORDER BY amount DESC");
+    let mut q1 = sqlx::query(AssertSqlSafe(supplier_sql.as_str())); for b in &binds { q1 = q1.bind(b); } let supplier_rows = q1.fetch_all(pool()).await.unwrap_or_default();
+    let mut q2 = sqlx::query(AssertSqlSafe(product_sql.as_str())); for b in &binds2 { q2 = q2.bind(b); } let product_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let hf = xlsx_header_format(0x4472C4);
+    let ws1 = workbook.add_worksheet(); ws1.set_name("按供应商汇总").unwrap();
+    for (col, h) in ["供应商", "采购数量", "采购金额", "平均成本"].iter().enumerate() { ws1.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws1.set_column_width(0, 18).unwrap(); ws1.set_column_width(1, 14).unwrap(); ws1.set_column_width(2, 14).unwrap(); ws1.set_column_width(3, 14).unwrap();
+    for (i, row) in supplier_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let amt: f64 = row.get("amount"); ws1.write(r, 0, row.get::<String, _>("name")).unwrap(); ws1.write(r, 1, qty).unwrap(); ws1.write(r, 2, amt).unwrap(); ws1.write(r, 3, if qty > 0.0 { amt / qty } else { 0.0 }).unwrap(); }
+    let ws2 = workbook.add_worksheet(); ws2.set_name("按商品汇总").unwrap();
+    for (col, h) in ["商品名称", "规格", "采购数量", "采购金额", "平均单价"].iter().enumerate() { ws2.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws2.set_column_width(0, 20).unwrap(); ws2.set_column_width(1, 14).unwrap(); ws2.set_column_width(2, 14).unwrap(); ws2.set_column_width(3, 14).unwrap(); ws2.set_column_width(4, 14).unwrap();
+    for (i, row) in product_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let amt: f64 = row.get("amount"); ws2.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws2.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws2.write(r, 2, qty).unwrap(); ws2.write(r, 3, amt).unwrap(); ws2.write(r, 4, if qty > 0.0 { amt / qty } else { 0.0 }).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购汇总统计.xlsx")
+}
+
+async fn api_query_sales_price_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or(""); let purchaser_id = params.get("purchaser_id").map(|s| s.as_str()).unwrap_or("");
+    let mut base_sql = String::from(" FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new();
+    if !product_name.is_empty() { base_sql.push_str(" AND soi.product_name LIKE ?"); binds.push(format!("%{}%", product_name)); }
+    if !purchaser_id.is_empty() { base_sql.push_str(" AND so.purchaser_id = ?"); binds.push(purchaser_id.to_string()); }
+    let data_sql = format!("SELECT soi.product_name, soi.spec, soi.unit, soi.unit_price, soi.quantity, so.order_date, p.name as purchaser_name {} ORDER BY so.order_date DESC", base_sql);
+    let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str())); for b in &binds { query = query.bind(b); } let rows = query.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("销售价格").unwrap(); let hf = xlsx_header_format(0x70AD47);
+    for (col, h) in ["商品名称", "规格", "采购单位", "销售单价", "销售日期", "销售数量"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws.set_column_width(0, 20).unwrap(); ws.set_column_width(1, 14).unwrap(); ws.set_column_width(2, 16).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap(); ws.set_column_width(5, 14).unwrap();
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("purchaser_name")).unwrap(); ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "销售价格查询.xlsx")
+}
+
+async fn api_query_sales_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut purchaser_sql = String::from("SELECT p.name, SUM(soi.quantity) as quantity, SUM(soi.amount) as sales_amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1");
+    let mut product_sql = String::from("SELECT soi.product_name, soi.spec, SUM(soi.quantity) as quantity, SUM(soi.amount) as sales_amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { purchaser_sql.push_str(" AND so.order_date >= ?"); product_sql.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); }
+    let mut binds2 = binds.clone(); if !end_date.is_empty() { purchaser_sql.push_str(" AND so.order_date <= ?"); product_sql.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); binds2.push(end_date.to_string()); }
+    purchaser_sql.push_str(" GROUP BY p.id ORDER BY sales_amount DESC"); product_sql.push_str(" GROUP BY soi.product_name, soi.spec ORDER BY sales_amount DESC");
+    let mut q1 = sqlx::query(AssertSqlSafe(purchaser_sql.as_str())); for b in &binds { q1 = q1.bind(b); } let purchaser_rows = q1.fetch_all(pool()).await.unwrap_or_default();
+    let mut q2 = sqlx::query(AssertSqlSafe(product_sql.as_str())); for b in &binds2 { q2 = q2.bind(b); } let product_rows = q2.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let hf = xlsx_header_format(0x70AD47);
+    let ws1 = workbook.add_worksheet(); ws1.set_name("按采购单位汇总").unwrap();
+    for (col, h) in ["采购单位", "销售数量", "销售金额", "成本", "毛利", "毛利率"].iter().enumerate() { ws1.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws1.set_column_width(0, 18).unwrap(); ws1.set_column_width(1, 14).unwrap(); ws1.set_column_width(2, 14).unwrap(); ws1.set_column_width(3, 14).unwrap(); ws1.set_column_width(4, 14).unwrap(); ws1.set_column_width(5, 14).unwrap();
+    for (i, row) in purchaser_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let sales: f64 = row.get("sales_amount"); let cost = 0.0; let profit = sales - cost; let margin = if sales > 0.0 { profit / sales * 100.0 } else { 0.0 }; ws1.write(r, 0, row.get::<String, _>("name")).unwrap(); ws1.write(r, 1, qty).unwrap(); ws1.write(r, 2, sales).unwrap(); ws1.write(r, 3, cost).unwrap(); ws1.write(r, 4, profit).unwrap(); ws1.write(r, 5, margin).unwrap(); }
+    let ws2 = workbook.add_worksheet(); ws2.set_name("按商品汇总").unwrap();
+    for (col, h) in ["商品名称", "规格", "销售数量", "销售金额", "成本", "毛利"].iter().enumerate() { ws2.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws2.set_column_width(0, 20).unwrap(); ws2.set_column_width(1, 14).unwrap(); ws2.set_column_width(2, 14).unwrap(); ws2.set_column_width(3, 14).unwrap(); ws2.set_column_width(4, 14).unwrap(); ws2.set_column_width(5, 14).unwrap();
+    for (i, row) in product_rows.iter().enumerate() { let r = (i + 1) as u32; let qty: f64 = row.get("quantity"); let sales: f64 = row.get("sales_amount"); let cost = 0.0; let profit = sales - cost; ws2.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws2.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws2.write(r, 2, qty).unwrap(); ws2.write(r, 3, sales).unwrap(); ws2.write(r, 4, cost).unwrap(); ws2.write(r, 5, profit).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "销售汇总报表.xlsx")
+}
+
+async fn api_query_product_rank_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut top_sql = String::from("SELECT soi.product_name, soi.spec, SUM(soi.quantity) as quantity, SUM(soi.amount) as amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { top_sql.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); } if !end_date.is_empty() { top_sql.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); }
+    top_sql.push_str(" GROUP BY soi.product_name, soi.spec ORDER BY quantity DESC LIMIT 10");
+    let mut query = sqlx::query(AssertSqlSafe(top_sql.as_str())); for b in &binds { query = query.bind(b); } let rows = query.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("畅销商品TOP10").unwrap(); let hf = xlsx_header_format(0x70AD47);
+    for (col, h) in ["排名", "商品名称", "规格", "销售数量", "销售金额"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    ws.set_column_width(0, 8).unwrap(); ws.set_column_width(1, 20).unwrap(); ws.set_column_width(2, 14).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap();
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, (i + 1) as i64).unwrap(); ws.write(r, 1, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 2, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 3, row.get::<f64, _>("quantity")).unwrap(); ws.write(r, 4, row.get::<f64, _>("amount")).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "畅销商品排名.xlsx")
+}
+
+async fn api_query_reimburse_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let source_ids: Vec<i64> = sqlx::query_scalar::<_, i64>("SELECT DISTINCT source_order_id FROM consumable_allocation").fetch_all(pool()).await.unwrap_or_default();
+    let source_set: std::collections::HashSet<i64> = source_ids.into_iter().collect();
+    let mut date_cond = String::from(""); let mut binds: Vec<String> = Vec::new();
+    if !start_date.is_empty() { date_cond.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); } if !end_date.is_empty() { date_cond.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); }
+    let real_sql = format!("SELECT so.purchaser_id, p.name, SUM(soi.amount) as amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1 {} GROUP BY so.purchaser_id", date_cond);
+    let mut q = sqlx::query(AssertSqlSafe(real_sql.as_str())); for b in &binds { q = q.bind(b); } let real_rows = q.fetch_all(pool()).await.unwrap_or_default();
+    use std::collections::HashMap; let mut pmap: HashMap<i64, (String, f64, f64)> = HashMap::new();
+    for r in &real_rows { let pid = r.get::<i64,_>("purchaser_id"); let name = r.get::<String,_>("name"); let a = r.get::<f64,_>("amount"); pmap.entry(pid).or_insert((name,0.0,0.0)).1 += a; }
+    let supp_sql = format!("SELECT so.purchaser_id, p.name, SUM(osi.amount) as supp_amount FROM order_supplement_item osi JOIN sales_order so ON osi.target_order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1 {} GROUP BY so.purchaser_id", date_cond);
+    let mut q2 = sqlx::query(AssertSqlSafe(supp_sql.as_str())); for b in &binds { q2 = q2.bind(b); }
+    for r in q2.fetch_all(pool()).await.unwrap_or_default() { let pid = r.get::<i64,_>("purchaser_id"); let name = r.get::<String,_>("name"); let sa = r.get::<f64,_>("supp_amount"); pmap.entry(pid).or_insert((name,0.0,0.0)).2 += sa; }
+    if !source_set.is_empty() {
+        let src_sql = format!("SELECT so.purchaser_id, p.name, so.id as oid, SUM(soi.amount) as amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN purchaser p ON so.purchaser_id = p.id WHERE 1=1 {} GROUP BY so.id", date_cond);
+        let mut q3 = sqlx::query(AssertSqlSafe(src_sql.as_str())); for b in &binds { q3 = q3.bind(b); }
+        for r in q3.fetch_all(pool()).await.unwrap_or_default() { let oid = r.get::<i64,_>("oid"); if !source_set.contains(&oid) { continue; } let pid = r.get::<i64,_>("purchaser_id"); let name = r.get::<String,_>("name"); let a = r.get::<f64,_>("amount"); pmap.entry(pid).or_insert((name,0.0,0.0)).2 -= a; }
+    }
+    let mut by_purchaser: Vec<serde_json::Value> = pmap.values().map(|(n,r,s)| serde_json::json!({"name":n,"real_amount":r,"supplement_amount":s,"reimburse_amount":r+s})).collect();
+    by_purchaser.sort_by(|a,b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+    let mut prod_map: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    let pr = format!("SELECT soi.product_name, COALESCE(soi.spec,'') as spec, soi.order_id, soi.quantity, soi.amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id WHERE 1=1 {}", date_cond);
+    let mut q4 = sqlx::query(AssertSqlSafe(pr.as_str())); for b in &binds { q4 = q4.bind(b); }
+    for r in q4.fetch_all(pool()).await.unwrap_or_default() { let oid = r.get::<i64,_>("order_id"); if source_set.contains(&oid) { continue; } let nm = r.get::<String,_>("product_name"); let sp = r.get::<String,_>("spec"); let qty = r.get::<f64,_>("quantity"); let amt = r.get::<f64,_>("amount"); let e = prod_map.entry((nm,sp)).or_insert((0.0,0.0)); e.0 += qty; e.1 += amt; }
+    let ps = format!("SELECT osi.product_name, COALESCE(osi.spec,'') as spec, osi.quantity, osi.amount FROM order_supplement_item osi JOIN sales_order so ON osi.target_order_id = so.id WHERE 1=1 {}", date_cond);
+    let mut q5 = sqlx::query(AssertSqlSafe(ps.as_str())); for b in &binds { q5 = q5.bind(b); }
+    for r in q5.fetch_all(pool()).await.unwrap_or_default() { let nm = r.get::<String,_>("product_name"); let sp = r.get::<String,_>("spec"); let qty = r.get::<f64,_>("quantity"); let amt = r.get::<f64,_>("amount"); let e = prod_map.entry((nm,sp)).or_insert((0.0,0.0)); e.0 += qty; e.1 += amt; }
+    let mut by_product: Vec<serde_json::Value> = prod_map.iter().map(|((n,s),(q,a))| serde_json::json!({"product_name":n,"spec":s,"quantity":q,"reimburse_amount":a})).collect();
+    by_product.sort_by(|a,b| b["reimburse_amount"].as_f64().unwrap_or(0.0).partial_cmp(&a["reimburse_amount"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+    let mut workbook = Workbook::new(); let hf = xlsx_header_format(0x70AD47);
+    let ws1 = workbook.add_worksheet(); ws1.set_name("按采购单位汇总").unwrap();
+    for (c,h) in ["采购单位","真实金额","分摊增项净额","报销金额"].iter().enumerate() { ws1.write_with_format(0,c as u16,*h,&hf).unwrap(); }
+    ws1.set_column_width(0,18).unwrap(); ws1.set_column_width(1,14).unwrap(); ws1.set_column_width(2,16).unwrap(); ws1.set_column_width(3,14).unwrap();
+    for (i,item) in by_purchaser.iter().enumerate() { let r=(i+1)as u32; ws1.write(r,0,item.get("name").and_then(|v|v.as_str()).unwrap_or("")).unwrap(); ws1.write(r,1,item.get("real_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); ws1.write(r,2,item.get("supplement_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); ws1.write(r,3,item.get("reimburse_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); }
+    let ws2 = workbook.add_worksheet(); ws2.set_name("按商品汇总").unwrap();
+    for (c,h) in ["商品名称","规格","数量","报销金额"].iter().enumerate() { ws2.write_with_format(0,c as u16,*h,&hf).unwrap(); }
+    ws2.set_column_width(0,20).unwrap(); ws2.set_column_width(1,14).unwrap(); ws2.set_column_width(2,14).unwrap(); ws2.set_column_width(3,14).unwrap();
+    for (i,item) in by_product.iter().enumerate() { let r=(i+1)as u32; ws2.write(r,0,item.get("product_name").and_then(|v|v.as_str()).unwrap_or("")).unwrap(); ws2.write(r,1,item.get("spec").and_then(|v|v.as_str()).unwrap_or_default()).unwrap(); ws2.write(r,2,item.get("quantity").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); ws2.write(r,3,item.get("reimburse_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "报销口径汇总.xlsx")
+}
+
+async fn api_query_allocation_source_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or(""); let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut sql = String::from("SELECT ca.source_order_id, ca.total_amount, ca.allocated_amount, ca.remaining_balance, ca.status, so.order_no, so.order_date FROM consumable_allocation ca JOIN sales_order so ON ca.source_order_id = so.id WHERE 1=1");
+    let mut binds: Vec<String> = Vec::new(); if !start_date.is_empty() { sql.push_str(" AND so.order_date >= ?"); binds.push(start_date.to_string()); } if !end_date.is_empty() { sql.push_str(" AND so.order_date <= ?"); binds.push(end_date.to_string()); }
+    sql.push_str(" ORDER BY so.order_date DESC"); let mut q = sqlx::query(AssertSqlSafe(sql.as_str())); for b in &binds { q = q.bind(b); } let rows = q.fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("分摊来源").unwrap(); let hf = xlsx_header_format(0x70AD47);
+    for (c,h) in ["来源订单","日期","来源金额","已分摊","剩余","状态","分摊去向"].iter().enumerate() { ws.write_with_format(0,c as u16,*h,&hf).unwrap(); }
+    ws.set_column_width(0,18).unwrap(); ws.set_column_width(1,14).unwrap(); ws.set_column_width(2,14).unwrap(); ws.set_column_width(3,14).unwrap(); ws.set_column_width(4,14).unwrap(); ws.set_column_width(5,10).unwrap(); ws.set_column_width(6,30).unwrap();
+    let sm = ["未分摊","分摊中","已完成","已终止"];
+    for (i,row) in rows.iter().enumerate() { let r=(i+1)as u32; let src_id=row.get::<i64,_>("source_order_id"); let st:i64=row.get("status");
+        let tgts=sqlx::query("SELECT so.order_no, SUM(osi.amount) as amount FROM order_supplement_item osi JOIN sales_order so ON osi.target_order_id=so.id WHERE osi.source_order_id=? GROUP BY osi.target_order_id HAVING SUM(osi.amount)<>0 ORDER BY amount DESC").bind(src_id).fetch_all(pool()).await.unwrap_or_default();
+        let tstr:String=tgts.iter().map(|t| format!("{}(¥{:.2})",t.get::<String,_>("order_no"),t.get::<f64,_>("amount"))).collect::<Vec<_>>().join("、");
+        let ss=if(st as usize)<sm.len(){sm[st as usize]}else{"未知"}; ws.write(r,0,row.get::<String,_>("order_no")).unwrap(); ws.write(r,1,row.get::<String,_>("order_date")).unwrap(); ws.write(r,2,row.get::<f64,_>("total_amount")).unwrap(); ws.write(r,3,row.get::<f64,_>("allocated_amount")).unwrap(); ws.write(r,4,row.get::<f64,_>("remaining_balance")).unwrap(); ws.write(r,5,ss).unwrap(); ws.write(r,6,&tstr).unwrap(); }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "分摊来源统计.xlsx")
+}
+
+async fn api_query_overview_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let month = params.get("month").map(|s| s.as_str()).unwrap_or("");
+    let purchase_total: f64 = sqlx::query_scalar("SELECT COALESCE(SUM(po.total_amount),0) FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=?").bind(month).fetch_one(pool()).await.unwrap_or(0.0);
+    let sales_total: f64 = sqlx::query_scalar("SELECT COALESCE(SUM(so.total_amount),0) FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=?").bind(month).fetch_one(pool()).await.unwrap_or(0.0);
+    let stock_total: f64 = sqlx::query_scalar("SELECT COALESCE(SUM(i.quantity*pr.selling_price),0) FROM inventory i JOIN product pr ON i.product_id=pr.id").fetch_one(pool()).await.unwrap_or(0.0);
+    let profit_total = sales_total - purchase_total;
+    let pur_rows = sqlx::query("SELECT s.name,COALESCE(SUM(poi.amount),0) as amount,COALESCE(SUM(poi.quantity),0) as quantity FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN supplier s ON po.supplier_id=s.id WHERE strftime('%Y-%m',po.order_date)=? GROUP BY s.id,s.name ORDER BY amount DESC").bind(month).fetch_all(pool()).await.unwrap_or_default();
+    let sal_rows = sqlx::query("SELECT p.name,COALESCE(SUM(soi.amount),0) as amount,COALESCE(SUM(soi.quantity),0) as quantity FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN purchaser p ON so.purchaser_id=p.id WHERE strftime('%Y-%m',so.order_date)=? GROUP BY p.id,p.name ORDER BY amount DESC").bind(month).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new(); let hf=xlsx_header_format(0x2E75B6);
+    let ws1=workbook.add_worksheet(); ws1.set_name("汇总").unwrap();
+    for (c,h) in ["指标","金额"].iter().enumerate(){ws1.write_with_format(0,c as u16,*h,&hf).unwrap();} ws1.set_column_width(0,16).unwrap(); ws1.set_column_width(1,16).unwrap();
+    ws1.write(1,0,"总进货").unwrap(); ws1.write(1,1,purchase_total).unwrap(); ws1.write(2,0,"总销售").unwrap(); ws1.write(2,1,sales_total).unwrap(); ws1.write(3,0,"库存").unwrap(); ws1.write(3,1,stock_total).unwrap(); ws1.write(4,0,"毛利").unwrap(); ws1.write(4,1,profit_total).unwrap();
+    let ws2=workbook.add_worksheet(); ws2.set_name("采购汇总").unwrap();
+    for (c,h) in ["供应商","采购金额","数量"].iter().enumerate(){ws2.write_with_format(0,c as u16,*h,&hf).unwrap();} ws2.set_column_width(0,18).unwrap(); ws2.set_column_width(1,14).unwrap(); ws2.set_column_width(2,14).unwrap();
+    for (i,row) in pur_rows.iter().enumerate(){let r=(i+1)as u32;ws2.write(r,0,row.get::<String,_>("name")).unwrap();ws2.write(r,1,row.get::<f64,_>("amount")).unwrap();ws2.write(r,2,row.get::<f64,_>("quantity")).unwrap();}
+    let ws3=workbook.add_worksheet(); ws3.set_name("销售汇总").unwrap();
+    for (c,h) in ["采购单位","销售金额","数量"].iter().enumerate(){ws3.write_with_format(0,c as u16,*h,&hf).unwrap();} ws3.set_column_width(0,18).unwrap(); ws3.set_column_width(1,14).unwrap(); ws3.set_column_width(2,14).unwrap();
+    for (i,row) in sal_rows.iter().enumerate(){let r=(i+1)as u32;ws3.write(r,0,row.get::<String,_>("name")).unwrap();ws3.write(r,1,row.get::<f64,_>("amount")).unwrap();ws3.write(r,2,row.get::<f64,_>("quantity")).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "进销存汇总报表.xlsx")
+}
+
+async fn api_query_stock_balance_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let category_id=params.get("category_id").map(|s|s.as_str()).unwrap_or("");
+    let sql=if category_id.is_empty(){"SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? ORDER BY p.name".to_string()}
+    else{format!("SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? AND p.category_id={} ORDER BY p.name",category_id)};
+    let pattern=format!("%{}%",product_name);
+    let rows=if category_id.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(pool()).await.unwrap_or_default()}else{let cid:i64=category_id.parse().unwrap_or(0);sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).bind(cid).fetch_all(pool()).await.unwrap_or_default()};
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存余额").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["商品名称","规格","单位","库存数量","库存金额","最低库存","最高库存"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,14).unwrap();ws.set_column_width(6,14).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("product_name")).unwrap();ws.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,3,row.try_get::<f64,_>("quantity").unwrap_or(0.0)).unwrap();ws.write(r,4,row.try_get::<f64,_>("amount").unwrap_or(0.0)).unwrap();ws.write(r,5,row.try_get::<f64,_>("min_stock").unwrap_or(0.0)).unwrap();ws.write(r,6,row.try_get::<f64,_>("max_stock").unwrap_or(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "库存余额查询.xlsx")
+}
+
+async fn api_query_stock_flow_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");let product_id=params.get("product_id").and_then(|s|s.parse::<i64>().ok());
+    let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");let mut swc=String::from("WHERE 1=1");
+    if let Some(pid)=product_id{wc.push_str(&format!(" AND p.id={}",pid));swc.push_str(&format!(" AND p.id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");swc.push_str(" AND p.name LIKE ?");}
+    if!start_date.is_empty(){wc.push_str(&format!(" AND po.order_date>='{}'",start_date));swc.push_str(&format!(" AND so.order_date>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND po.order_date<='{}'",end_date));swc.push_str(&format!(" AND so.order_date<='{}'",end_date));}
+    let sql=format!("SELECT po.order_date as create_time,'采购入库' as type,p.name as product_name,p.spec,poi.quantity as in_quantity,0 as out_quantity,poi.remark FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product p ON poi.product_id=p.id {} UNION ALL SELECT so.order_date as create_time,'销售出库' as type,p.name as product_name,p.spec,0 as in_quantity,soi.quantity as out_quantity,soi.remark FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product p ON soi.product_id=p.id {} ORDER BY create_time",wc,swc);
+    let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).bind(&pattern).fetch_all(pool()).await.unwrap_or_default()};
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["日期","类型","商品名称","规格","入库数量","出库数量","备注"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,14).unwrap();ws.set_column_width(6,20).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("create_time")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,4,row.try_get::<f64,_>("in_quantity").unwrap_or(0.0)).unwrap();ws.write(r,5,row.try_get::<f64,_>("out_quantity").unwrap_or(0.0)).unwrap();ws.write(r,6,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "库存流水查询.xlsx")
+}
+
+async fn api_query_stock_warning_export() -> impl IntoResponse {
+    let low_rows=sqlx::query("SELECT p.name as product_name,p.spec,p.unit,i.quantity as current_stock,i.min_stock FROM inventory i JOIN product p ON i.product_id=p.id WHERE i.quantity<i.min_stock ORDER BY (i.min_stock-i.quantity) DESC").fetch_all(pool()).await.unwrap_or_default();
+    let high_rows=sqlx::query("SELECT p.name as product_name,p.spec,p.unit,i.quantity as current_stock,i.max_stock FROM inventory i JOIN product p ON i.product_id=p.id WHERE i.quantity>i.max_stock ORDER BY (i.quantity-i.max_stock) DESC").fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let hf=xlsx_header_format(0x2E75B6);
+    let ws1=workbook.add_worksheet();ws1.set_name("低于最低库存").unwrap();
+    for(c,h)in["商品名称","规格","单位","当前库存","最低库存","缺货数量"].iter().enumerate(){ws1.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws1.set_column_width(0,20).unwrap();ws1.set_column_width(1,14).unwrap();ws1.set_column_width(2,10).unwrap();ws1.set_column_width(3,14).unwrap();ws1.set_column_width(4,14).unwrap();ws1.set_column_width(5,14).unwrap();
+    for(i,row)in low_rows.iter().enumerate(){let r=(i+1)as u32;let cur=row.try_get::<f64,_>("current_stock").unwrap_or(0.0);let min=row.try_get::<f64,_>("min_stock").unwrap_or(0.0);ws1.write(r,0,row.get::<String,_>("product_name")).unwrap();ws1.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws1.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws1.write(r,3,cur).unwrap();ws1.write(r,4,min).unwrap();ws1.write(r,5,(min-cur).max(0.0)).unwrap();}
+    let ws2=workbook.add_worksheet();ws2.set_name("高于最高库存").unwrap();
+    for(c,h)in["商品名称","规格","单位","当前库存","最高库存","积压数量"].iter().enumerate(){ws2.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws2.set_column_width(0,20).unwrap();ws2.set_column_width(1,14).unwrap();ws2.set_column_width(2,10).unwrap();ws2.set_column_width(3,14).unwrap();ws2.set_column_width(4,14).unwrap();ws2.set_column_width(5,14).unwrap();
+    for(i,row)in high_rows.iter().enumerate(){let r=(i+1)as u32;let cur=row.try_get::<f64,_>("current_stock").unwrap_or(0.0);let max=row.try_get::<f64,_>("max_stock").unwrap_or(0.0);ws2.write(r,0,row.get::<String,_>("product_name")).unwrap();ws2.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws2.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws2.write(r,3,cur).unwrap();ws2.write(r,4,max).unwrap();ws2.write(r,5,(cur-max).max(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "库存预警.xlsx")
+}
+
+async fn api_query_slow_stock_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let days:i64=params.get("days").and_then(|s|s.parse().ok()).unwrap_or(30);
+    let rows=sqlx::query("SELECT p.id,p.name as product_name,p.spec,p.unit,i.quantity as current_stock,i.quantity*p.base_price as amount,COALESCE(soi.last_sale_date,'无') as last_sale_date FROM inventory i JOIN product p ON i.product_id=p.id LEFT JOIN (SELECT soi.product_id,MAX(so.order_date) as last_sale_date FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id GROUP BY soi.product_id) soi ON i.product_id=soi.product_id WHERE soi.last_sale_date IS NULL OR julianday('now')-julianday(soi.last_sale_date)>? ORDER BY soi.last_sale_date ASC NULLS FIRST").bind(days).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("呆滞库存").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["商品名称","规格","单位","当前库存","库存金额","最后出库日期","呆滞天数"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,16).unwrap();ws.set_column_width(6,12).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;let cur=row.try_get::<f64,_>("current_stock").unwrap_or(0.0);let amt=row.try_get::<f64,_>("amount").unwrap_or(0.0);ws.write(r,0,row.get::<String,_>("product_name")).unwrap();ws.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,3,cur).unwrap();ws.write(r,4,amt).unwrap();ws.write(r,5,row.get::<String,_>("last_sale_date")).unwrap();ws.write(r,6,days).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "呆滞库存查询.xlsx")
+}
+
+async fn api_query_income_expense_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
+    let mut df=String::new();if!start_date.is_empty(){df.push_str(&format!(" AND order_date>='{}'",start_date));}if!end_date.is_empty(){df.push_str(&format!(" AND order_date<='{}'",end_date));}
+    let sql=format!("SELECT order_date,'销售订单' as type,CAST(total_amount AS REAL) as total_amount,CAST(final_amount AS REAL) as final_amount,'收入' as direction FROM sales_order WHERE status!='cancelled'{} UNION ALL SELECT order_date,'采购订单' as type,CAST(total_amount AS REAL) as total_amount,CAST(final_amount AS REAL) as final_amount,'支出' as direction FROM purchase_order WHERE status!='cancelled'{} ORDER BY order_date",df,df);
+    let rows=sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("收支流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["日期","类型","方向","订单金额","实付金额"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("order_date")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("direction")).unwrap();ws.write(r,3,row.try_get::<f64,_>("total_amount").unwrap_or(0.0)).unwrap();ws.write(r,4,row.try_get::<f64,_>("final_amount").unwrap_or(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "收支流水查询.xlsx")
+}
+
+async fn api_query_profit_detail_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
+    let mut df=String::new();if!start_date.is_empty(){df.push_str(&format!(" AND so.order_date>='{}'",start_date));}if!end_date.is_empty(){df.push_str(&format!(" AND so.order_date<='{}'",end_date));}
+    let sql=format!("SELECT so.order_no,so.order_date,soi.product_name,CAST(soi.quantity AS REAL) as quantity,CAST(soi.unit_price AS REAL) as sale_price,COALESCE(CAST(p.purchase_price AS REAL),0) as purchase_price,(CAST(soi.unit_price AS REAL)-COALESCE(CAST(p.purchase_price AS REAL),0))*CAST(soi.quantity AS REAL) as profit,CAST(soi.amount AS REAL) as sale_amount,COALESCE(CAST(p.purchase_price AS REAL),0)*CAST(soi.quantity AS REAL) as cost_amount FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id LEFT JOIN product p ON soi.product_id=p.id WHERE so.status!='cancelled'{} ORDER BY so.order_date,so.order_no",df);
+    let rows=sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("毛利明细").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["订单号","日期","商品名称","数量","销售单价","进货价","销售金额","成本金额","毛利","毛利率"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,10).unwrap();ws.set_column_width(4,12).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,14).unwrap();ws.set_column_width(7,14).unwrap();ws.set_column_width(8,14).unwrap();ws.set_column_width(9,10).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;let qty=row.try_get::<f64,_>("quantity").unwrap_or(0.0);let sp=row.try_get::<f64,_>("sale_price").unwrap_or(0.0);let pp=row.try_get::<f64,_>("purchase_price").unwrap_or(0.0);let sa=row.try_get::<f64,_>("sale_amount").unwrap_or(0.0);let ca=row.try_get::<f64,_>("cost_amount").unwrap_or(0.0);let pf=row.try_get::<f64,_>("profit").unwrap_or(0.0);let mg=if sa>0.0{pf/sa*100.0}else{0.0};ws.write(r,0,row.get::<String,_>("order_no")).unwrap();ws.write(r,1,row.get::<String,_>("order_date")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,qty).unwrap();ws.write(r,4,sp).unwrap();ws.write(r,5,pp).unwrap();ws.write(r,6,sa).unwrap();ws.write(r,7,ca).unwrap();ws.write(r,8,pf).unwrap();ws.write(r,9,mg).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "毛利明细查询.xlsx")
+}
+
+async fn api_query_category_stats_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
+    let rows=sqlx::query("SELECT pc.id,pc.name as category_name,COALESCE((SELECT SUM(poi.quantity) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product pr ON poi.product_id=pr.id WHERE pr.category_id=pc.id AND po.order_date>=? AND po.order_date<=?),0) as purchase_quantity,COALESCE((SELECT SUM(poi.amount) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product pr ON poi.product_id=pr.id WHERE pr.category_id=pc.id AND po.order_date>=? AND po.order_date<=?),0) as purchase_amount,COALESCE((SELECT SUM(soi.quantity) FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product pr ON soi.product_id=pr.id WHERE pr.category_id=pc.id AND so.order_date>=? AND so.order_date<=?),0) as sales_quantity,COALESCE((SELECT SUM(soi.amount) FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product pr ON soi.product_id=pr.id WHERE pr.category_id=pc.id AND so.order_date>=? AND so.order_date<=?),0) as sales_amount,COALESCE((SELECT SUM(i.quantity) FROM inventory i JOIN product pr ON i.product_id=pr.id WHERE pr.category_id=pc.id),0) as stock_quantity,COALESCE((SELECT SUM(i.quantity*pr.selling_price) FROM inventory i JOIN product pr ON i.product_id=pr.id WHERE pr.category_id=pc.id),0) as stock_amount FROM category pc WHERE pc.entity_type='product' AND pc.parent_id IS NULL ORDER BY pc.id")
+    .bind(start_date).bind(end_date).bind(start_date).bind(end_date).bind(start_date).bind(end_date).bind(start_date).bind(end_date).fetch_all(pool()).await.unwrap_or_default();
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("品类统计").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["品类名称","采购数量","采购金额","销售数量","销售金额","库存数量","库存金额","毛利"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,16).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,12).unwrap();ws.set_column_width(3,12).unwrap();ws.set_column_width(4,12).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,12).unwrap();ws.set_column_width(7,12).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;let pa:f64=row.get("purchase_amount");let sa:f64=row.get("sales_amount");let mg=sa-pa;ws.write(r,0,row.get::<String,_>("category_name")).unwrap();ws.write(r,1,row.get::<f64,_>("purchase_quantity")).unwrap();ws.write(r,2,pa).unwrap();ws.write(r,3,row.get::<f64,_>("sales_quantity")).unwrap();ws.write(r,4,sa).unwrap();ws.write(r,5,row.get::<f64,_>("stock_quantity")).unwrap();ws.write(r,6,row.get::<f64,_>("stock_amount")).unwrap();ws.write(r,7,mg).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "品类进销存统计.xlsx")
+}
+
+async fn api_query_document_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let month=params.get("month").map(|s|s.as_str()).unwrap_or("");
+    let rows=sqlx::query("SELECT strftime('%Y-%m',po.order_date) as month,COUNT(DISTINCT po.id) as purchase_count,COALESCE(SUM(po.total_amount),0) as purchase_amount,COALESCE((SELECT COUNT(DISTINCT so.id) FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=strftime('%Y-%m',po.order_date)),0) as sales_count,COALESCE((SELECT SUM(so.total_amount) FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=strftime('%Y-%m',po.order_date)),0) as sales_amount FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=? GROUP BY strftime('%Y-%m',po.order_date) UNION ALL SELECT strftime('%Y-%m',so.order_date) as month,COALESCE((SELECT COUNT(DISTINCT po.id) FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=strftime('%Y-%m',so.order_date)),0) as purchase_count,COALESCE((SELECT SUM(po.total_amount) FROM purchase_order po WHERE strftime('%Y-%m',po.order_date)=strftime('%Y-%m',so.order_date)),0) as purchase_amount,COUNT(DISTINCT so.id) as sales_count,COALESCE(SUM(so.total_amount),0) as sales_amount FROM sales_order so WHERE strftime('%Y-%m',so.order_date)=? GROUP BY strftime('%Y-%m',so.order_date)").bind(month).bind(month).fetch_all(pool()).await.unwrap_or_default();
+    let mut mm:std::collections::HashMap<String,serde_json::Value>=std::collections::HashMap::new();
+    for row in &rows{let m=row.get::<String,_>("month");let pc:i64=row.get("purchase_count");let pa:f64=row.get("purchase_amount");let sc:i64=row.get("sales_count");let sa:f64=row.get("sales_amount");if let Some(e)=mm.get_mut(&m){e["purchase_count"]=serde_json::json!(std::cmp::max(e["purchase_count"].as_i64().unwrap_or(0),pc));e["purchase_amount"]=serde_json::json!(e["purchase_amount"].as_f64().unwrap_or(0.0).max(pa));e["sales_count"]=serde_json::json!(std::cmp::max(e["sales_count"].as_i64().unwrap_or(0),sc));e["sales_amount"]=serde_json::json!(e["sales_amount"].as_f64().unwrap_or(0.0).max(sa));}else{let mj=m.clone();mm.insert(mj,serde_json::json!({"month":m,"purchase_count":pc,"purchase_amount":pa,"sales_count":sc,"sales_amount":sa}));}}
+    let mut result:Vec<serde_json::Value>=mm.values().cloned().collect();result.sort_by(|a,b|a["month"].as_str().unwrap_or("").cmp(b["month"].as_str().unwrap_or("")));
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("单据汇总").unwrap();let hf=xlsx_header_format(0x2E75B6);
+    for(c,h)in["月份","采购订单数","销售订单数","采购金额","销售金额"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,12).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,14).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();
+    for(i,item)in result.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,item.get("month").and_then(|v|v.as_str()).unwrap_or("")).unwrap();ws.write(r,1,item.get("purchase_count").and_then(|v|v.as_i64()).unwrap_or(0)).unwrap();ws.write(r,2,item.get("sales_count").and_then(|v|v.as_i64()).unwrap_or(0)).unwrap();ws.write(r,3,item.get("purchase_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap();ws.write(r,4,item.get("sales_amount").and_then(|v|v.as_f64()).unwrap_or(0.0)).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "单据汇总查询.xlsx")
+}
+
+async fn api_purchase_document_list_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) }
+    } else {
+        params.get("supplier_id").and_then(|s|s.parse::<i64>().ok())
+    };
+    let document_date=params.get("document_date").map(|s|s.as_str()).unwrap_or("");
+    let mut sql="SELECT id,supplier_id,supplier_name,document_date,remark,create_at FROM purchase_document WHERE 1=1".to_string();
+    let rows=match(supplier_id,document_date.is_empty()){(Some(sid),false)=>{sql.push_str(" AND supplier_id=? AND document_date=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(sid).bind(document_date).fetch_all(pool()).await.unwrap_or_default()},(Some(sid),true)=>{sql.push_str(" AND supplier_id=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(sid).fetch_all(pool()).await.unwrap_or_default()},(None,false)=>{sql.push_str(" AND document_date=? ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).bind(document_date).fetch_all(pool()).await.unwrap_or_default()},(None,true)=>{sql.push_str(" ORDER BY create_at DESC");sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool()).await.unwrap_or_default()},};
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("采购单据").unwrap();let hf=xlsx_header_format(0x4472C4);
+    for(c,h)in["ID","供应商","单据日期","备注","创建时间"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
+    ws.set_column_width(0,8).unwrap();ws.set_column_width(1,18).unwrap();ws.set_column_width(2,14).unwrap();ws.set_column_width(3,20).unwrap();ws.set_column_width(4,20).unwrap();
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<i64,_>("id")).unwrap();ws.write(r,1,row.get::<String,_>("supplier_name")).unwrap();ws.write(r,2,row.get::<String,_>("document_date")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();ws.write(r,4,row.get::<String,_>("create_at")).unwrap();}
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购单据列表.xlsx")
+}
+
+async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): Json<SalesOrderReq>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/create").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
+    // 行级数据权限：purchaser 只能为自己绑定的采购单位创建销售单
+    if ctx.role == "purchaser" {
+        let effective_purchaser_id = if req.purchaser_id != 0 { req.purchaser_id } else { ctx.purchaser_id };
+        if ctx.purchaser_id == 0 || effective_purchaser_id != ctx.purchaser_id {
+            return (StatusCode::FORBIDDEN, "采购单位账号只能为自己创建销售单".to_string());
+        }
+    }
+
     let result = sqlx::query(
         "INSERT INTO sales_order(purchaser_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -16292,15 +19875,15 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
             let order_id = res.last_insert_rowid();
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, supplier_id, supplier_name, remark) VALUES {}",
+                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark) VALUES {}",
                     placeholders.join(", ")
                 );
                 
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for item in &req.items {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -16313,26 +19896,35 @@ async fn api_sales_order_create(Json(req): Json<SalesOrderReq>) -> impl IntoResp
                         .bind(item.quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
+                        .bind(item.pre_sale_quantity.unwrap_or(0.0))
                         .bind(item.supplier_id)
                         .bind(&item.supplier_name)
                         .bind(&item.remark);
                 }
                 let _ = query.execute(pool()).await;
             }
-            StatusCode::OK
+            log_operation(&ctx, "sales_order.create", "sales_order", &order_id.to_string(),
+                &format!("创建销售单 {}（采购单位ID={}）", req.order_no, req.purchaser_id)).await;
+            (StatusCode::OK, "创建成功".to_string())
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "创建失败".to_string()),
     }
 }
 
-async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_sales_order_list(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let keyword_pattern = parse_keyword_pattern(&params);
     
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
     
-    let purchaser_id: Option<i64> = params.get("purchaser_id").and_then(|s| s.parse().ok());
+    // 行级数据权限：purchaser 角色强制只看自己绑定的采购单位
+    let ctx = get_user_ctx(&headers).await;
+    let purchaser_id: Option<i64> = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { Some(ctx.purchaser_id) } else { Some(-1) /* 未绑定则查不到任何数据 */ }
+    } else {
+        params.get("purchaser_id").and_then(|s| s.parse().ok())
+    };
     
     // 排序处理
     let sort_field = params.get("sort_field").map(|s| s.as_str()).unwrap_or("id");
@@ -16369,7 +19961,8 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     let (sql, query_params) = if let Some(pid) = purchaser_id {
         (
             format!(
-                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name,
+                        (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
                  FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
                  WHERE so.purchaser_id = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)
                  ORDER BY {} LIMIT ? OFFSET ?",
@@ -16380,7 +19973,8 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     } else {
         (
             format!(
-                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name 
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name,
+                        (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
                  FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
                  WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
                  ORDER BY {} LIMIT ? OFFSET ?",
@@ -16412,6 +20006,7 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
             "status": row.get::<String, _>("status"),
             "remark": row.get::<Option<String>, _>("remark"),
             "purchaser_name": row.get::<String, _>("purchaser_name"),
+            "is_reimburse": row.get::<i64, _>("supplement_count") > 0,
         }))
         .collect();
     
@@ -16426,7 +20021,9 @@ async fn api_sales_order_list(axum::extract::Query(params): axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
+async fn api_sales_order_accept(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
+    let ctx = get_user_ctx(&headers).await;
+
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
                 p.name as purchaser_name, p.address as purchaser_address
@@ -16436,54 +20033,183 @@ async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
     .fetch_optional(pool())
     .await
     .unwrap_or(None);
-    
+
     if order_row.is_none() {
         return (StatusCode::NOT_FOUND, "订单不存在".to_string());
     }
-    
+
+    // 行级数据权限：仅可查看归属自己的销售单验收单
     let row = order_row.unwrap();
-    
+    let row_purchaser_id: i64 = row.get("purchaser_id");
+    if !can_access_sales_order(&ctx, row_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string());
+    }
+    let discount_rate = row.get::<f64, _>("discount_rate");
+
+    // 1) 真实明细（带分类信息，用于排序）
     let item_rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark
-         FROM sales_order_item soi WHERE soi.order_id = ?"
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+                p.category_id, pc.name as category_name, pc2.name as parent_name
+         FROM sales_order_item soi
+         LEFT JOIN product p ON soi.product_id = p.id
+         LEFT JOIN category pc ON p.category_id = pc.id
+         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+         WHERE soi.order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
     .await
     .unwrap_or_default();
 
-    let items: Vec<serde_json::Value> = item_rows
-        .iter()
-        .map(|r| {
-            let food_name = r.get::<Option<String>, _>("alias2").unwrap_or_default();
-            let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
-            let remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
+    use std::collections::HashMap;
+    let mut item_map: HashMap<i64, (i64, String, String, String, f64, f64, f64, String, i64)> = HashMap::new(); // sort_key, food_name, spec, unit, unit_price, quantity, amount, remark, original_id
+    // product_id -> 真实明细行 id，用于分摊增项 target_order_item_id 失效时回退匹配
+    let mut product_to_key: HashMap<i64, i64> = HashMap::new();
+    for r in &item_rows {
+        let rid = r.get::<i64, _>("id");
+        let pid = r.get::<i64, _>("product_id");
+        product_to_key.entry(pid).or_insert(rid);
+        let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+        let product_name = r.get::<String, _>("product_name");
+        let food_name = if alias2.is_empty() {
+            product_name.clone()
+        } else {
+            format!("{}({})", product_name, alias2)
+        };
+        let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
+        let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        let original_remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
+        let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
+        let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
+        let sort_key = get_category_sort_key(&category_name, &parent_name);
+        item_map.insert(rid, (sort_key, food_name, spec, unit, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), original_remark, rid));
+    }
+
+    // 2) 合并分摊增项（与验收单导出 Excel 一致的逻辑）
+    let supplement_rows = sqlx::query(
+        "SELECT id, target_order_id, source_order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, amount, operation_type, target_order_item_id
+         FROM order_supplement_item WHERE target_order_id = ?"
+    )
+    .bind(id)
+    .fetch_all(pool())
+    .await
+    .unwrap_or_default();
+
+    for r in &supplement_rows {
+        let op_type = r.get::<String, _>("operation_type");
+        let target_item_id = r.get::<Option<i64>, _>("target_order_item_id");
+        let supp_product_id = r.get::<i64, _>("product_id");
+        let qty = r.get::<f64, _>("quantity");
+        let amt = r.get::<f64, _>("amount");
+        let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
+        let product_name = r.get::<String, _>("product_name");
+
+        // 解析目标明细行 key：优先用 target_order_item_id，失效时用 product_id 回退匹配
+        let resolved_key: Option<i64> = match target_item_id {
+            Some(tid) if item_map.contains_key(&tid) => Some(tid),
+            _ => product_to_key.get(&supp_product_id).copied(),
+        };
+
+        // 替换-冲减：负数金额，若归零则移除
+        if op_type == "replace_remove" {
+            if let Some(tid) = resolved_key {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.6 + amt;
+                    if new_qty.abs() < 0.001 || new_amt.abs() < 0.001 {
+                        item_map.remove(&tid);
+                    } else {
+                        entry.4 = new_qty;
+                        entry.6 = new_amt;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 追加数量：叠加到原明细
+        if op_type == "increase_quantity" {
+            if let Some(tid) = resolved_key {
+                if let Some(entry) = item_map.get_mut(&tid) {
+                    let new_qty = entry.4 + qty;
+                    let new_amt = entry.6 + amt;
+                    let new_remark = format!("{}（含增项+{}）", entry.7, qty);
+                    entry.4 = new_qty;
+                    entry.6 = new_amt;
+                    entry.7 = new_remark;
+                }
+            }
+        } else {
+            // new_item 或 replace_add：作为新明细
+            let food_name = if alias2.is_empty() { product_name.clone() } else { format!("{}({})", product_name, alias2) };
+            let unit = r.get::<String, _>("unit");
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            // 通过 product_id 反查分类名做排序
+            let category_query = sqlx::query(
+                "SELECT pc.name as category_name, pc2.name as parent_name
+                 FROM product p
+                 LEFT JOIN category pc ON p.category_id = pc.id
+                 LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+                 WHERE p.id = ?"
+            )
+            .bind(r.get::<i64, _>("product_id"))
+            .fetch_optional(pool())
+            .await
+            .ok()
+            .flatten();
+            let (cat_name, parent_name) = if let Some(cr) = category_query {
+                (cr.get::<Option<String>, _>("category_name").unwrap_or_default(),
+                 cr.get::<Option<String>, _>("parent_name").unwrap_or_default())
+            } else {
+                (String::new(), String::new())
+            };
+            let sort_key = get_category_sort_key(&cat_name, &parent_name);
+            let remark = if op_type == "replace_add" {
+                spec.clone()
+            } else {
+                if spec.is_empty() { "[增项]".to_string() } else { format!("{}; [增项]", spec) }
+            };
+            item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, spec, unit, r.get::<f64, _>("unit_price"), qty, amt, remark, 0));
+        }
+    }
+
+    let mut items_vec: Vec<_> = item_map.into_values().collect();
+    items_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // 3) 按合并后明细重算验收金额
+    let accept_total_amount: f64 = items_vec.iter().map(|item| item.6).sum();
+    let accept_final_amount = accept_total_amount * (1.0 - discount_rate / 100.0);
+
+    // 4) 输出 JSON（字段名与原接口一致）
+    let items: Vec<serde_json::Value> = items_vec
+        .into_iter()
+        .map(|(_sort_key, food_name, _spec, unit, unit_price, quantity, amount, remark, original_id)| {
             serde_json::json!({
-                "id": r.get::<i64, _>("id"),
-                "product_id": r.get::<i64, _>("product_id"),
-                "product_name": r.get::<String, _>("product_name"),
-                "food_name": if food_name.is_empty() { r.get::<String, _>("product_name") } else { food_name },
-                "alias2": r.get::<Option<String>, _>("alias2"),
+                "id": original_id,
+                "product_id": 0,
+                "product_name": food_name.clone(),
+                "food_name": food_name,
+                "alias2": "",
                 "spec": unit,
                 "unit": unit,
-                "unit_price": r.get::<f64, _>("unit_price"),
-                "quantity": r.get::<f64, _>("quantity"),
-                "amount": r.get::<f64, _>("amount"),
+                "unit_price": unit_price,
+                "quantity": quantity,
+                "amount": amount,
                 "remark": remark,
             })
         })
         .collect();
-    
+
     let supplier_name = "湖南食全味美餐饮管理有限公司".to_string();
     let car_no = "湘A·NY360".to_string();
-    
+
     let accept_data = serde_json::json!({
         "id": row.get::<i64, _>("id"),
         "order_no": row.get::<String, _>("order_no"),
         "order_date": row.get::<String, _>("order_date"),
-        "total_amount": row.get::<f64, _>("total_amount"),
-        "discount_rate": row.get::<f64, _>("discount_rate"),
-        "final_amount": row.get::<f64, _>("final_amount"),
+        "total_amount": accept_total_amount,
+        "discount_rate": discount_rate,
+        "final_amount": accept_final_amount,
         "remark": row.get::<Option<String>, _>("remark"),
         "purchaser_name": row.get::<String, _>("purchaser_name"),
         "purchaser_address": row.get::<Option<String>, _>("purchaser_address"),
@@ -16491,7 +20217,7 @@ async fn api_sales_order_accept(Path(id): Path<i64>) -> impl IntoResponse {
         "car_no": car_no,
         "items": items,
     });
-    
+
     (StatusCode::OK, serde_json::to_string(&accept_data).unwrap())
 }
 
@@ -17537,13 +21263,7 @@ async fn page_supplement() -> Html<String> {
                 if (pendingReplaceLines.length === 0) { alert('请至少添加一条替换商品'); return; }
 
                 const src = targetOrderDetails[idx];
-                const origAmount = src.amount;
-                const replaceTotal = pendingReplaceLines.reduce((s, l) => s + l.amount, 0);
-                const diff = replaceTotal - origAmount;
-                if (Math.abs(diff) > 5.0) {
-                    alert(`替换总金额 ${replaceTotal.toFixed(2)} 元与原明细 ${origAmount.toFixed(2)} 元差额 ${diff.toFixed(2)} 元，超过±5元限制`);
-                    return;
-                }
+                // 添加时不立即校验替换差额，允许组合多条后统一在"保存增项"时检查
 
                 const allocDate = document.getElementById('allocateDateInput').value;
                 const groupTag = 'RPL' + Date.now();
@@ -17563,7 +21283,7 @@ async fn page_supplement() -> Html<String> {
                     unit: src.unit || '',
                     unit_price: src.unit_price,
                     quantity: -src.quantity,
-                    amount: -origAmount,
+                    amount: -src.amount,
                     allocate_date: allocDate,
                     operation_type: 'replace_remove',
                     target_order_item_id: src.id,
@@ -17765,11 +21485,7 @@ async fn page_supplement() -> Html<String> {
                     targetItemId = item.id;
                 }
 
-                const currentAllocSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
-                if (amount > allocationSummary.remaining_balance - currentAllocSum + 5.0) {
-                    alert('增项金额不能超过未分摊余额（允许上浮 5 元尾差）');
-                    return;
-                }
+                // 添加时不立即校验金额，允许组合多条增项；统一在"保存增项"时校验差额（上下 5 元）
 
                 pendingSupplements.push({
                     id: null,
@@ -17799,12 +21515,19 @@ async fn page_supplement() -> Html<String> {
 
             function updateBalanceWarning() {
                 const pendingSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
-                const remaining = allocationSummary ? allocationSummary.remaining_balance - pendingSum : 0;
+                const total = allocationSummary ? allocationSummary.total_amount : 0;
+                const allocated = allocationSummary ? allocationSummary.allocated_amount : 0;
+                const remainingBalance = allocationSummary ? allocationSummary.remaining_balance : 0;
+                // 预计总分摊 = 已分摊(历史已保存) + 本次待保存净额(含正负)
+                const projected = allocated + pendingSum;
+                // 超额 = 预计总分摊 - 耗材总额（等价于 pendingSum - remaining_balance）
+                const over = projected - total;
                 const warn = document.getElementById('balanceWarning');
-                if (remaining < 0) {
-                    warn.textContent = `超出余额 ${Math.abs(remaining).toFixed(2)} 元`;
+                if (Math.abs(over) > 0.005) {
+                    warn.textContent = `耗材总额 ${total.toFixed(2)}｜已分摊 ${allocated.toFixed(2)}｜剩余 ${remainingBalance.toFixed(2)}｜本次 ${pendingSum.toFixed(2)}｜预计总分摊 ${projected.toFixed(2)}（${over > 0 ? '超额' : '结余'} ${Math.abs(over).toFixed(2)} 元，保存时校验）`;
+                    warn.className = 'text-muted ml-2';
                 } else {
-                    warn.textContent = `剩余可分摊: ${remaining.toFixed(2)} 元`;
+                    warn.textContent = `耗材总额 ${total.toFixed(2)}｜已分摊 ${allocated.toFixed(2)}｜本次 ${pendingSum.toFixed(2)}｜预计总分摊 ${projected.toFixed(2)}（平衡）`;
                     warn.className = 'text-success ml-2';
                 }
             }
@@ -17929,6 +21652,24 @@ async fn page_supplement() -> Html<String> {
                     alert('没有待保存的增项');
                     return;
                 }
+                // 保存前校验分摊总额（上下 5 元尾差）
+                const pendingSum = toSave.reduce((sum, s) => sum + s.amount, 0);
+                const total_amount = allocationSummary ? allocationSummary.total_amount : 0;
+                const allocated_amount = allocationSummary ? allocationSummary.allocated_amount : 0;
+                const remaining_balance = allocationSummary ? allocationSummary.remaining_balance : 0;
+                const projected = allocated_amount + pendingSum;  // 预计总分摊
+                const diff = projected - total_amount;            // 与耗材总额的差额
+                if (Math.abs(diff) > 5.0) {
+                    alert(`保存失败：预计总分摊金额超出耗材总额 ${diff.toFixed(2)} 元（超出±5元限制）。` +
+                          `\n\n耗材总额: ${total_amount.toFixed(2)} 元` +
+                          `\n已分摊: ${allocated_amount.toFixed(2)} 元` +
+                          `\n剩余余额: ${remaining_balance.toFixed(2)} 元` +
+                          `\n本次待保存: ${pendingSum.toFixed(2)} 元` +
+                          `\n预计总分摊: ${projected.toFixed(2)} 元` +
+                          `\n超额: ${diff.toFixed(2)} 元` +
+                          `\n\n请调整增项后再保存。`);
+                    return;
+                }
                 for (const item of toSave) {
                     await fetch('/api/supplement/create', {
                         method: 'POST',
@@ -17937,6 +21678,9 @@ async fn page_supplement() -> Html<String> {
                     });
                 }
                 alert('增项保存成功');
+                // 保存成功后立即清空 pending 列表，避免残留条目被重复计入或重复保存
+                pendingSupplements = [];
+                renderPendingSupplements();
                 if (selectedConsumableOrder) {
                     await loadAllocationSummary(selectedConsumableOrder.id);
                     await loadAllocationOrders(selectedConsumableOrder.id);
@@ -17945,6 +21689,8 @@ async fn page_supplement() -> Html<String> {
                     await loadCompareData(selectedTargetOrder.id);
                 }
                 await loadOrdersByPurchaser();
+                // 数据刷新后更新标签，显示保存后的整体分摊状态
+                updateBalanceWarning();
             }
 
             function resetOrderSelection() {
@@ -17987,14 +21733,22 @@ async fn page_supplement() -> Html<String> {
     Html(layout_html("耗材分摊管理", "supplement", content))
 }
 
-async fn api_sales_order_by_purchaser(Path(purchaser_id): Path<i64>) -> impl IntoResponse {
+async fn api_sales_order_by_purchaser(headers: axum::http::HeaderMap, Path(purchaser_id): Path<i64>) -> impl IntoResponse {
+    // 行级数据权限：purchaser 角色只能查自己绑定的采购单位
+    let ctx = get_user_ctx(&headers).await;
+    let effective_purchaser_id = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { ctx.purchaser_id } else { -1 }
+    } else {
+        purchaser_id
+    };
+
     let orders = sqlx::query(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount as discount_total, so.status,
                 p.name as purchaser_name, so.purchaser_id
          FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id
          WHERE so.purchaser_id = ? ORDER BY so.order_date DESC"
     )
-    .bind(purchaser_id)
+    .bind(effective_purchaser_id)
     .fetch_all(pool())
     .await
     .unwrap_or_default();
@@ -18342,25 +22096,25 @@ async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> impl 
 
     match result {
         Ok(res) => {
-            // replace_remove 是替换操作中的冲减记录（负数金额），不消耗分摊余额
-            if req.operation_type != "replace_remove" {
-                let _ = sqlx::query(
-                    "UPDATE consumable_allocation SET allocated_amount = allocated_amount + ?, remaining_balance = remaining_balance - ?, status = CASE WHEN remaining_balance - ? <= 0 THEN 2 ELSE 1 END WHERE source_order_id = ?"
-                )
-                .bind(req.amount)
-                .bind(req.amount)
-                .bind(req.amount)
-                .bind(req.source_order_id)
-                .execute(pool())
-                .await;
-                
-                let _ = sqlx::query(
-                    "UPDATE consumable_allocation SET completed_at = datetime('now') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
-                )
-                .bind(req.source_order_id)
-                .execute(pool())
-                .await;
-            }
+            // 所有操作类型（含 replace_remove 冲减负数）都更新分摊余额：
+            // 正数(换入/追加/新增)消耗余额，负数(冲减)释放余额，保证账目平衡
+            let _ = sqlx::query(
+                "UPDATE consumable_allocation SET allocated_amount = allocated_amount + ?, remaining_balance = remaining_balance - ?, status = CASE WHEN remaining_balance - ? <= 0 THEN 2 ELSE 1 END WHERE source_order_id = ?"
+            )
+            .bind(req.amount)
+            .bind(req.amount)
+            .bind(req.amount)
+            .bind(req.source_order_id)
+            .execute(pool())
+            .await;
+
+            // 冲减后若余额回升（remaining>0），需从"已完成"回退到"分摊中"并清空完结时间
+            let _ = sqlx::query(
+                "UPDATE consumable_allocation SET completed_at = datetime('now') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
+            )
+            .bind(req.source_order_id)
+            .execute(pool())
+            .await;
 
             (StatusCode::OK, serde_json::to_string(&serde_json::json!({ "id": res.last_insert_rowid() })).unwrap())
         }
@@ -18370,7 +22124,7 @@ async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> impl 
 
 async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, so.order_no as source_order_no
+        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id, so.order_no as source_order_no
          FROM order_supplement_item soi LEFT JOIN sales_order so ON soi.source_order_id = so.id
          WHERE soi.target_order_id = ? ORDER BY soi.allocate_date DESC"
     )
@@ -18396,29 +22150,94 @@ async fn api_supplement_list_by_target(Path(order_id): Path<i64>) -> impl IntoRe
             "quantity": row.get::<f64, _>("quantity"),
             "amount": row.get::<f64, _>("amount"),
             "allocate_date": row.get::<String, _>("allocate_date"),
+            "operation_type": row.get::<String, _>("operation_type"),
+            "target_order_item_id": row.get::<Option<i64>, _>("target_order_item_id"),
         })
     }).collect();
 
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
-async fn api_adjusted_orders() -> impl IntoResponse {
-    // 列出所有存在自调整记录（target_order_id == source_order_id）的订单
-    let rows = sqlx::query(
+async fn api_adjusted_orders(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 列出所有收到分摊增项/调整的目标订单（target_order_id 指向该订单即视为有变更）
+    let page = params.get("page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).max(1);
+    let page_size = params.get("page_size").and_then(|v| v.parse::<i64>().ok()).unwrap_or(10).clamp(1, 100);
+    let keyword = params.get("keyword").cloned().unwrap_or_default();
+    let purchaser_id = params.get("purchaser_id").and_then(|v| v.parse::<i64>().ok());
+    let sort_order = params.get("sort_order").cloned().unwrap_or_default();
+    let offset = (page - 1) * page_size;
+
+    // 动态筛选条件（参数化绑定）
+    let mut conds: Vec<String> = Vec::new();
+    let mut bind_kw: Option<String> = None;
+    let mut bind_pid: Option<i64> = None;
+    if !keyword.trim().is_empty() {
+        bind_kw = Some(format!("%{}%", keyword.trim()));
+        conds.push("so.order_no LIKE ?".to_string());
+    }
+    if let Some(pid) = purchaser_id {
+        bind_pid = Some(pid);
+        conds.push("so.purchaser_id = ?".to_string());
+    }
+    let cond_sql = if conds.is_empty() { String::new() } else { format!(" AND {}", conds.join(" AND ")) };
+
+    // 总数
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM (
+            SELECT so.id FROM sales_order so
+            INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
+            WHERE 1=1{} GROUP BY so.id
+        ) t", cond_sql
+    );
+    let mut count_q = sqlx::query(AssertSqlSafe(count_sql.as_str()));
+    if let Some(kw) = &bind_kw { count_q = count_q.bind(kw); }
+    if let Some(pid) = bind_pid { count_q = count_q.bind(pid); }
+    let total: i64 = count_q.fetch_one(pool()).await.map(|r| r.get::<i64, _>(0)).unwrap_or(0);
+
+    // 合计（所有匹配订单）
+    let sum_sql = format!(
+        "SELECT COALESCE(SUM(sub.total_amount), 0), COALESCE(SUM(sub.adjust_amount), 0)
+         FROM (
+            SELECT so.id, so.total_amount, COALESCE(SUM(osi.amount), 0) as adjust_amount
+            FROM sales_order so
+            INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
+            WHERE 1=1{} GROUP BY so.id, so.total_amount
+         ) sub", cond_sql
+    );
+    let mut sum_q = sqlx::query(AssertSqlSafe(sum_sql.as_str()));
+    if let Some(kw) = &bind_kw { sum_q = sum_q.bind(kw); }
+    if let Some(pid) = bind_pid { sum_q = sum_q.bind(pid); }
+    let (sum_real, sum_adjust) = match sum_q.fetch_one(pool()).await {
+        Ok(r) => (r.get::<f64, _>(0), r.get::<f64, _>(1)),
+        Err(_) => (0.0, 0.0),
+    };
+
+    // 排序：点击"订单日期"列头时按订单日期升/降序，否则默认按最近调整日
+    let sort_sql = if sort_order == "asc" || sort_order == "desc" {
+        format!("ORDER BY so.order_date {}, MAX(osi.allocate_date) DESC, so.order_no DESC", sort_order)
+    } else {
+        "ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC".to_string()
+    };
+
+    // 分页列表
+    let list_sql = format!(
         "SELECT so.id, so.order_no, so.order_date, so.total_amount,
-                p.name as purchaser_name,
+                p.name as purchaser_name, so.purchaser_id,
                 COALESCE(SUM(osi.amount), 0) as adjust_amount,
                 COUNT(osi.id) as adjust_count,
                 MAX(osi.allocate_date) as last_adjust_date
          FROM sales_order so
-         INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id AND osi.source_order_id = so.id
+         INNER JOIN order_supplement_item osi ON osi.target_order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
-         GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name
-         ORDER BY MAX(osi.allocate_date) DESC, so.order_no DESC"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         WHERE 1=1{}
+         GROUP BY so.id, so.order_no, so.order_date, so.total_amount, p.name, so.purchaser_id
+         {}
+         LIMIT ? OFFSET ?", cond_sql, sort_sql
+    );
+    let mut list_q = sqlx::query(AssertSqlSafe(list_sql.as_str()));
+    if let Some(kw) = &bind_kw { list_q = list_q.bind(kw); }
+    if let Some(pid) = bind_pid { list_q = list_q.bind(pid); }
+    let rows = list_q.bind(page_size).bind(offset).fetch_all(pool()).await.unwrap_or_default();
 
     let items: Vec<serde_json::Value> = rows.iter().map(|row| {
         let total: f64 = row.get::<f64, _>("total_amount");
@@ -18428,6 +22247,7 @@ async fn api_adjusted_orders() -> impl IntoResponse {
             "order_no": row.get::<String, _>("order_no"),
             "order_date": row.get::<String, _>("order_date"),
             "purchaser_name": row.get::<Option<String>, _>("purchaser_name").unwrap_or_default(),
+            "purchaser_id": row.get::<i64, _>("purchaser_id"),
             "total_amount": total,
             "adjust_amount": adjust,
             "adjusted_total": total + adjust,
@@ -18436,7 +22256,17 @@ async fn api_adjusted_orders() -> impl IntoResponse {
         })
     }).collect();
 
-    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+    let resp = serde_json::json!({
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_real_amount": sum_real,
+        "total_adjust_amount": sum_adjust,
+        "total_adjusted_amount": sum_real + sum_adjust,
+        "items": items,
+    });
+
+    (StatusCode::OK, resp.to_string())
 }
 
 async fn api_supplement_list_by_source(Path(order_id): Path<i64>) -> impl IntoResponse {
@@ -18490,7 +22320,7 @@ async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
     let r = row.unwrap();
     let source_order_id: i64 = r.get("source_order_id");
     let amount: f64 = r.get("amount");
-    let operation_type: String = r.get("operation_type");
+    let _operation_type: String = r.get("operation_type");
 
     let result = sqlx::query("DELETE FROM order_supplement_item WHERE id = ?")
         .bind(id)
@@ -18500,34 +22330,34 @@ async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
     match result {
         Ok(res) => {
             if res.rows_affected() > 0 {
-                // replace_remove 记录删除时不回滚分摊金额（创建时也未计入）
-                if operation_type != "replace_remove" {
-                    let _ = sqlx::query(
-                        "UPDATE consumable_allocation SET allocated_amount = allocated_amount - ?, remaining_balance = remaining_balance + ?, status = CASE WHEN remaining_balance + ? < total_amount THEN 1 ELSE 0 END WHERE source_order_id = ? AND status != 3"
-                    )
-                    .bind(amount)
-                    .bind(amount)
-                    .bind(amount)
-                    .bind(source_order_id)
-                    .execute(pool())
-                    .await;
+                // 所有操作类型（含 replace_remove 冲减负数）都回滚分摊金额：
+                // 正数(换入/追加/新增)回滚时 allocated 减回、remaining 加回；
+                // 负数(冲减)回滚时 allocated 加回、remaining 减回（与创建时反向）
+                let _ = sqlx::query(
+                    "UPDATE consumable_allocation SET allocated_amount = allocated_amount - ?, remaining_balance = remaining_balance + ?, status = CASE WHEN remaining_balance + ? < total_amount THEN 1 ELSE 0 END WHERE source_order_id = ? AND status != 3"
+                )
+                .bind(amount)
+                .bind(amount)
+                .bind(amount)
+                .bind(source_order_id)
+                .execute(pool())
+                .await;
 
-                    let _ = sqlx::query(
-                        "UPDATE consumable_allocation SET completed_at = NULL WHERE source_order_id = ? AND status = 2 AND completed_at IS NOT NULL"
-                    )
-                    .bind(source_order_id)
-                    .execute(pool())
-                    .await;
+                let _ = sqlx::query(
+                    "UPDATE consumable_allocation SET completed_at = NULL WHERE source_order_id = ? AND status = 2 AND completed_at IS NOT NULL"
+                )
+                .bind(source_order_id)
+                .execute(pool())
+                .await;
 
-                    // 若已分摊金额已归零，则删除该分摊方案，回到"未分摊"初始态，
-                    // 允许重新勾选明细并再次初始化分摊
-                    let _ = sqlx::query(
-                        "DELETE FROM consumable_allocation WHERE source_order_id = ? AND status != 3 AND allocated_amount <= 0.0001"
-                    )
-                    .bind(source_order_id)
-                    .execute(pool())
-                    .await;
-                }
+                // 若已分摊金额已归零，则删除该分摊方案，回到"未分摊"初始态，
+                // 允许重新勾选明细并再次初始化分摊
+                let _ = sqlx::query(
+                    "DELETE FROM consumable_allocation WHERE source_order_id = ? AND status != 3 AND allocated_amount <= 0.0001"
+                )
+                .bind(source_order_id)
+                .execute(pool())
+                .await;
 
                 (StatusCode::OK, "回滚成功").into_response()
             } else {
@@ -18701,7 +22531,53 @@ async fn api_supplement_compare(Path(order_id): Path<i64>) -> impl IntoResponse 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse {
+// 导出报销单（报销口径）：合并分摊增项后的明细
+async fn api_sales_order_accept_excel(
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = params.get("force").map(|s| s == "1").unwrap_or(false);
+    match check_sales_order_access(&headers, id).await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    build_accept_excel(id, true, force).await.into_response()
+}
+
+// 导出验收单（真实口径）：真实账套明细，不合并分摊增项
+async fn api_sales_order_real_excel(
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = params.get("force").map(|s| s == "1").unwrap_or(false);
+    match check_sales_order_access(&headers, id).await {
+        Err(e) => return e.into_response(),
+        Ok(_) => {}
+    }
+    build_accept_excel(id, false, force).await.into_response()
+}
+
+/// 校验用户是否有权查看/导出指定销售单（行级数据权限）
+async fn check_sales_order_access(
+    headers: &axum::http::HeaderMap,
+    id: i64,
+) -> Result<(), (StatusCode, String)> {
+    let ctx = get_user_ctx(headers).await;
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return Err((StatusCode::FORBIDDEN, "您没有权限查看此订单".to_string()));
+    }
+    Ok(())
+}
+
+// reimburse=true 报销口径（合并分摊增项）；false 真实口径（真实账套）
+async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoResponse {
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
                 p.name as purchaser_name, p.address as purchaser_address
@@ -18728,7 +22604,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     let car_no = "湘A·NY360".to_string();
 
     let item_rows = sqlx::query(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.category_id, pc.name as category_name, pc.parent_id, pc2.name as parent_name
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          LEFT JOIN category pc ON p.category_id = pc.id
@@ -18740,50 +22616,98 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
     .await
     .unwrap_or_default();
 
-    let supplement_rows = sqlx::query(
-        "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
-                pc.name as category_name, pc2.name as parent_name
-         FROM order_supplement_item soi
-         LEFT JOIN product p ON soi.product_id = p.id
-         LEFT JOIN category pc ON p.category_id = pc.id
-         LEFT JOIN category pc2 ON pc.parent_id = pc2.id
-         WHERE soi.target_order_id = ?"
-    )
-    .bind(id)
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+    // 检查是否有金额为零的明细，存在则禁止导出
+    if !force {
+        let zero_amount_items: Vec<_> = item_rows.iter()
+            .filter(|r| {
+                let amount: f64 = r.get("amount");
+                amount.abs() < 0.001
+            })
+            .collect();
+        if !zero_amount_items.is_empty() {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                serde_json::to_string(&serde_json::json!({
+                    "error": true,
+                    "count": zero_amount_items.len(),
+                    "message": format!("订单中有 {} 条明细金额为零，不允许导出，请先调整后再试", zero_amount_items.len())
+                })).unwrap(),
+            ).into_response();
+        }
+    }
+
+    // 真实口径不合并分摊增项，仅报销口径需要
+    let supplement_rows = if reimburse {
+        sqlx::query(
+            "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+                    pc.name as category_name, pc2.name as parent_name
+             FROM order_supplement_item soi
+             LEFT JOIN product p ON soi.product_id = p.id
+             LEFT JOIN category pc ON p.category_id = pc.id
+             LEFT JOIN category pc2 ON pc.parent_id = pc2.id
+             WHERE soi.target_order_id = ?"
+        )
+        .bind(id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     use std::collections::HashMap;
     let mut item_map: HashMap<i64, (i64, String, String, f64, f64, f64, String)> = HashMap::new();
+    // product_id -> 真实明细行 id，用于分摊增项 target_order_item_id 失效时回退匹配
+    let mut product_to_key: HashMap<i64, i64> = HashMap::new();
     for r in &item_rows {
         let rid = r.get::<i64, _>("id");
+        let pid = r.get::<i64, _>("product_id");
+        product_to_key.entry(pid).or_insert(rid);
         let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
         let product_name = r.get::<String, _>("product_name");
         let food_name = if alias2.is_empty() {
             product_name
         } else {
-            format!("{}({})", product_name, alias2)
+            alias2
         };
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
-        let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
+        // 订单明细的 unit 为空时，回退到商品表的基础单位 base_unit
+        let unit_for_spec = if !unit.is_empty() {
+            unit
+        } else {
+            r.get::<Option<String>, _>("product_base_unit").unwrap_or_default()
+        };
+        let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        if spec.is_empty() {
+            spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
+        }
         let original_remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
-        let remark = if spec.is_empty() { original_remark } else if original_remark.is_empty() { spec } else { format!("{}; {}", spec, original_remark) };
+        let remark = if spec.is_empty() { original_remark } else if original_remark.is_empty() { spec.clone() } else { format!("{}; {}", spec, original_remark) };
         let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
-        item_map.insert(rid, (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark));
+        item_map.insert(rid, (sort_key, food_name, unit_for_spec, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark));
     }
 
     for r in &supplement_rows {
         let op_type = r.get::<String, _>("operation_type");
         let target_item_id = r.get::<Option<i64>, _>("target_order_item_id");
+        let supp_product_id = r.get::<i64, _>("product_id");
         let qty = r.get::<f64, _>("quantity");
         let amt = r.get::<f64, _>("amount");
 
+        // 解析目标明细行 key：优先用 target_order_item_id，失效时用 product_id 回退匹配
+        // （销售订单更新会 DELETE+INSERT 导致 sales_order_item.id 变化，旧 target_order_item_id 会失效）
+        let resolved_key: Option<i64> = match target_item_id {
+            Some(tid) if item_map.contains_key(&tid) => Some(tid),
+            _ => product_to_key.get(&supp_product_id).copied(),
+        };
+
         // 替换-冲减：不导出（原被替换商品也需从导出中扣除）
         if op_type == "replace_remove" {
-            if let Some(tid) = target_item_id {
+            if let Some(tid) = resolved_key {
                 if let Some(entry) = item_map.get_mut(&tid) {
                     let new_qty = entry.4 + qty;
                     let new_amt = entry.5 + amt;
@@ -18799,7 +22723,7 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
         }
 
         if op_type == "increase_quantity" {
-            if let Some(tid) = target_item_id {
+            if let Some(tid) = resolved_key {
                 if let Some(entry) = item_map.get_mut(&tid) {
                     let new_qty = entry.4 + qty;
                     let new_amt = entry.5 + amt;
@@ -18811,20 +22735,33 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
             // new_item 或 replace_add：作为新明细导出，按商品类别归类排序
             let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
             let product_name = r.get::<String, _>("product_name");
-            let food_name = if alias2.is_empty() { product_name } else { format!("{}({})", product_name, alias2) };
-            let unit = r.get::<String, _>("unit");
-            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let food_name = if alias2.is_empty() { product_name } else { alias2 };
+            // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
+            // 优先取分摊增项的 unit，为空时回退到商品表的基础单位 base_unit
+            let unit = {
+                let u = r.get::<String, _>("unit");
+                if !u.is_empty() {
+                    u
+                } else {
+                    r.get::<Option<String>, _>("product_base_unit").unwrap_or_default()
+                }
+            };
+            let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            if spec.is_empty() {
+                spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
+            }
             let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
             let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
             let sort_key = get_category_sort_key(&category_name, &parent_name);
             let remark = if op_type == "replace_add" {
                 // 替换换入：按类别正常导出，不额外标记
-                spec
+                spec.clone()
             } else {
                 // 普通新增增项：保留标记
                 let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
                 if spec.is_empty() { format!("[增项] {}", source_remark) } else { format!("{}; [增项] {}", spec, source_remark) }
             };
+            // 规格列（C列）填单位（打印模板的"规格"列实际是单位列）
             item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
         }
     }
@@ -18868,7 +22805,9 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
             .set_font_size(10)
             .set_align(FormatAlign::Left)
             .set_align(FormatAlign::VerticalCenter)
-            .set_border(FormatBorder::Thin);
+            .set_border(FormatBorder::Thin)
+            // .set_text_wrap();// 自动换行
+            .set_shrink();// 自动缩放
 
         let cell_right_format = Format::new()
             .set_font_size(10)
@@ -18905,16 +22844,16 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
             .set_align(FormatAlign::Left)
             .set_align(FormatAlign::VerticalCenter);
 
-        let col_widths = [4.0, 14.0, 7.0, 7.0, 7.0, 8.0, 10.0, 7.0, 11.0, 11.0, 11.0, 14.0, 10.0];
+        let col_widths = [4.0, 20.0, 4.0, 6.0, 8.0, 10.0, 10.0, 6.0, 10.0, 10.0, 10.0, 15.0, 10.0];
         for (i, w) in col_widths.iter().enumerate() {
             worksheet.set_column_width(i as u16, *w)?;
         }
 
         let headers = [
-            "序号".to_string(), "食材名称".to_string(), "规格".to_string(), "数量".to_string(), "单价".to_string(), "总价".to_string(),
-            "生产日期/批号".to_string(), "保质期".to_string(), "是否有蔬菜农残检测报告单".to_string(),
-            "是否有肉类检疫合格证".to_string(), "是否异常(异味、异色)".to_string(),
-            "检验情况是否合格".to_string(), "备注".to_string(),
+            "序号".to_string(), "品名规格".to_string(), "单位".to_string(), "数量".to_string(), "单价".to_string(), "总价".to_string(),
+            "生产日期\n/批号".to_string(), "保质期".to_string(), "是否有蔬\n菜农残检\n测报告单".to_string(),
+            "是否有肉\n类检疫合\n格证".to_string(), "是否异常\n(异味异色)".to_string(),
+            "检验情况\n是否合格".to_string(), "备注".to_string(),
         ];
 
         let items_per_page = 20;
@@ -18953,10 +22892,10 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
                 worksheet.write_with_format(current_row, 5, *amount, &money_format)?;
                 worksheet.write_with_format(current_row, 6, "", &cell_format)?;
                 worksheet.write_with_format(current_row, 7, "", &cell_format)?;
-                worksheet.write_with_format(current_row, 8, "□有  □无", &cell_format)?;
-                worksheet.write_with_format(current_row, 9, "□有  □无", &cell_format)?;
-                worksheet.write_with_format(current_row, 10, "□有  □无", &cell_format)?;
-                worksheet.write_with_format(current_row, 11, "□合格  □不合格", &cell_format)?;
+                worksheet.write_with_format(current_row, 8, "□有 □无", &cell_format)?;
+                worksheet.write_with_format(current_row, 9, "□有 □无", &cell_format)?;
+                worksheet.write_with_format(current_row, 10, "□有 □无", &cell_format)?;
+                worksheet.write_with_format(current_row, 11, "□合格 □不合格", &cell_format)?;
                 worksheet.write_with_format(current_row, 12, remark, &cell_left_format)?;
 
                 current_row += 1;
@@ -19116,16 +23055,12 @@ async fn api_sales_order_accept_excel(Path(id): Path<i64>) -> impl IntoResponse 
 
     match result {
         Ok(buf) => {
-            let filename = format!("验收单_{}.xlsx", order_no);
-            let content_disposition = format!("attachment; filename=\"{}\"", filename);
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-                    (header::CONTENT_DISPOSITION, content_disposition.as_str()),
-                ],
-                buf,
-            ).into_response()
+            let filename = if reimburse {
+                format!("报销单_{}.xlsx", order_no)
+            } else {
+                format!("验收单_{}.xlsx", order_no)
+            };
+            xlsx_response(buf, &filename)
         }
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("生成Excel失败: {}", e)).into_response()
@@ -19487,6 +23422,8 @@ async fn api_sales_order_sort_items_by_category_excel() -> impl IntoResponse {
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "quantity": r.get::<f64, _>("quantity"),
+            "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
+            "amount": r.get::<Option<f64>, _>("amount").unwrap_or(0.0),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
         }));
@@ -19699,20 +23636,28 @@ async fn api_sales_order_sort_items_by_category_excel() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_sort_items_by_supplier() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 无日期：当前待分拣（pending/sorting）；有日期：检索该日期的历史分拣清单
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
         "SELECT soi.id as item_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY s.name, p.name, soi.product_name"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         {}
+         ORDER BY s.name, p.name, soi.product_name", where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut supplier_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
     
@@ -19765,20 +23710,33 @@ async fn api_sales_order_sort_items_by_supplier() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
-    let rows = sqlx::query(
-        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
+async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 无日期：当前待分拣（pending/sorting）；有日期：检索该日期的历史分拣清单
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    // 可选：是否输出实量/单价/金额数值。不传或非 1/true 时为打印手填模式（三列留空）
+    let print_values = matches!(
+        params.get("print_values").map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
+        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY s.name, p.name, soi.product_name"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         {}
+         ORDER BY s.name, p.name, soi.product_name", where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool()).await.unwrap_or_default();
     
     let mut supplier_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
     
@@ -19797,6 +23755,8 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "quantity": r.get::<f64, _>("quantity"),
+            "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
+            "amount": r.get::<Option<f64>, _>("amount").unwrap_or(0.0),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
             "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
         }));
@@ -19827,12 +23787,6 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
 
     let excel_result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
-        let worksheet = workbook.add_worksheet();
-
-        worksheet.set_landscape();
-        worksheet.set_margins(0.2, 0.2, 0.2, 0.2, 0.2, 0.2);
-        worksheet.set_print_center_vertically(false);
-        worksheet.set_print_center_horizontally(true);
 
         let title_format = Format::new()
             .set_bold()
@@ -19860,13 +23814,11 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
             .set_align(FormatAlign::VerticalCenter)
             .set_border(FormatBorder::Thin);
 
-        let supplier_format = Format::new()
-            .set_bold()
-            .set_font_size(12)
-            .set_align(FormatAlign::Center)
+        let cell_right_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
             .set_align(FormatAlign::VerticalCenter)
-            .set_background_color("#10B981")
-            .set_font_color("#FFFFFF");
+            .set_border(FormatBorder::Thin);
 
         let purchaser_format = Format::new()
             .set_bold()
@@ -19876,60 +23828,183 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
             .set_background_color("#E5E7EB")
             .set_font_color("#374151");
 
-        let col_widths = [6.0, 18.0, 8.0, 10.0, 20.0, 20.0];
-        for (i, w) in col_widths.iter().enumerate() {
-            worksheet.set_column_width(i as u16, *w)?;
-        }
+        let col_widths = [4, 16, 4, 6, 6, 6, 8, 8];
+        let headers = ["序号", "品名规格", "单位", "订量", "实量", "单价", "金额", "备注"];
+        let display_date = if has_date {
+            date.clone()
+        } else {
+            Local::now().format("%Y-%m-%d").to_string()
+        };
 
-        let mut current_row = 0;
-        worksheet.merge_range(current_row, 0, current_row, 5, "采购分拣清单（按供应商）", &title_format)?;
-        worksheet.set_row_height(current_row, 28)?;
-        current_row += 2;
+        let date_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter);
 
-        let headers = ["序号", "商品名称", "单位", "数量", "备注", "采购单位"];
-        for (i, header) in headers.iter().enumerate() {
-            worksheet.write_with_format(current_row, i as u16, *header, &header_format)?;
-        }
-        current_row += 1;
+        let summary_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter);
 
-        let mut seq = 1;
-        for supplier in &result {
-            let supplier_name = supplier["supplier_name"].as_str().unwrap_or("未分配供应商");
-            
-            let supplier_title = format!("【{}】", supplier_name);
-            worksheet.merge_range(current_row, 0, current_row, 5, supplier_title.as_str(), &supplier_format)?;
-            worksheet.set_row_height(current_row, 22)?;
-            current_row += 1;
+        let summary_right_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter);
 
-            if let Some(purchasers) = supplier["purchasers"].as_array() {
-                for purchaser in purchasers {
-                    let purchaser_name = purchaser["purchaser_name"].as_str().unwrap_or("");
-                    let purchaser_title = format!("├── {}", purchaser_name);
-                    worksheet.merge_range(current_row, 0, current_row, 5, purchaser_title.as_str(), &purchaser_format)?;
-                    worksheet.set_row_height(current_row, 20)?;
-                    current_row += 1;
+        let grand_total_format = Format::new()
+            .set_bold()
+            .set_font_size(11)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_background_color("#E5E7EB")
+            .set_font_color("#374151");
 
-                    if let Some(items) = purchaser["items"].as_array() {
-                        for item in items {
-                            let product_name = item["product_name"].as_str().unwrap_or("");
-                            let unit = item["unit"].as_str().unwrap_or("");
-                            let quantity = item["quantity"].as_f64().unwrap_or(0.0);
-                            let remark = item["remark"].as_str().unwrap_or("");
+        let grand_total_right_format = Format::new()
+            .set_bold()
+            .set_font_size(11)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_background_color("#E5E7EB")
+            .set_font_color("#374151");
 
-                            worksheet.write_with_format(current_row, 0, seq as f64, &cell_format)?;
-                            worksheet.write_with_format(current_row, 1, product_name, &cell_left_format)?;
-                            worksheet.write_with_format(current_row, 2, unit, &cell_format)?;
-                            worksheet.write_with_format(current_row, 3, quantity, &cell_format)?;
-                            worksheet.write_with_format(current_row, 4, remark, &cell_left_format)?;
-                            worksheet.write_with_format(current_row, 5, purchaser_name, &cell_left_format)?;
+        let max_col = 7u16;
+
+        if result.is_empty() {
+            let worksheet = workbook.add_worksheet();
+            worksheet.set_name("无数据")?;
+            worksheet.merge_range(0, 0, 0, max_col, "暂无分拣数据", &title_format)?;
+        } else {
+            for supplier in &result {
+                let supplier_name = supplier["supplier_name"].as_str().unwrap_or("未分配供应商");
+                // sheet 名称最多 31 个字符
+                let sheet_name = if supplier_name.len() > 31 {
+                    supplier_name[..31].to_string()
+                } else {
+                    supplier_name.to_string()
+                };
+                let worksheet = workbook.add_worksheet();
+                worksheet.set_name(sheet_name.as_str())?;
+
+                worksheet.set_landscape();
+                // 上边距1cm，下边距1.27cm留出页脚间隙，页脚1cm，左右为0
+                worksheet.set_margins(0.0, 0.0, 0.4, 0.5, 0.0, 0.2);
+                worksheet.set_print_center_vertically(false);
+                worksheet.set_print_center_horizontally(true);
+                worksheet.set_header("");
+                worksheet.set_footer("&C第 &P 页，共 &N 页");
+                // 每页重复打印标题、日期、表头(行0-2)，保证多页时每页都有页头和日期
+                worksheet.set_repeat_rows(0, 2)?;
+
+                for (i, w) in col_widths.iter().enumerate() {
+                    worksheet.set_column_width(i as u16, *w)?;
+                }
+
+                let mut current_row = 0;
+                let title = format!("{} - 采购分拣清单", supplier_name);
+                worksheet.merge_range(current_row, 0, current_row, max_col, title.as_str(), &title_format)?;
+                worksheet.set_row_height(current_row, 28)?;
+                current_row += 1;
+
+                worksheet.merge_range(current_row, 4, current_row, max_col, display_date.as_str(), &date_format)?;
+                worksheet.set_row_height(current_row, 14)?;
+                current_row += 1;
+
+                for (i, header) in headers.iter().enumerate() {
+                    worksheet.write_with_format(current_row, i as u16, *header, &header_format)?;
+                }
+                current_row += 1;
+
+                let mut grand_total_items = 0i64;
+                let mut grand_total_amount = 0.0;
+
+                if let Some(purchasers) = supplier["purchasers"].as_array() {
+                    for purchaser in purchasers {
+                        let purchaser_name = purchaser["purchaser_name"].as_str().unwrap_or("");
+                        let purchaser_title = format!("├── {}", purchaser_name);
+                        worksheet.merge_range(current_row, 0, current_row, max_col, purchaser_title.as_str(), &purchaser_format)?;
+                        worksheet.set_row_height(current_row, 20)?;
+                        current_row += 1;
+
+                        if let Some(items) = purchaser["items"].as_array() {
+                            // 按单位分组（保持插入顺序）
+                            let mut unit_groups: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+                            for item in items {
+                                let unit = item["unit"].as_str().unwrap_or("").to_string();
+                                if let Some(pos) = unit_groups.iter().position(|(u, _)| u == &unit) {
+                                    unit_groups[pos].1.push(item);
+                                } else {
+                                    unit_groups.push((unit, vec![item]));
+                                }
+                            }
+
+                            let mut purchaser_total_items = 0i64;
+                            let mut purchaser_total_amount = 0.0;
+                            let mut purchaser_seq = 1;
+
+                            for (unit, group_items) in &unit_groups {
+                                let mut unit_amount = 0.0;
+                                for item in group_items {
+                                    let product_name = item["product_name"].as_str().unwrap_or("");
+                                    let quantity = item["quantity"].as_f64().unwrap_or(0.0);
+                                    let pre_sale_quantity = item["pre_sale_quantity"].as_f64().unwrap_or(0.0);
+                                    let amount = item["amount"].as_f64().unwrap_or(0.0);
+                                    let remark = item["remark"].as_str().unwrap_or("");
+
+                                    unit_amount += amount;
+
+                                    worksheet.write_with_format(current_row, 0, purchaser_seq as f64, &cell_format)?;
+                                    worksheet.write_with_format(current_row, 1, product_name, &cell_left_format)?;
+                                    worksheet.write_with_format(current_row, 2, unit.as_str(), &cell_format)?;
+                                    worksheet.write_with_format(current_row, 3, pre_sale_quantity, &cell_format)?;
+                                    if print_values {
+                                        worksheet.write_with_format(current_row, 4, quantity, &cell_format)?;
+                                        let unit_price = if quantity != 0.0 { amount / quantity } else { 0.0 };
+                                        worksheet.write_with_format(current_row, 5, unit_price, &cell_format)?;
+                                        worksheet.write_with_format(current_row, 6, amount, &cell_right_format)?;
+                                    } else {
+                                        worksheet.write_with_format(current_row, 4, "", &cell_format)?;
+                                        worksheet.write_with_format(current_row, 5, "", &cell_format)?;
+                                        worksheet.write_with_format(current_row, 6, "", &cell_right_format)?;
+                                    }
+                                    worksheet.write_with_format(current_row, 7, remark, &cell_left_format)?;
+                                    worksheet.set_row_height(current_row, 20.0)?;//设置供应商分拣页面的导出xlsx的行高
+                                    current_row += 1;
+                                    purchaser_seq += 1;
+                                }
+                                let unit_count = group_items.len();
+                                purchaser_total_items += unit_count as i64;
+                                purchaser_total_amount += unit_amount;
+                            }
+
+                            // 采购单位小计
+                            let purchaser_total = format!("小计: 包装数量 {}", purchaser_total_items);
+                            worksheet.merge_range(current_row, 0, current_row, 5, purchaser_total.as_str(), &summary_format)?;
+                            if print_values {
+                                worksheet.write_with_format(current_row, 6, purchaser_total_amount, &summary_right_format)?;
+                            } else {
+                                worksheet.write_with_format(current_row, 6, "", &summary_right_format)?;
+                            }
+                            worksheet.set_row_height(current_row, 18)?;
                             current_row += 1;
-                            seq += 1;
+
+                            grand_total_items += purchaser_total_items;
+                            grand_total_amount += purchaser_total_amount;
                         }
                     }
                 }
+
+                // 供应商总计
+                let grand_total = format!("总计: 包装数量 {}", grand_total_items);
+                worksheet.merge_range(current_row, 0, current_row, 5, grand_total.as_str(), &grand_total_format)?;
+                if print_values {
+                    worksheet.write_with_format(current_row, 6, grand_total_amount, &grand_total_right_format)?;
+                } else {
+                    worksheet.write_with_format(current_row, 6, "", &grand_total_right_format)?;
+                }
+                worksheet.set_row_height(current_row, 22)?;
             }
-            
-            current_row += 1;
         }
 
         let buf = workbook.save_to_buffer()?;
@@ -19938,9 +24013,14 @@ async fn api_sales_order_sort_items_by_supplier_excel() -> impl IntoResponse {
 
     match excel_result {
         Ok(buf) => {
+            let filename = if has_date {
+                format!("采购分拣清单_按供应商_{}.xlsx", date)
+            } else {
+                "采购分拣清单_按供应商.xlsx".to_string()
+            };
             let headers = [
                 ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-                ("Content-Disposition", "attachment; filename=\"采购分拣清单_按供应商.xlsx\""),
+                ("Content-Disposition", &format!("attachment; filename=\"{}\"", filename)),
             ];
             (StatusCode::OK, headers, buf).into_response()
         }
@@ -20620,7 +24700,13 @@ async fn api_sales_order_sort_comprehensive_excel() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_update_status(Json(req): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(req): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/update_status").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let id = req.get("id").and_then(|s| s.parse::<i64>().ok());
     let new_status = req.get("status");
     
@@ -20643,6 +24729,16 @@ async fn api_sales_order_update_status(Json(req): Json<std::collections::HashMap
         .ok();
     
     let current_status = current_status.unwrap_or_else(|| "pending".to_string());
+
+    // 行级数据权限：仅可操作归属自己的销售单
+    let order_purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool())
+        .await
+        .unwrap_or(-1);
+    if !can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
     
     let allowed_transitions = match current_status.as_str() {
         "pending" => vec!["sorting"],
@@ -20666,12 +24762,22 @@ async fn api_sales_order_update_status(Json(req): Json<std::collections::HashMap
         .await;
     
     match result {
-        Ok(_) => (StatusCode::OK, "状态更新成功".to_string()),
+        Ok(_) => {
+            log_operation(&ctx, "sales_order.update_status", "sales_order", &id.to_string(),
+                &format!("销售单 {} 状态 {} -> {}", id, current_status, new_status)).await;
+            (StatusCode::OK, "状态更新成功".to_string())
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "状态更新失败".to_string()),
     }
 }
 
-async fn api_sales_order_correction(Json(data): Json<std::collections::HashMap<String, serde_json::Value>>) -> impl IntoResponse {
+async fn api_sales_order_correction(headers: axum::http::HeaderMap, Json(data): Json<std::collections::HashMap<String, serde_json::Value>>) -> impl IntoResponse {
+    match check_api_permission(&headers, "/api/sales_order/correction").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = get_user_ctx(&headers).await;
+
     let corrections = data.get("corrections");
     if corrections.is_none() {
         return (StatusCode::BAD_REQUEST, "缺少修正数据".to_string());
@@ -20720,6 +24826,9 @@ async fn api_sales_order_correction(Json(data): Json<std::collections::HashMap<S
         }
     }
     
+    log_operation(&ctx, "sales_order.correction", "sales_order", "", 
+        &format!("批量修正销售单数量，共修正 {} 条记录", updated_count)).await;
+
     (StatusCode::OK, format!("成功修正 {} 条记录", updated_count))
 }
 
@@ -20804,6 +24913,7 @@ fn build_router() -> Router {
     Router::new()
         .route("/static/bootstrap.min.css", get(serve_bootstrap_css))
         .route("/static/bootstrap.bundle.min.js", get(serve_bootstrap_js))
+        .route("/static/chart.umd.min.js", get(serve_chart_js))
         .route("/", get(page_index))
         .route("/supplier", get(page_supplier))
         .route("/purchaser", get(page_purchaser))
@@ -20829,6 +24939,7 @@ fn build_router() -> Router {
         .route("/query/stock_balance", get(page_query_stock_balance))
         .route("/query/stock_flow", get(page_query_stock_flow))
         .route("/query/stock_summary", get(page_query_stock_summary))
+        .route("/query/stock_summary_reimburse", get(page_query_stock_summary_reimburse))
         .route("/query/stock_warning", get(page_query_stock_warning))
         .route("/query/slow_stock", get(page_query_slow_stock))
         .route("/query/income_expense", get(page_query_income_expense))
@@ -20841,6 +24952,7 @@ fn build_router() -> Router {
         .route("/backup", get(page_backup))
         .route("/restore", get(page_restore))
         .route("/api/system/config", post(api_system_config))
+        .route("/api/user/list", get(api_user_list))
         .route("/api/user/{id}", get(api_user_get))
         .route("/api/user", post(api_user_create))
         .route("/api/user/{id}", put(api_user_update))
@@ -20890,6 +25002,10 @@ fn build_router() -> Router {
         .route("/api/product/price/delete", post(api_product_price_delete))
         .route("/api/product/price/delete_by_product", post(api_product_price_delete_by_product))
         .route("/api/product/sync_base_price", post(api_product_sync_base_price))
+        .route("/api/product/price_log/list", get(api_product_price_log_list))
+        .route("/api/product/last_purchase_price", get(api_product_last_purchase_price))
+        .route("/api/product/set_auto_update_price", post(api_product_set_auto_update_price))
+        .route("/api/product/batch_set_auto_update_price", post(api_product_batch_set_auto_update_price))
         .route("/api/category/list", get(api_category_list))
         .route("/api/category/tree", get(api_category_tree))
         .route("/api/category/create", post(api_category_create))
@@ -20906,12 +25022,14 @@ fn build_router() -> Router {
         .route("/api/purchase_order/update", post(api_purchase_order_update))
         .route("/api/purchase_order/delete/{id}", delete(api_purchase_order_delete))
         .route("/api/purchase_order/export", get(api_purchase_order_export))
+        .route("/api/purchase_order/export_print/{id}", get(api_purchase_order_print_excel))
         .route("/api/purchase_order/import", post(api_purchase_order_import))
         .route("/api/sales_order/create", post(api_sales_order_create))
         .route("/api/sales_order/list", get(api_sales_order_list))
         .route("/api/sales_order/by_purchaser/{purchaser_id}", get(api_sales_order_by_purchaser))
         .route("/api/sales_order/detail/{id}", get(api_sales_order_detail))
         .route("/api/sales_order/update", post(api_sales_order_update))
+        .route("/api/sales_order/update_prices/{id}", post(api_sales_order_update_prices))
         .route("/api/sales_order/upload_image", post(api_sales_order_upload_image))
         .route("/api/sales_order/delete_image", post(api_sales_order_delete_image))
         .route("/api/sales_order/delete/{id}", delete(api_sales_order_delete))
@@ -20919,6 +25037,7 @@ fn build_router() -> Router {
         .route("/api/sales_order/import", post(api_sales_order_import))
         .route("/api/sales_order/accept/{id}", get(api_sales_order_accept))
         .route("/api/sales_order/accept_excel/{id}", get(api_sales_order_accept_excel))
+        .route("/api/sales_order/real_excel/{id}", get(api_sales_order_real_excel))
         .route("/api/supplement/create", post(api_supplement_create))
         .route("/api/supplement/list_by_target/{order_id}", get(api_supplement_list_by_target))
         .route("/api/supplement/adjusted_orders", get(api_adjusted_orders))
@@ -20951,33 +25070,53 @@ fn build_router() -> Router {
         .route("/api/sales_order/sort_comprehensive_excel", get(api_sales_order_sort_comprehensive_excel))
         .route("/api/query/purchase_order", get(api_query_purchase_order))
         .route("/api/purchase_document/list", get(api_purchase_document_list))
+        .route("/api/purchase_document/list/export", get(api_purchase_document_list_export))
         .route("/api/purchase_document/upload", post(api_purchase_document_upload))
         .route("/api/purchase_document/delete/{id}", delete(api_purchase_document_delete))
         .route("/api/query/purchase_order/export", get(api_query_purchase_order_export))
         .route("/api/query/purchase_price", get(api_query_purchase_price))
+        .route("/api/query/purchase_price/export", get(api_query_purchase_price_export))
         .route("/api/query/purchase_summary", get(api_query_purchase_summary))
+        .route("/api/query/purchase_summary/export", get(api_query_purchase_summary_export))
         .route("/api/query/supplier_balance", get(api_query_supplier_balance))
         .route("/api/query/supplier_balance/export", get(api_query_supplier_balance_export))
         .route("/api/query/sales_order", get(api_query_sales_order))
         .route("/api/query/sales_order/export", get(api_query_sales_order_export))
         .route("/api/query/sales_price", get(api_query_sales_price))
+        .route("/api/query/sales_price/export", get(api_query_sales_price_export))
+        .route("/api/query/product_price_trend", get(api_query_product_price_trend))
         .route("/api/query/sales_summary", get(api_query_sales_summary))
+        .route("/api/query/sales_summary/export", get(api_query_sales_summary_export))
         .route("/api/query/purchaser_balance", get(api_query_purchaser_balance))
         .route("/api/query/purchaser_balance/export", get(api_query_purchaser_balance_export))
         .route("/api/query/product_rank", get(api_query_product_rank))
+        .route("/api/query/product_rank/export", get(api_query_product_rank_export))
         .route("/api/query/reimburse_summary", get(api_query_reimburse_summary))
+        .route("/api/query/reimburse_summary/export", get(api_query_reimburse_summary_export))
         .route("/api/query/allocation_source", get(api_query_allocation_source))
+        .route("/api/query/allocation_source/export", get(api_query_allocation_source_export))
         .route("/api/query/stock_balance", get(api_query_stock_balance))
+        .route("/api/query/stock_balance/export", get(api_query_stock_balance_export))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
+        .route("/api/query/stock_flow/export", get(api_query_stock_flow_export))
         .route("/api/query/stock_summary", get(api_query_stock_summary))
         .route("/api/query/stock_summary/export", get(api_query_stock_summary_export))
+        .route("/api/query/stock_summary_reimburse", get(api_query_stock_summary_reimburse))
+        .route("/api/query/stock_summary_reimburse/export", get(api_query_stock_summary_reimburse_export))
         .route("/api/query/stock_warning", get(api_query_stock_warning))
+        .route("/api/query/stock_warning/export", get(api_query_stock_warning_export))
         .route("/api/query/slow_stock", get(api_query_slow_stock))
+        .route("/api/query/slow_stock/export", get(api_query_slow_stock_export))
         .route("/api/query/income_expense", get(api_query_income_expense))
+        .route("/api/query/income_expense/export", get(api_query_income_expense_export))
         .route("/api/query/profit_detail", get(api_query_profit_detail))
+        .route("/api/query/profit_detail/export", get(api_query_profit_detail_export))
         .route("/api/query/overview", get(api_query_overview))
+        .route("/api/query/overview/export", get(api_query_overview_export))
         .route("/api/query/category_stats", get(api_query_category_stats))
+        .route("/api/query/category_stats/export", get(api_query_category_stats_export))
         .route("/api/query/document_summary", get(api_query_document_summary))
+        .route("/api/query/document_summary/export", get(api_query_document_summary_export))
         .route("/api/order/generate_no", get(api_order_generate_no))
         .route("/api/accept/create", post(api_accept_create))
         .route("/api/accept/list", get(api_accept_list))
