@@ -24758,12 +24758,13 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
         } else {
             for supplier in &result {
                 let supplier_name = supplier["supplier_name"].as_str().unwrap_or("未分配供应商");
-                // sheet 名称最多 31 个字符
-                let sheet_name = if supplier_name.len() > 31 {
-                    supplier_name[..31].to_string()
-                } else {
-                    supplier_name.to_string()
-                };
+                // Excel sheet 名称最多 31 个字符，且禁止 \ / ? * [ ] : 字符。
+                // 按字符（而非字节）安全截断，避免中文供应商名按字节切片时 panic
+                let sheet_name: String = supplier_name
+                    .chars()
+                    .filter(|c| !matches!(c, '\\' | '/' | '?' | '*' | '[' | ']' | ':'))
+                    .take(31)
+                    .collect();
                 let worksheet = workbook.add_worksheet();
                 worksheet.set_name(sheet_name.as_str())?;
 
