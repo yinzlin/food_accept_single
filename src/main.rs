@@ -3314,7 +3314,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 <input type="number" step="0.01" name="base_price" placeholder="基础单价(售价)" class="form-control">
                             </div>
                             <div class="col-md-2">
-                                <input type="number" step="0.01" name="purchase_price" placeholder="进价" class="form-control">
+                                <input type="number" step="0.01" name="purchase_price" placeholder="进价" class="form-control purchase-price-field">
                             </div>
                             <div class="col-md-2">
                                 <select name="category_id" class="form-control">{0}</select>
@@ -3344,7 +3344,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
         <div class="product-list-section">
         <table class="table table-bordered product-sticky-table">
-            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th>进价</th><th>多单位</th><th>分类</th><th>状态</th><th style="width:140px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th style="width:140px">操作</th></tr></thead>
             <tbody id="productTableBody">
                 <tr><td colspan="12" class="text-center text-muted">加载中...</td></tr>
             </tbody>
@@ -3394,9 +3394,9 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <label class="form-label">基础单价（每基础单位，售价）</label>
                                     <input type="number" step="0.01" name="base_price" class="form-control">
                                 </div>
-                                <div class="col-md-4">
+                                <div class="col-md-4" id="purchasePriceField">
                                     <label class="form-label">当前进价（每基础单位，最近采购价）</label>
-                                    <input type="number" step="0.01" name="purchase_price" class="form-control">
+                                    <input type="number" step="0.01" name="purchase_price" class="form-control purchase-price-field">
                                 </div>
                             </div>
                             <div class="row mt-3">
@@ -3415,11 +3415,11 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                         <option value="1">开启</option>
                                     </select>
                                 </div>
-                                <div class="col-md-2">
+                                <div class="col-md-2 purchase-price-col">
                                     <label class="form-label">历史最高进价（自动）</label>
                                     <input type="number" step="0.01" name="max_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
-                                <div class="col-md-2">
+                                <div class="col-md-2 purchase-price-col">
                                     <label class="form-label">历史最低进价（自动）</label>
                                     <input type="number" step="0.01" name="min_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
                                 </div>
@@ -3495,7 +3495,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 单位采购价用于整采整卖场景，留0则使用进价按比例计算。
                             </div>
                             <table class="table table-sm table-bordered mt-2" id="unitTable">
-                                <thead><tr><th>单位名称</th><th>换算比例（1本单位=?基础单位）</th><th>单位售价（留0则按比例自动算）</th><th>单位采购价（留0则按进价比例算）</th><th>排序</th><th>操作</th></tr></thead>
+                                <thead><tr><th>单位名称</th><th>换算比例（1本单位=?基础单位）</th><th>单位售价（留0则按比例自动算）</th><th class="purchase-price-col">单位采购价（留0则按进价比例算）</th><th>排序</th><th>操作</th></tr></thead>
                                 <tbody id="unitTableBody"></tbody>
                             </table>
                         </div>
@@ -3631,7 +3631,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     let autoBadge = (p.auto_update_price === 1) ? '<span class="badge bg-info" title="开启自动更新售价">自动</span>' : '<span class="badge bg-light text-dark" title="人工维护售价">人工</span>';
                     let autoBtnClass = (p.auto_update_price === 1) ? 'btn-outline-secondary' : 'btn-outline-info';
                     let autoBtnText = (p.auto_update_price === 1) ? '关闭自动' : '开启自动';
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td><td>' + (p.purchase_price || 0) + '</td><td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
                     html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
@@ -3787,6 +3787,25 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 return true;
             }}
 
+            // 进价字段仅超级管理员可见可编辑：非 super_admin 禁用并隐藏所有进价输入框及进价列
+            let isSuperAdmin = false;
+            function applyPurchasePriceRestriction() {{
+                if (isSuperAdmin) return;
+                document.querySelectorAll('.purchase-price-field').forEach(el => {{
+                    el.disabled = true;
+                    el.style.display = 'none';
+                }});
+                document.querySelectorAll('.purchase-price-col, #purchasePriceField').forEach(el => {{
+                    el.style.display = 'none';
+                }});
+            }}
+            fetch('/api/login/check').then(r => r.json()).then(d => {{
+                if (d && d.logged_in) {{
+                    isSuperAdmin = (d.user.role === 'super_admin');
+                }}
+                applyPurchasePriceRestriction();
+            }});
+
             function addUnitRow(unitData) {{
                 const tbody = document.getElementById('unitTableBody');
                 const tr = document.createElement('tr');
@@ -3794,11 +3813,12 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     <td><input type="text" class="form-control form-control-sm" name="unit_name" value="${{unitData ? escapeHtml(unitData.unit_name) : ''}}"></td>
                     <td><input type="number" step="0.01" class="form-control form-control-sm" name="ratio" value="${{unitData ? unitData.ratio : 1}}"></td>
                     <td><input type="number" step="0.01" class="form-control form-control-sm" name="unit_price" value="${{unitData ? unitData.unit_price : 0}}"></td>
-                    <td><input type="number" step="0.01" class="form-control form-control-sm" name="purchase_price" value="${{unitData ? (unitData.purchase_price || 0) : 0}}"></td>
+                    ${{isSuperAdmin ? '<td><input type="number" step="0.01" class="form-control form-control-sm purchase-price-field" name="purchase_price" value="' + (unitData ? (unitData.purchase_price || 0) : 0) + '"></td>' : ''}}
                     <td><input type="number" class="form-control form-control-sm" name="sort_order" value="${{unitData ? unitData.sort_order : 0}}"></td>
                     <td><button class="btn btn-sm btn-danger" onclick="this.parentElement.parentElement.remove()">删除</button></td>
                 `;
                 tbody.appendChild(tr);
+                applyPurchasePriceRestriction();
             }}
 
             async function editProduct(id) {{
@@ -3861,6 +3881,7 @@ async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
 
                 const modal = new bootstrap.Modal(document.getElementById('editProductModal'));
+                applyPurchasePriceRestriction();
                 modal.show();
             }}
 
@@ -7508,13 +7529,24 @@ async fn page_query_purchase_price() -> Html<String> {
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>商品名称</th><th>规格</th><th>供应商</th><th>采购单价</th><th>采购日期</th><th>采购数量</th></tr></thead>
+                <thead><tr><th>商品名称</th><th>规格</th><th>供应商</th><th id="thPurchaseUnitPrice">采购单价</th><th>采购日期</th><th>采购数量</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
             <div id="pagination" class="mt-3"></div>
         </div>
         <script>
             let currentPage = 1;
+            // 采购单价为进价信息，仅超级管理员可见
+            let isSuperAdmin = false;
+            fetch('/api/login/check').then(r => r.json()).then(d => {
+                if (d && d.logged_in) {
+                    isSuperAdmin = (d.user.role === 'super_admin');
+                }
+                if (!isSuperAdmin) {
+                    const th = document.getElementById('thPurchaseUnitPrice');
+                    if (th) th.style.display = 'none';
+                }
+            });
             async function loadSuppliers() {
                 const res = await fetch('/api/supplier/list');
                 const suppliers = await res.json();
@@ -7543,7 +7575,7 @@ async fn page_query_purchase_price() -> Html<String> {
                     return;
                 }
                 data.forEach(item => {
-                    tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '-') + '</td><td>' + item.supplier_name + '</td><td>¥' + item.unit_price.toFixed(2) + '/' + (item.unit || '') + '</td><td>' + item.order_date + '</td><td>' + item.quantity.toFixed(2) + (item.unit || '') + '</td></tr>';
+                    tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '-') + '</td><td>' + item.supplier_name + '</td>' + (isSuperAdmin ? '<td>¥' + item.unit_price.toFixed(2) + '/' + (item.unit || '') + '</td>' : '') + '<td>' + item.order_date + '</td><td>' + item.quantity.toFixed(2) + (item.unit || '') + '</td></tr>';
                 });
                 renderPagination(result.page, result.total_pages, result.total);
             }
@@ -13662,7 +13694,9 @@ async fn api_product_toggle_status(Path(id): Path<i64>) -> impl IntoResponse {
     }
 }
 
-async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 进价仅超级管理员可见：非 super_admin 返回的进价字段置 0
+    let is_super_admin = get_user_ctx(&headers).await.role == "super_admin";
     let category_id = params.get("category_id").and_then(|v| v.parse::<i64>().ok());
     let keyword_pattern = parse_keyword_pattern(&params);
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -13754,7 +13788,7 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
                 "unit_name": ur.get::<String, _>("unit_name"),
                 "ratio": ur.get::<f64, _>("ratio"),
                 "unit_price": ur.get::<f64, _>("unit_price"),
-                "purchase_price": ur.get::<f64, _>("purchase_price"),
+                "purchase_price": if is_super_admin { ur.get::<f64, _>("purchase_price") } else { 0.0 },
                 "sort_order": ur.get::<i32, _>("sort_order"),
             }))
             .collect();
@@ -13807,9 +13841,9 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
             "unit": row.get::<String, _>("unit"),
             "base_unit": row.get::<String, _>("base_unit"),
             "base_price": row.get::<f64, _>("base_price"),
-            "purchase_price": row.get::<f64, _>("purchase_price"),
-            "max_purchase_price": row.get::<f64, _>("max_purchase_price"),
-            "min_purchase_price": row.get::<f64, _>("min_purchase_price"),
+            "purchase_price": if is_super_admin { row.get::<f64, _>("purchase_price") } else { 0.0 },
+            "max_purchase_price": if is_super_admin { row.get::<f64, _>("max_purchase_price") } else { 0.0 },
+            "min_purchase_price": if is_super_admin { row.get::<f64, _>("min_purchase_price") } else { 0.0 },
             "markup_rate": row.get::<f64, _>("markup_rate"),
             "auto_update_price": row.get::<i64, _>("auto_update_price"),
             "image_url": row.get::<Option<String>, _>("image_url"),
@@ -13834,12 +13868,14 @@ async fn api_product_list(axum::extract::Query(params): axum::extract::Query<std
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_product_create(Json(req): Json<ProductReq>) -> impl IntoResponse {
+async fn api_product_create(headers: axum::http::HeaderMap, Json(req): Json<ProductReq>) -> impl IntoResponse {
+    // 进价仅超级管理员可设置：非 super_admin 创建商品时进价强制为 0
+    let role = get_user_ctx(&headers).await.role;
     let base_unit = req.base_unit.clone().unwrap_or_else(|| req.unit.clone().unwrap_or_else(|| "个".to_string()));
     let unit = req.unit.clone().unwrap_or_else(|| "个".to_string());
     let base_price = req.base_price.unwrap_or(0.0);
     
-    let purchase_price = req.purchase_price.unwrap_or(0.0);
+    let purchase_price = if role == "super_admin" { req.purchase_price.unwrap_or(0.0) } else { 0.0 };
     
     let result = sqlx::query(
         "INSERT INTO product(name, spec, alias1, alias2, unit, base_unit, base_price, purchase_price, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -13898,7 +13934,8 @@ async fn api_product_check_name(axum::extract::Query(params): axum::extract::Que
     (StatusCode::OK, serde_json::to_string(&products).unwrap())
 }
 
-async fn api_product_by_id(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_product_by_id(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let is_super_admin = get_user_ctx(&headers).await.role == "super_admin";
     let product_id = params.get("id").and_then(|s| s.parse::<i64>().ok());
     if product_id.is_none() {
         return (StatusCode::OK, serde_json::to_string(&serde_json::json!({})).unwrap());
@@ -13928,7 +13965,7 @@ async fn api_product_by_id(axum::extract::Query(params): axum::extract::Query<st
                 "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
                 "base_unit": r.get::<Option<String>, _>("base_unit").unwrap_or_default(),
                 "base_price": r.get::<f64, _>("base_price"),
-                "purchase_price": r.get::<f64, _>("purchase_price"),
+                "purchase_price": if is_super_admin { r.get::<f64, _>("purchase_price") } else { 0.0 },
                 "selling_price": r.get::<f64, _>("selling_price"),
                 "category_name": r.get::<Option<String>, _>("category_name").unwrap_or_default(),
             });
@@ -13938,7 +13975,8 @@ async fn api_product_by_id(axum::extract::Query(params): axum::extract::Query<st
     }
 }
 
-async fn api_product_search(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_product_search(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let is_super_admin = get_user_ctx(&headers).await.role == "super_admin";
     let keyword = params.get("keyword").filter(|s| !s.is_empty());
     if keyword.is_none() {
         return (StatusCode::OK, serde_json::to_string(&Vec::<serde_json::Value>::new()).unwrap());
@@ -13974,7 +14012,7 @@ async fn api_product_search(axum::extract::Query(params): axum::extract::Query<s
             "unit": row.get::<String, _>("unit"),
             "base_unit": row.get::<String, _>("base_unit"),
             "base_price": row.get::<f64, _>("base_price"),
-            "purchase_price": row.get::<f64, _>("purchase_price"),
+            "purchase_price": if is_super_admin { row.get::<f64, _>("purchase_price") } else { 0.0 },
             "selling_price": row.get::<f64, _>("selling_price"),
             "category_name": row.get::<Option<String>, _>("category_name"),
         }))
@@ -14000,11 +14038,11 @@ struct ProductUpdateReq {
     auto_update_price: Option<i64>,
 }
 
-async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<ProductUpdateReq>) -> impl IntoResponse {
-    match check_api_permission(&headers, "/api/product/update").await {
+async fn api_product_update(headers: axum::http::HeaderMap, Json(mut req): Json<ProductUpdateReq>) -> impl IntoResponse {
+    let role = match check_api_permission(&headers, "/api/product/update").await {
         Err(e) => return e,
-        Ok(_) => {}
-    }
+        Ok(role) => role,
+    };
     // 读取旧值用于日志
     let old_row = sqlx::query(
         "SELECT base_price, purchase_price, markup_rate, auto_update_price FROM product WHERE id = ?"
@@ -14024,6 +14062,10 @@ async fn api_product_update(headers: axum::http::HeaderMap, Json(req): Json<Prod
     } else {
         (0.0, 0.0, 0.5, 0)
     };
+    // 进价仅超级管理员可修改：非 super_admin 忽略前端传入的进价，保持原值
+    if role != "super_admin" {
+        req.purchase_price = Some(old_purchase);
+    }
 
     let result = sqlx::query(
         "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ?, markup_rate = ?, auto_update_price = ? WHERE id = ?"
@@ -14979,7 +15021,8 @@ async fn api_product_unit_delete_by_product(Json(req): Json<serde_json::Value>) 
     }
 }
 
-async fn api_product_unit_list(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_product_unit_list(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let is_super_admin = get_user_ctx(&headers).await.role == "super_admin";
     let product_id = params.get("product_id").and_then(|s| s.parse::<i64>().ok());
     if product_id.is_none() {
         return (StatusCode::OK, serde_json::to_string(&Vec::<serde_json::Value>::new()).unwrap());
@@ -14999,7 +15042,7 @@ async fn api_product_unit_list(axum::extract::Query(params): axum::extract::Quer
             "name": row.get::<String, _>("unit_name"),
             "ratio": row.get::<f64, _>("ratio"),
             "unit_price": row.get::<f64, _>("unit_price"),
-            "purchase_price": row.get::<f64, _>("purchase_price"),
+            "purchase_price": if is_super_admin { row.get::<f64, _>("purchase_price") } else { 0.0 },
         }))
         .collect();
     
@@ -20437,7 +20480,9 @@ async fn api_query_profit_detail(axum::extract::Query(params): axum::extract::Qu
 
 // ===== 导出函数 =====
 
-async fn api_query_purchase_price_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn api_query_purchase_price_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    // 采购单价为进价信息，仅超级管理员可见：非 super_admin 导出时该列置空
+    let is_super_admin = get_user_ctx(&headers).await.role == "super_admin";
     let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or(""); let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
     let mut base_sql = String::from(" FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id WHERE 1=1");
     let mut binds: Vec<String> = Vec::new();
@@ -20448,9 +20493,9 @@ async fn api_query_purchase_price_export(axum::extract::Query(params): axum::ext
     let rows = query.fetch_all(pool()).await.unwrap_or_default();
     let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("采购价格").unwrap();
     let hf = xlsx_header_format(0x4472C4);
-    for (col, h) in ["商品名称", "规格", "供应商", "采购单价", "采购日期", "采购数量"].iter().enumerate() { ws.write_with_format(0, col as u16, *h, &hf).unwrap(); }
+    for (col, h) in ["商品名称", "规格", "供应商", "采购单价", "采购日期", "采购数量"].iter().enumerate() { ws.write_with_format(0, col as u16, if *h == "采购单价" && !is_super_admin { "" } else { *h }, &hf).unwrap(); }
     ws.set_column_width(0, 20).unwrap(); ws.set_column_width(1, 14).unwrap(); ws.set_column_width(2, 16).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap(); ws.set_column_width(5, 14).unwrap();
-    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("supplier_name")).unwrap(); ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
+    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("supplier_name")).unwrap(); if is_super_admin { ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); } else { ws.write(r, 3, "").unwrap(); } ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
     xlsx_response(workbook.save_to_buffer().unwrap(), "采购价格查询.xlsx")
 }
 
