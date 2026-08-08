@@ -24566,6 +24566,20 @@ async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoR
     }
 }
 
+// 分拣相关 API 的日期筛选辅助函数
+fn build_date_where(params: &std::collections::HashMap<String, String>) -> String {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    where_extra
+}
+
 async fn api_sales_order_sort_items() -> impl IntoResponse {
     let rows = sqlx::query(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
@@ -24829,15 +24843,7 @@ async fn api_sales_order_sort_items_excel() -> impl IntoResponse {
 async fn api_sales_order_sort_items_by_category(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
+    let where_extra = build_date_where(&params);
     let sql = format!(
         "SELECT soi.id as item_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
@@ -24906,15 +24912,7 @@ async fn api_sales_order_sort_items_by_category(
 async fn api_sales_order_sort_items_by_category_excel(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
+    let where_extra = build_date_where(&params);
     let sql = format!(
         "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
@@ -25559,15 +25557,7 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
 async fn api_sales_order_sort_items_by_purchaser(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
+    let where_extra = build_date_where(&params);
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no
@@ -25624,15 +25614,7 @@ async fn api_sales_order_sort_items_by_purchaser(
 async fn api_sales_order_sort_items_by_purchaser_excel(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
+    let where_extra = build_date_where(&params);
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
@@ -25835,15 +25817,7 @@ async fn api_sales_order_sort_items_by_purchaser_excel(
 async fn api_sales_order_sort_comprehensive(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
+    let where_extra = build_date_where(&params);
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
@@ -25979,15 +25953,7 @@ async fn api_sales_order_sort_comprehensive(
 async fn api_sales_order_sort_comprehensive_excel(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
+    let where_extra = build_date_where(&params);
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
