@@ -10283,6 +10283,10 @@ async fn page_mobile_sort() -> Html<String> {
         .filter-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
         .filter-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-size: 14px; }
         .filter-bar button.clear { background: #f3f4f6; color: #666; }
+        .history-bar { background: #ecfdf5; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .history-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .history-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #10b981; color: white; font-size: 14px; white-space: nowrap; }
+        .history-bar button.clear { background: #f3f4f6; color: #666; }
         .bottom-bar { background: white; padding: 6px 12px; position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 6px; box-shadow: 0 -2px 8px rgba(0,0,0,0.05); }
         .bottom-bar button { flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; }
         .btn-select-all { background: #f3f4f6; color: #333; }
@@ -10590,6 +10594,10 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
         .filter-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
         .filter-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-size: 14px; }
         .filter-bar button.clear { background: #f3f4f6; color: #666; }
+        .history-bar { background: #ecfdf5; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .history-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .history-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #10b981; color: white; font-size: 14px; white-space: nowrap; }
+        .history-bar button.clear { background: #f3f4f6; color: #666; }
         .bottom-bar { background: white; padding: 6px 12px; position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 6px; box-shadow: 0 -2px 8px rgba(0,0,0,0.05); }
         .bottom-bar button { flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; }
         .btn-select-all { background: #f3f4f6; color: #333; }
@@ -10930,6 +10938,10 @@ async fn page_mobile_sort_by_category() -> Html<String> {
         .filter-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
         .filter-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-size: 14px; }
         .filter-bar button.clear { background: #f3f4f6; color: #666; }
+        .history-bar { background: #ecfdf5; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .history-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .history-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #10b981; color: white; font-size: 14px; white-space: nowrap; }
+        .history-bar button.clear { background: #f3f4f6; color: #666; }
         .bottom-bar { background: white; padding: 6px 12px; position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 6px; box-shadow: 0 -2px 8px rgba(0,0,0,0.05); }
         .bottom-bar button { flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; }
         .btn-select-all { background: #f3f4f6; color: #333; }
@@ -24586,7 +24598,7 @@ async fn api_sales_order_sort_items(axum::extract::Query(params): axum::extract:
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          {}
-         ORDER BY soi.product_name",
+         ORDER BY soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -24680,7 +24692,7 @@ async fn api_sales_order_sort_items_excel(axum::extract::Query(params): axum::ex
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          {}
-         ORDER BY soi.product_name",
+         ORDER BY soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -24870,7 +24882,7 @@ async fn api_sales_order_sort_items_by_category(
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
          {}
-         ORDER BY c.name, p.name, soi.product_name",
+         ORDER BY c.name, p.name, soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -24946,7 +24958,7 @@ async fn api_sales_order_sort_items_by_category_excel(
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
          {}
-         ORDER BY c.name, p.name, soi.product_name",
+         ORDER BY c.name, p.name, soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -25200,7 +25212,7 @@ async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params): ax
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
          {}
-         ORDER BY s.name, p.name, soi.product_name", where_sql
+         ORDER BY s.name, p.name, soi.product_name, so.id, soi.id", where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
     if has_date { q = q.bind(&date); }
@@ -25279,7 +25291,7 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
          {}
-         ORDER BY s.name, p.name, soi.product_name", where_sql
+         ORDER BY s.name, p.name, soi.product_name, so.id, soi.id", where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
     if has_date { q = q.bind(&date); }
@@ -25596,7 +25608,7 @@ async fn api_sales_order_sort_items_by_purchaser(
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          {}
-         ORDER BY p.name, soi.product_name",
+         ORDER BY p.name, soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -25664,7 +25676,7 @@ async fn api_sales_order_sort_items_by_purchaser_excel(
          LEFT JOIN category pc ON pr.category_id = pc.id
          LEFT JOIN category pc2 ON pc.parent_id = pc2.id
          {}
-         ORDER BY p.name, soi.product_name",
+         ORDER BY p.name, soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -25873,7 +25885,7 @@ async fn api_sales_order_sort_comprehensive(
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
          {}
-         ORDER BY p.name, c.name, soi.product_name",
+         ORDER BY p.name, c.name, soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -26016,7 +26028,7 @@ async fn api_sales_order_sort_comprehensive_excel(
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
          {}
-         ORDER BY p.name, c.name, soi.product_name",
+         ORDER BY p.name, c.name, soi.product_name, so.id, soi.id",
         where_sql
     );
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
