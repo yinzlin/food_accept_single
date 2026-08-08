@@ -1101,6 +1101,16 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 销售单位：销售订单明细的实际单位，可能与商品基础单位不同，用于生成采购订单时区分明细
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN sales_unit TEXT")
+        .execute(pool)
+        .await;
+
+    // 销售单来源：标识该采购明细由哪张销售单生成，便于同供应商多单合并时精确重算单张销售单的贡献
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN source_sales_order_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN source_sales_order_id INTEGER DEFAULT 0")
         .execute(pool)
         .await;
@@ -4535,7 +4545,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             <button onclick="searchOrders()" class="btn btn-primary ml-2">搜索</button>
             <button onclick="resetSearch()" class="btn btn-secondary ml-2">重置</button>
             <button onclick="cancelOrder()" class="btn btn-warning ml-2">取消</button>
-            <a href="/api/purchase_order/export" class="btn btn-success ml-2">导出</a>
+            <a href="javascript:void(0)" onclick="exportFilteredPurchaseOrders()" class="btn btn-success ml-2">导出</a>
             <button onclick="importPurchaseOrders()" class="btn btn-warning ml-2">导入</button>
             <input type="file" id="purchaseOrderFileInput" style="display:none" accept=".csv" onchange="handlePurchaseOrderFile(this)">
         </div>
@@ -4760,6 +4770,21 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 currentKeyword = document.getElementById('searchInput').value.trim();
                 currentPage = 1;
                 await loadOrders();
+            }}
+
+            // 按当前筛选条件（搜索关键字 + 供应商）跳转导出，参数与列表保持一致
+            function exportFilteredPurchaseOrders() {{
+                const params = new URLSearchParams();
+                const kw = document.getElementById('searchInput').value.trim();
+                if (kw) params.set('keyword', kw);
+                const supplierId = document.getElementById('supplierSelect').value;
+                if (supplierId) params.set('supplier_id', supplierId);
+                if (sortField) {{
+                    params.set('sort_field', sortField);
+                    params.set('sort_order', sortOrder);
+                }}
+                const qs = params.toString();
+                window.location = '/api/purchase_order/export' + (qs ? '?' + qs : '');
             }}
 
             async function loadOrders(page) {{
@@ -5609,7 +5634,7 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             <button onclick="searchOrders()" class="btn btn-primary ml-2">搜索</button>
             <button onclick="resetSearch()" class="btn btn-secondary ml-2">重置</button>
             <button onclick="cancelOrder()" class="btn btn-warning ml-2">取消</button>
-            <a href="/api/sales_order/export" class="btn btn-success ml-2">导出</a>
+            <a href="javascript:void(0)" onclick="exportFilteredSalesOrders()" class="btn btn-success ml-2">导出</a>
             <button onclick="importSalesOrders()" class="btn btn-warning ml-2">导入</button>
             <input type="file" id="salesOrderFileInput" style="display:none" accept=".csv" onchange="handleSalesOrderFile(this)">
         </div>
@@ -6415,6 +6440,21 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 currentKeyword = document.getElementById('searchInput').value.trim();
                 currentPage = 1;
                 await loadOrders();
+            }}
+
+            // 按当前筛选条件（搜索关键字 + 采购单位）跳转导出，参数与列表保持一致
+            function exportFilteredSalesOrders() {{
+                const params = new URLSearchParams();
+                const kw = document.getElementById('searchInput').value.trim();
+                if (kw) params.set('keyword', kw);
+                const purchaserId = document.getElementById('purchaserSelect').value;
+                if (purchaserId) params.set('purchaser_id', purchaserId);
+                if (sortField) {{
+                    params.set('sort_field', sortField);
+                    params.set('sort_order', sortOrder);
+                }}
+                const qs = params.toString();
+                window.location = '/api/sales_order/export' + (qs ? '?' + qs : '');
             }}
 
             async function loadOrders(page) {{
@@ -10282,8 +10322,10 @@ async fn page_mobile_sort() -> Html<String> {
     </div>
     
     <div class="filter-bar">
+        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
+        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="clearSearch()">清除</button>
+        <button class="clear" onclick="resetDateFilter()">清除</button>
     </div>
     </div>
     
@@ -10572,8 +10614,10 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
     </div>
     
     <div class="filter-bar">
+        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
+        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="clearSearch()">清除</button>
+        <button class="clear" onclick="resetDateFilter()">清除</button>
     </div>
     </div>
     
@@ -10599,7 +10643,14 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
 
         async function loadItems() {
             try {
-                const res = await fetch('/api/sales_order/sort_items_by_purchaser');
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+                let url = '/api/sales_order/sort_items_by_purchaser';
+                const params = [];
+                if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+                if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+                if (params.length > 0) url += '?' + params.join('&');
+                const res = await fetch(url);
                 purchasers = await res.json();
                 loadCheckedState();
                 loadCorrectedQuantities();
@@ -10608,6 +10659,13 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
             } catch (e) {
                 console.error('加载失败:', e);
             }
+        }
+
+        function resetDateFilter() {
+            document.getElementById('startDate').value = '';
+            document.getElementById('endDate').value = '';
+            document.getElementById('searchInput').value = '';
+            loadItems();
         }
 
         function loadCheckedState() {
@@ -10796,7 +10854,14 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
         }
 
         function exportExcel() {
-            window.location.href = '/api/sales_order/sort_items_by_purchaser_excel';
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            const params = [];
+            if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+            if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+            let url = '/api/sales_order/sort_items_by_purchaser_excel';
+            if (params.length > 0) url += '?' + params.join('&');
+            window.location.href = url;
         }
 
         loadItems();
@@ -16149,8 +16214,14 @@ async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extract::
     let (sql, query_params) = if let Some(sid) = supplier_id {
         (
             format!(
-                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
-                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name,
+                        (SELECT GROUP_CONCAT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_names,
+                        (SELECT COUNT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_count
+                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
                  WHERE po.supplier_id = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)
                  ORDER BY {} LIMIT ? OFFSET ?",
                 order_clause
@@ -16160,8 +16231,14 @@ async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extract::
     } else {
         (
             format!(
-                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name 
-                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name,
+                        (SELECT GROUP_CONCAT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_names,
+                        (SELECT COUNT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_count
+                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
                  WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?
                  ORDER BY {} LIMIT ? OFFSET ?",
                 order_clause
@@ -16169,30 +16246,48 @@ async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extract::
             vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
         )
     };
-    
+
     let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
     for p in &query_params {
         query = query.bind(p);
     }
     query = query.bind(page_size).bind(offset);
     let rows = query.fetch_all(pool()).await.unwrap_or_default();
-    
+
     let orders: Vec<serde_json::Value> = rows
         .iter()
-        .map(|row| serde_json::json!({
-            "id": row.get::<i64, _>("id"),
-            "order_no": row.get::<String, _>("order_no"),
-            "order_date": row.get::<String, _>("order_date"),
-            "total_amount": row.get::<f64, _>("total_amount"),
-            "discount_rate": row.get::<f64, _>("discount_rate"),
-            "amount_reduction": row.get::<f64, _>("amount_reduction"),
-            "final_amount": row.get::<f64, _>("final_amount"),
-            "warehouse_id": row.get::<i64, _>("warehouse_id"),
-            "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
-            "status": row.get::<String, _>("status"),
-            "remark": row.get::<Option<String>, _>("remark"),
-            "supplier_name": row.get::<String, _>("supplier_name"),
-        }))
+        .map(|row| {
+            let item_wh_count: i64 = row.get::<i64, _>("item_warehouse_count");
+            let item_wh_names: Option<String> = row.try_get::<Option<String>, _>("item_warehouse_names").unwrap_or(None);
+            let main_wh_name: Option<String> = row.try_get::<Option<String>, _>("warehouse_name").unwrap_or(None);
+
+            // 仓库展示规则：
+            // 1) 明细里无任何仓库名 → 沿用主表仓库名
+            // 2) 明细里只有一个去重仓库名 → 显示该仓库名
+            // 3) 明细里有 ≥2 个去重仓库名 → 显示"综合"
+            let display_warehouse = if item_wh_count == 0 {
+                main_wh_name.unwrap_or_default()
+            } else if item_wh_count == 1 {
+                item_wh_names.unwrap_or_default()
+            } else {
+                "综合".to_string()
+            };
+
+            serde_json::json!({
+                "id": row.get::<i64, _>("id"),
+                "order_no": row.get::<String, _>("order_no"),
+                "order_date": row.get::<String, _>("order_date"),
+                "total_amount": row.get::<f64, _>("total_amount"),
+                "discount_rate": row.get::<f64, _>("discount_rate"),
+                "amount_reduction": row.get::<f64, _>("amount_reduction"),
+                "final_amount": row.get::<f64, _>("final_amount"),
+                "warehouse_id": row.get::<i64, _>("warehouse_id"),
+                "warehouse_name": display_warehouse,
+                "status": row.get::<String, _>("status"),
+                "remark": row.get::<Option<String>, _>("remark"),
+                "supplier_name": row.get::<String, _>("supplier_name"),
+            })
+        })
         .collect();
     
     let result = serde_json::json!({
@@ -16543,43 +16638,59 @@ async fn api_purchase_order_unapprove(headers: axum::http::HeaderMap, Path(id): 
     }
 }
 
-async fn api_purchase_order_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn api_purchase_order_export(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     // 行级数据权限：supplier 只能导出自己的
     let ctx = get_user_ctx(&headers).await;
-    let mut sql = String::from(
-        "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.final_amount, po.status, po.remark, s.name as supplier_name,
-                poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.ordered_quantity, poi.quantity, poi.unit_price, poi.base_quantity, poi.amount, poi.remark as item_remark
-         FROM purchase_order po 
-         JOIN supplier s ON po.supplier_id = s.id
-         LEFT JOIN purchase_order_item poi ON po.id = poi.order_id"
-    );
-    let mut binds: Vec<i64> = Vec::new();
-    if ctx.role == "supplier" {
-        sql.push_str(" WHERE po.supplier_id = ?");
-        binds.push(ctx.supplier_id);
-    }
-    sql.push_str(" ORDER BY po.id, poi.id");
+    let keyword_pattern = parse_keyword_pattern(&params);
 
-    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
-    for b in &binds {
-        q = q.bind(b);
-    }
-    let rows = q.fetch_all(pool()).await.unwrap_or_default();
-    
+    // 行级数据权限 + 筛选：supplier 强制只看自己，其他角色可按 supplier_id 过滤
+    let supplier_id: Option<i64> = if ctx.role == "supplier" {
+        if ctx.supplier_id > 0 { Some(ctx.supplier_id) } else { Some(-1) }
+    } else {
+        params.get("supplier_id").and_then(|s| s.parse().ok())
+    };
+
+    // 导出按订单ID与明细ID顺序排列，便于阅读核对
+    let base_sql = "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.final_amount, po.status, po.remark, s.name as supplier_name,
+                           poi.product_name, poi.alias1, poi.alias2, poi.spec, poi.unit, poi.ordered_quantity, poi.quantity, poi.unit_price, poi.base_quantity, poi.amount, poi.remark as item_remark
+                    FROM purchase_order po
+                    JOIN supplier s ON po.supplier_id = s.id
+                    LEFT JOIN purchase_order_item poi ON po.id = poi.order_id
+                    WHERE (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)";
+    let (sql, rows): (String, Vec<sqlx::sqlite::SqliteRow>) = if let Some(sid) = supplier_id {
+        let sql = format!("{} AND po.supplier_id = ? ORDER BY po.id, poi.id", base_sql);
+        let q = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&keyword_pattern).bind(&keyword_pattern).bind(&keyword_pattern)
+            .bind(sid);
+        (sql, q.fetch_all(pool()).await.unwrap_or_default())
+    } else {
+        let sql = format!("{} ORDER BY po.id, poi.id", base_sql);
+        let q = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&keyword_pattern).bind(&keyword_pattern).bind(&keyword_pattern);
+        (sql, q.fetch_all(pool()).await.unwrap_or_default())
+    };
+    let _ = sql; // 当前未使用，保留以备后续排查
+    build_purchase_order_export_workbook(rows)
+}
+
+fn build_purchase_order_export_workbook(rows: Vec<sqlx::sqlite::SqliteRow>) -> axum::response::Response {
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
         let worksheet = workbook.add_worksheet();
-        
+
         let header_format = Format::new()
             .set_bold()
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
-        
+
         let headers = ["订单ID", "订单号", "订单日期", "供应商", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "订购数量", "数量", "单价", "基本数量", "金额", "商品备注"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
-        
+
         let mut row_idx = 1;
         for row in rows {
             worksheet.write(row_idx, 0, row.get::<i64, _>("id"))?;
@@ -16604,7 +16715,7 @@ async fn api_purchase_order_export(headers: axum::http::HeaderMap) -> impl IntoR
             worksheet.write(row_idx, 19, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
             row_idx += 1;
         }
-        
+
         worksheet.set_column_width(0, 8)?;
         worksheet.set_column_width(1, 18)?;
         worksheet.set_column_width(2, 12)?;
@@ -16625,10 +16736,10 @@ async fn api_purchase_order_export(headers: axum::http::HeaderMap) -> impl IntoR
         worksheet.set_column_width(17, 10)?;
         worksheet.set_column_width(18, 10)?;
         worksheet.set_column_width(19, 15)?;
-        
+
         workbook.save_to_buffer()
     })();
-    
+
     match result {
         Ok(data) => (
             StatusCode::OK,
@@ -17276,7 +17387,12 @@ async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): Json<
                 
                 let order_id = req.id;
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in req.items {
+                for mut item in req.items {
+                    // 数量同步：保存时若销售数量为 0 而预售数量 > 0，
+                    // 用预售数量兜底，避免后续生成采购时数量为 0 的空明细
+                    if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
+                        item.quantity = item.pre_sale_quantity.unwrap();
+                    }
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -17476,43 +17592,54 @@ async fn api_sales_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i
     }
 }
 
-async fn api_sales_order_export(headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn api_sales_order_export(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     // 行级数据权限：purchaser 只能导出自己采购单位的销售单
     let ctx = get_user_ctx(&headers).await;
-    let mut sql = String::from(
-        "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name,
-                soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.pre_sale_quantity, soi.quantity, soi.unit_price, soi.base_quantity, soi.amount, soi.remark as item_remark
-         FROM sales_order so 
-         JOIN purchaser p ON so.purchaser_id = p.id
-         LEFT JOIN sales_order_item soi ON so.id = soi.order_id"
-    );
-    let mut binds: Vec<i64> = Vec::new();
-    if ctx.role == "purchaser" {
-        sql.push_str(" WHERE so.purchaser_id = ?");
-        binds.push(ctx.purchaser_id);
-    }
-    sql.push_str(" ORDER BY so.id, soi.id");
+    let keyword_pattern = parse_keyword_pattern(&params);
 
-    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
-    for b in &binds {
-        q = q.bind(b);
-    }
-    let rows = q.fetch_all(pool()).await.unwrap_or_default();
-    
+    // 行级数据权限 + 筛选：purchaser 强制只看自己，其他角色可按 purchaser_id 过滤
+    let purchaser_id: Option<i64> = if ctx.role == "purchaser" {
+        if ctx.purchaser_id > 0 { Some(ctx.purchaser_id) } else { Some(-1) }
+    } else {
+        params.get("purchaser_id").and_then(|s| s.parse().ok())
+    };
+
+    let base_sql = "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.status, so.remark, p.name as purchaser_name,
+                           soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.pre_sale_quantity, soi.quantity, soi.unit_price, soi.base_quantity, soi.amount, soi.remark as item_remark
+                    FROM sales_order so
+                    JOIN purchaser p ON so.purchaser_id = p.id
+                    LEFT JOIN sales_order_item soi ON so.id = soi.order_id
+                    WHERE (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)";
+    let rows: Vec<sqlx::sqlite::SqliteRow> = if let Some(pid) = purchaser_id {
+        let sql = format!("{} AND so.purchaser_id = ? ORDER BY so.id, soi.id", base_sql);
+        let q = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&keyword_pattern).bind(&keyword_pattern).bind(&keyword_pattern)
+            .bind(pid);
+        q.fetch_all(pool()).await.unwrap_or_default()
+    } else {
+        let sql = format!("{} ORDER BY so.id, soi.id", base_sql);
+        let q = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&keyword_pattern).bind(&keyword_pattern).bind(&keyword_pattern);
+        q.fetch_all(pool()).await.unwrap_or_default()
+    };
+
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
         let worksheet = workbook.add_worksheet();
-        
+
         let header_format = Format::new()
             .set_bold()
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
-        
+
         let headers = ["订单ID", "订单号", "订单日期", "采购单位", "总金额", "下浮率(%)", "下浮后合计", "状态", "备注", "商品名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "预售数量", "数量", "单价", "基本数量", "金额", "商品备注"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
-        
+
         let mut row_idx = 1;
         for row in rows {
             worksheet.write(row_idx, 0, row.get::<i64, _>("id"))?;
@@ -17537,7 +17664,7 @@ async fn api_sales_order_export(headers: axum::http::HeaderMap) -> impl IntoResp
             worksheet.write(row_idx, 19, row.get::<Option<String>, _>("item_remark").unwrap_or_default())?;
             row_idx += 1;
         }
-        
+
         worksheet.set_column_width(0, 8)?;
         worksheet.set_column_width(1, 18)?;
         worksheet.set_column_width(2, 12)?;
@@ -17558,10 +17685,10 @@ async fn api_sales_order_export(headers: axum::http::HeaderMap) -> impl IntoResp
         worksheet.set_column_width(17, 10)?;
         worksheet.set_column_width(18, 10)?;
         worksheet.set_column_width(19, 15)?;
-        
+
         workbook.save_to_buffer()
     })();
-    
+
     match result {
         Ok(data) => (
             StatusCode::OK,
@@ -19045,17 +19172,27 @@ async fn api_sales_order_generate_purchase(
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string()).into_response();
     }
     let order_date = row.get::<String, _>("order_date");
-    let warehouse_id = row.get::<i64, _>("warehouse_id");
-    let warehouse_name = row.get::<Option<String>, _>("warehouse_name").unwrap_or_default();
+    let so_warehouse_id = row.get::<i64, _>("warehouse_id");
+    let so_warehouse_name = row.get::<Option<String>, _>("warehouse_name").unwrap_or_default();
 
-    // 重复生成检查：是否已存在源自该销售订单的采购订单
+    // 重复生成检查：是否已存在本销售单关联的采购订单
     // 已处理（非 pending）的采购订单受保护，不允许覆盖；
-    // pending 状态的采购订单在用户确认后会先删除再重新生成，避免重复
-    let existed: Vec<(i64, String, String, String)> = sqlx::query(
+    // pending 状态在 force=true 时会被删除并重新合并，避免用户重复点击产生重复明细
+    //
+    // 检测范围（必须全部命中才算"已存在"）：
+    //   1) 主表 source_sales_order_id = id（首次创建时的销售单）
+    //   2) 明细中 source_sales_order_id IN (id, 0) — 兼容迁移前旧数据与 force 删除后残留
+    //   3) 当天同供应商已存在的非取消 PO（合并场景：首次创建来自其他销售单）
+    // 三路任一命中即视为本销售单已生成过
+    let mut existed: Vec<(i64, String, String, String)> = sqlx::query(
         "SELECT po.id, po.order_no, po.status, COALESCE(s.name, '未知供应商') as supplier_name
          FROM purchase_order po LEFT JOIN supplier s ON po.supplier_id = s.id
-         WHERE po.source_sales_order_id = ? ORDER BY po.id"
+         WHERE po.source_sales_order_id = ?
+            OR EXISTS (SELECT 1 FROM purchase_order_item poi
+                       WHERE poi.order_id = po.id AND (poi.source_sales_order_id = ? OR poi.source_sales_order_id = 0))
+         ORDER BY po.id"
     )
+    .bind(id)
     .bind(id)
     .fetch_all(pool())
     .await
@@ -19069,8 +19206,56 @@ async fn api_sales_order_generate_purchase(
     ))
     .collect();
 
+    // 兜底：当天同供应商已存在非取消 PO（按"供应商+日期"合并到他人 PO 的场景）
+    if existed.is_empty() {
+        let involved_suppliers: Vec<(i64,)> = sqlx::query(
+            "SELECT DISTINCT supplier_id FROM sales_order_item WHERE order_id = ? AND supplier_id > 0"
+        )
+        .bind(id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.get::<i64, _>("supplier_id"),))
+        .collect();
+        if !involved_suppliers.is_empty() {
+            // 拼 IN (?, ?, ?)
+            let placeholders = std::iter::repeat("?")
+                .take(involved_suppliers.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT po.id, po.order_no, po.status, COALESCE(s.name, '未知供应商') as supplier_name
+                 FROM purchase_order po LEFT JOIN supplier s ON po.supplier_id = s.id
+                 WHERE po.order_date = ? AND po.status != 'cancelled'
+                   AND po.supplier_id IN ({})
+                 ORDER BY po.id",
+                placeholders
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(&order_date);
+            for (sid,) in &involved_suppliers {
+                q = q.bind(sid);
+            }
+            existed = q
+                .fetch_all(pool())
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (
+                    r.get::<i64, _>("id"),
+                    r.get::<String, _>("order_no"),
+                    r.get::<String, _>("status"),
+                    r.get::<String, _>("supplier_name"),
+                ))
+                .collect();
+        }
+    }
+
+    // force 路径需要的旧明细（按 po 收集），仅当 force=true 时填充
+    // supplier_items 循环读取以做 UPDATE/INSERT/DELETE
+    let mut old_items_by_po: std::collections::HashMap<i64, Vec<(i64, i64, String, f64, f64)>> = std::collections::HashMap::new();
+
     if !existed.is_empty() {
-        // 区分可重建（pending）与已处理（非 pending）的采购订单
         let status_text = |s: &str| match s {
             "pending" => "待分拣",
             "sorting" => "分拣中",
@@ -19084,7 +19269,6 @@ async fn api_sales_order_generate_purchase(
         let pending: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 == "pending").collect();
         let processed: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 != "pending").collect();
 
-        // 存在已处理的采购订单：不允许重新生成，避免覆盖已发生的业务数据
         if !processed.is_empty() {
             let detail = processed.iter()
                 .map(|x| format!("{}（{}，状态：{}）", x.1, x.3, status_text(&x.2)))
@@ -19099,7 +19283,6 @@ async fn api_sales_order_generate_purchase(
             ).into_response();
         }
 
-        // 全部为 pending 状态：提示用户确认后删除旧的再重新生成
         if !force {
             let detail = pending.iter()
                 .map(|x| format!("{}（{}）", x.1, x.3))
@@ -19110,28 +19293,91 @@ async fn api_sales_order_generate_purchase(
                 serde_json::json!({
                     "warning": true,
                     "count": pending.len(),
-                    "message": format!("该销售订单已生成过 {} 张采购订单（均为待分拣状态）：{}\n重新生成将删除旧单并按最新销售订单重新生成，是否继续？", pending.len(), detail)
+                    "message": format!("该销售订单已生成过 {} 张采购订单（均为待分拣状态）：{}\n继续操作将对存在的采购订单对应的明细进行增删改（按新销售单明细），是否继续？", pending.len(), detail)
                 }).to_string(),
             ).into_response();
         }
 
-        // force=true：删除所有 pending 状态的旧采购订单及其明细
+        // force=true 准备：
+        // 不再"先删后插"，改为"对现存明细做 CRUD"。
+        // 1) 收集本销售单所贡献的现存 PO
+        // 2) 这些 PO 中本销售单已有的明细(source=id OR 0)暂存为 old_items_by_po
+        // 3) supplier_items 循环里据此做 UPDATE/INSERT/DELETE
+        // 注：已删除的 PO 不在范围内，无须处理
+
+        // 收集本销售单所贡献的 PO（按主表 source_sales_order_id 命中）
+        let mut affected_po_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for x in &pending {
-            sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
-                .bind(x.0)
-                .execute(pool())
-                .await
-                .ok();
-            sqlx::query("DELETE FROM purchase_order WHERE id = ?")
-                .bind(x.0)
-                .execute(pool())
-                .await
-                .ok();
+            affected_po_ids.insert(x.0);
+        }
+
+        // 兜底：按 supplier_id + order_date 找出当天所有非取消 PO，让重算也能覆盖到
+        // （例如本销售单明细合并到他人创建的 PO 时）
+        let po_pool: Vec<(i64, i64, String)> = sqlx::query(
+            "SELECT po.id, po.supplier_id, po.status FROM purchase_order po WHERE po.order_date = ? AND po.status != 'cancelled'"
+        )
+        .bind(&order_date)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.get::<i64, _>("id"), r.get::<i64, _>("supplier_id"), r.get::<String, _>("status")))
+        .collect();
+
+        // 计算该销售单涉及的 supplier_id 集合（来自明细），用于过滤受影响的 PO
+        let mut involved_supplier_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let preview_items: Vec<(i64,)> = sqlx::query(
+            "SELECT supplier_id FROM sales_order_item WHERE order_id = ?"
+        )
+        .bind(id)
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.get::<i64, _>("supplier_id"),))
+        .collect();
+        for (sid,) in &preview_items {
+            if *sid > 0 {
+                involved_supplier_ids.insert(*sid);
+            }
+        }
+        for (_po_id, sid, _status) in &po_pool {
+            if involved_supplier_ids.contains(sid) {
+                affected_po_ids.insert(*_po_id);
+            }
+        }
+
+        // 拉取每个 affected PO 中本销售单已有的明细（source=id OR 0）
+        // 暂存为 po_id -> Vec<(id, product_id, sales_unit, quantity, amount)>
+        for po_id in &affected_po_ids {
+            let rows: Vec<(i64, i64, String, f64, f64)> = sqlx::query(
+                "SELECT id, product_id, COALESCE(sales_unit, '') as sales_unit, quantity, COALESCE(amount, 0) as amount
+                 FROM purchase_order_item
+                 WHERE order_id = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
+            )
+            .bind(po_id)
+            .bind(id)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (
+                r.get::<i64, _>("id"),
+                r.get::<i64, _>("product_id"),
+                r.get::<String, _>("sales_unit"),
+                r.get::<f64, _>("quantity"),
+                r.get::<f64, _>("amount"),
+            ))
+            .collect();
+            if !rows.is_empty() {
+                old_items_by_po.insert(*po_id, rows);
+            }
         }
     }
-    
+
+    // 取销售订单明细（含销售单位 unit、备注）
     let item_rows = sqlx::query(
-        "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.supplier_id, soi.supplier_name, p.purchase_price, p.base_unit, p.base_price
+        "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.supplier_id, soi.supplier_name, soi.remark, p.purchase_price, p.base_unit, p.base_price
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          WHERE soi.order_id = ?"
     )
@@ -19139,9 +19385,11 @@ async fn api_sales_order_generate_purchase(
     .fetch_all(pool())
     .await
     .unwrap_or_default();
-    
-    let mut supplier_items: std::collections::HashMap<i64, Vec<(i64, String, String, String, String, String, f64, f64, f64, String, f64)>> = std::collections::HashMap::new();
-    
+
+    // 按供应商分组明细；每个 (supplier_id, product_id, warehouse_id, sales_unit) 唯一
+    // 单条销售明细条目的结构：(product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, base_unit, base_price, remark)
+    let mut supplier_items: std::collections::HashMap<i64, Vec<(i64, String, String, String, String, String, f64, f64, f64, String, f64, String)>> = std::collections::HashMap::new();
+
     for r in &item_rows {
         let supplier_id = r.get::<i64, _>("supplier_id");
         if supplier_id == 0 {
@@ -19154,67 +19402,170 @@ async fn api_sales_order_generate_purchase(
         let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
         let quantity = r.get::<f64, _>("quantity");
-        let pre_sale_quantity = r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0);
+        // ordered_quantity 由销售订单的预售数量生成：两者需保持同步
+        let ordered_quantity = r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(quantity);
         let purchase_price = r.get::<f64, _>("purchase_price");
         let base_unit = r.get::<Option<String>, _>("base_unit").unwrap_or_default();
         let base_price = r.get::<f64, _>("base_price");
-        
+        let remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
+
         let unit_price = if purchase_price > 0.0 { purchase_price } else { base_price };
-        
+
         supplier_items.entry(supplier_id).or_insert_with(Vec::new).push(
-            (product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, base_unit, base_price)
+            (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, base_unit, base_price, remark)
         );
     }
-    
+
     if supplier_items.is_empty() {
         return (StatusCode::BAD_REQUEST, serde_json::json!({ "message": "销售订单中没有供应商信息，无法生成采购订单" }).to_string()).into_response();
     }
-    
+
     let mut created_count = 0;
-    
+    let mut merged_count = 0;
+
     for (supplier_id, items) in supplier_items {
-        let supplier_name_result = sqlx::query("SELECT name FROM supplier WHERE id = ?")
-            .bind(supplier_id)
-            .fetch_optional(pool())
-            .await
-            .unwrap_or(None);
-        
-        let _supplier_name = match supplier_name_result {
-            Some(sr) => sr.get::<String, _>("name"),
-            None => "未知供应商".to_string(),
-        };
-        
-        let order_no = generate_order_no("purchase", &order_date).await;
-        
-        let mut total_amount = 0.0;
-        for (_, _, _, _, _, _, qty, _, price, _, _) in &items {
-            total_amount += qty * price;
+        // 计算该供应商所有明细的合计（用于新建 PO 时初始化主表金额）
+        let mut total_amount: f64 = 0.0;
+        let wh_id_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut wh_names: Vec<String> = Vec::new();
+        for (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, _base_unit, _base_price, remark) in &items {
+            total_amount += quantity * unit_price;
+            if !wh_names.contains(unit) && !unit.trim().is_empty() {
+                wh_names.push(unit.clone());
+            }
+            let _ = (product_id, product_name, alias1, alias2, spec, ordered_quantity, remark);
         }
-        
-        let result = sqlx::query(
-            "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        // 主表仓库从销售订单的 warehouse 取（销售单的仓库为唯一入口仓库）
+        let main_wh_id = so_warehouse_id;
+        let main_wh_name = so_warehouse_name.clone();
+        let _ = (wh_id_set, wh_names, total_amount);
+
+        // 查找当天同供应商是否已有非取消的采购订单
+        let existing_po: Option<i64> = sqlx::query(
+            "SELECT id FROM purchase_order WHERE supplier_id = ? AND order_date = ? AND status != 'cancelled' ORDER BY id LIMIT 1"
         )
         .bind(supplier_id)
-        .bind(&order_no)
         .bind(&order_date)
-        .bind(total_amount)
-        .bind(0.0)
-        .bind(0.0)
-        .bind(total_amount)
-        .bind(warehouse_id)
-        .bind(&warehouse_name)
-        .bind(None::<String>)
-        .bind(id)
-        .execute(pool())
-        .await;
-        
-        if let Ok(res) = result {
-            let po_id = res.last_insert_rowid();
-            for (product_id, product_name, alias1, alias2, spec, unit, quantity, pre_sale_quantity, unit_price, _base_unit, _base_price) in items {
-                let amount = quantity * unit_price;
-                let base_quantity = quantity;
-                sqlx::query(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        .fetch_optional(pool())
+        .await
+        .unwrap_or(None)
+        .map(|r| r.get::<i64, _>("id"));
+
+        let po_id: i64 = if let Some(existing_id) = existing_po {
+            existing_id
+        } else {
+            let supplier_name_result = sqlx::query("SELECT name FROM supplier WHERE id = ?")
+                .bind(supplier_id)
+                .fetch_optional(pool())
+                .await
+                .unwrap_or(None);
+            let _supplier_name = match supplier_name_result {
+                Some(sr) => sr.get::<String, _>("name"),
+                None => "未知供应商".to_string(),
+            };
+
+            let order_no = generate_order_no("purchase", &order_date).await;
+
+            let insert_res = sqlx::query(
+                "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(supplier_id)
+            .bind(&order_no)
+            .bind(&order_date)
+            .bind(0.0)
+            .bind(0.0)
+            .bind(0.0)
+            .bind(0.0)
+            .bind(main_wh_id)
+            .bind(&main_wh_name)
+            .bind(None::<String>)
+            .bind(id)
+            .execute(pool())
+            .await;
+
+            match insert_res {
+                Ok(res) => {
+                    created_count += 1;
+                    res.last_insert_rowid()
+                }
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "message": format!("创建采购订单失败: {}", e) }).to_string()).into_response();
+                }
+            }
+        };
+
+        // 拉取 PO 中本销售单已存在的明细（按 product_id+sales_unit 去重，仅本销售单贡献的）
+        // 这样其他销售单贡献的明细不会被错误合并
+        // 注意：force=true 路径下，old_items_by_po 已包含待 diff 的旧明细，此处复用之
+        let existing_items: Vec<(i64, f64, String)> = if let Some(old_rows) = old_items_by_po.get(&po_id) {
+            old_rows.iter().map(|(_id, pid, sunit, qty, _amt)| (*pid, *qty, sunit.clone())).collect()
+        } else {
+            sqlx::query(
+                "SELECT product_id, quantity, COALESCE(sales_unit, '') as sales_unit
+                 FROM purchase_order_item WHERE order_id = ? AND source_sales_order_id = ?"
+            )
+            .bind(po_id)
+            .bind(id)
+            .fetch_all(pool())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (
+                r.get::<i64, _>("product_id"),
+                r.get::<f64, _>("quantity"),
+                r.get::<String, _>("sales_unit"),
+            ))
+            .collect()
+        };
+
+        // 累计新增/合并/删除的合计金额（用于主表汇总）
+        let mut added_amount: f64 = 0.0;
+        let mut removed_amount: f64 = 0.0;
+        let mut added_lines: i64 = 0;
+        let mut removed_lines: i64 = 0;
+        let mut updated_lines: i64 = 0;
+
+        // 复制一份旧明细的"待消费"列表，CRUD 完后剩余 = 待删除
+        let mut to_delete: Vec<(i64, i64, String, f64, f64)> = if let Some(old_rows) = old_items_by_po.get(&po_id) {
+            old_rows.clone()
+        } else {
+            Vec::new()
+        };
+
+        for (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, _base_unit, _base_price, remark) in items {
+            let amount = quantity * unit_price;
+            let base_quantity = quantity;
+            let sales_unit = unit.clone();
+
+            // 在旧明细中找 (product_id, sales_unit) 匹配的项
+            if let Some(dup_idx) = to_delete.iter().position(|(_id, pid, sunit, _q, _a)| {
+                *pid == product_id && sunit.trim() == sales_unit.trim()
+            }) {
+                let (_old_id, _old_pid, _old_sunit, _old_qty, old_amount) = to_delete.remove(dup_idx).clone();
+                // 重新生成时同步：数量按销售 quantity，订购数量按销售预售数量
+                // 主表金额 delta = 新 amount - 旧 amount（替换而非新增）
+                let new_amount = quantity * unit_price;
+                let _ = sqlx::query(
+                    "UPDATE purchase_order_item SET quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ? WHERE order_id = ? AND product_id = ? AND COALESCE(sales_unit, '') = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
+                )
+                .bind(quantity)
+                .bind(quantity)
+                .bind(new_amount)
+                .bind(ordered_quantity)
+                .bind(po_id)
+                .bind(product_id)
+                .bind(sales_unit.trim())
+                .bind(id)
+                .execute(pool())
+                .await
+                .ok();
+                added_amount += new_amount;
+                removed_amount += old_amount;
+                updated_lines += 1;
+            } else {
+                // 不同的 product 或 sales_unit 或不同销售单 视为新明细
+                let _ = sqlx::query(
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name, sales_unit, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 .bind(po_id)
                 .bind(product_id)
@@ -19227,20 +19578,85 @@ async fn api_sales_order_generate_purchase(
                 .bind(quantity)
                 .bind(base_quantity)
                 .bind(amount)
-                .bind(pre_sale_quantity)
-                .bind(None::<String>)
+                .bind(ordered_quantity)
+                .bind(&remark)
+                .bind(main_wh_id)
+                .bind(&main_wh_name)
+                .bind(&sales_unit)
+                .bind(id)
                 .execute(pool())
                 .await
                 .ok();
+                added_amount += amount;
+                added_lines += 1;
             }
-            created_count += 1;
         }
-    }
-    
-    log_operation(&ctx, "sales_order.generate_purchase", "sales_order", &id.to_string(),
-        &format!("由销售单生成采购订单，成功 {} 张", created_count)).await;
 
-    (StatusCode::OK, serde_json::json!({ "count": created_count, "message": format!("成功生成 {} 张采购订单", created_count) }).to_string()).into_response()
+        // 删除 to_delete 剩余的旧明细（新销售单不再包含）
+        for (old_id, _pid, _sunit, _q, old_amt) in &to_delete {
+            let _ = sqlx::query(
+                "DELETE FROM purchase_order_item WHERE id = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
+            )
+            .bind(old_id)
+            .bind(id)
+            .execute(pool())
+            .await
+            .ok();
+            removed_amount += old_amt;
+            removed_lines += 1;
+        }
+
+        // 同步更新主表总金额：新增/更新 + 金额，删除 - 金额
+        if added_amount != 0.0 || removed_amount != 0.0 {
+            let delta = added_amount - removed_amount;
+            let _ = sqlx::query(
+                "UPDATE purchase_order SET total_amount = COALESCE(total_amount, 0) + ?, final_amount = COALESCE(final_amount, 0) + ? WHERE id = ?"
+            )
+            .bind(delta)
+            .bind(delta)
+            .bind(po_id)
+            .execute(pool())
+            .await
+            .ok();
+        }
+
+        // 全部明细删空则删主表
+        if force {
+            let remain: i64 = sqlx::query("SELECT COUNT(*) as c FROM purchase_order_item WHERE order_id = ?")
+                .bind(po_id)
+                .fetch_one(pool())
+                .await
+                .map(|r| r.get::<i64, _>("c"))
+                .unwrap_or(0);
+            if remain == 0 {
+                let _ = sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+                    .bind(po_id)
+                    .execute(pool())
+                    .await;
+            }
+        }
+
+        merged_count += updated_lines + added_lines;
+        let _ = removed_lines;
+        let _ = added_lines;
+        let _ = existing_items; // 兼容旧变量（CRUD 路径下不再使用）
+    }
+
+    log_operation(&ctx, "sales_order.generate_purchase", "sales_order", &id.to_string(),
+        &format!("由销售单生成采购订单，新建 {} 张，合并明细 {} 条", created_count, merged_count)).await;
+
+    let msg = if created_count > 0 && merged_count > 0 {
+        format!("成功生成 {} 张采购订单，并合并 {} 条相同明细", created_count, merged_count)
+    } else if created_count > 0 {
+        format!("成功生成 {} 张采购订单", created_count)
+    } else {
+        format!("已将销售明细合并到已有采购订单（{} 条合并）", merged_count)
+    };
+    (StatusCode::OK, serde_json::json!({
+        "count": created_count,
+        "merged": merged_count,
+        "message": msg
+    }).to_string()).into_response()
 }
 
 async fn api_query_product_rank(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
@@ -19707,16 +20123,24 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
         purchase_where.push_str(&format!(" AND po.order_date <= '{}'", end_date));
     }
     let purchase_sql = format!(
-        "SELECT po.order_date as day,
-                COALESCE(po.warehouse_id, 0) as warehouse_id,
-                COALESCE(po.warehouse_name, '未指定') as warehouse_name,
-                COALESCE(SUM(poi.amount), 0) as in_amount,
-                COUNT(poi.id) as in_item_count,
-                COUNT(DISTINCT po.id) as in_order_count
-         FROM purchase_order po
-         JOIN purchase_order_item poi ON poi.order_id = po.id
-         {}
-         GROUP BY po.order_date, po.warehouse_id, po.warehouse_name",
+        "WITH src AS (
+            SELECT po.order_date as day,
+                   COALESCE(poi.warehouse_id, po.warehouse_id, 0) as warehouse_id,
+                   COALESCE(NULLIF(TRIM(poi.warehouse_name), ''), po.warehouse_name, '未指定') as warehouse_name,
+                   poi.amount as amount,
+                   po.id as po_id
+            FROM purchase_order po
+            JOIN purchase_order_item poi ON poi.order_id = po.id
+            {}
+         )
+         SELECT day,
+                warehouse_id,
+                warehouse_name,
+                COALESCE(SUM(amount), 0) as in_amount,
+                COUNT(*) as in_item_count,
+                COUNT(DISTINCT po_id) as in_order_count
+         FROM src
+         GROUP BY day, warehouse_id, warehouse_name",
         purchase_where
     );
     let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
@@ -19875,16 +20299,24 @@ async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (V
     if !start_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date)); }
     if !end_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date <= '{}'", end_date)); }
     let purchase_sql = format!(
-        "SELECT po.order_date as day,
-                COALESCE(po.warehouse_id, 0) as warehouse_id,
-                COALESCE(po.warehouse_name, '未指定') as warehouse_name,
-                COALESCE(SUM(poi.amount), 0) as in_amount,
-                COUNT(poi.id) as in_item_count,
-                COUNT(DISTINCT po.id) as in_order_count
-         FROM purchase_order po
-         JOIN purchase_order_item poi ON poi.order_id = po.id
-         {}
-         GROUP BY po.order_date, po.warehouse_id, po.warehouse_name",
+        "WITH src AS (
+            SELECT po.order_date as day,
+                   COALESCE(poi.warehouse_id, po.warehouse_id, 0) as warehouse_id,
+                   COALESCE(NULLIF(TRIM(poi.warehouse_name), ''), po.warehouse_name, '未指定') as warehouse_name,
+                   poi.amount as amount,
+                   po.id as po_id
+            FROM purchase_order po
+            JOIN purchase_order_item poi ON poi.order_id = po.id
+            {}
+         )
+         SELECT day,
+                warehouse_id,
+                warehouse_name,
+                COALESCE(SUM(amount), 0) as in_amount,
+                COUNT(*) as in_item_count,
+                COUNT(DISTINCT po_id) as in_order_count
+         FROM src
+         GROUP BY day, warehouse_id, warehouse_name",
         purchase_where
     );
     let purchase_rows = sqlx::query(AssertSqlSafe(purchase_sql.as_str()))
@@ -20839,6 +21271,13 @@ async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): Json<
                 
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
                 for item in &req.items {
+                    // 数量同步：保存时若销售数量为 0 而预售数量 > 0，
+                    // 用预售数量兜底，避免后续生成采购时数量为 0 的空明细
+                    let quantity = if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
+                        item.pre_sale_quantity.unwrap()
+                    } else {
+                        item.quantity
+                    };
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -20848,7 +21287,7 @@ async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): Json<
                         .bind(&item.spec)
                         .bind(&item.unit)
                         .bind(item.unit_price)
-                        .bind(item.quantity)
+                        .bind(quantity)
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
                         .bind(item.pre_sale_quantity.unwrap_or(0.0))
@@ -24987,19 +25426,32 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
     }
 }
 
-async fn api_sales_order_sort_items_by_purchaser() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_purchaser(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no
-         FROM sales_order_item soi 
+         FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY p.name, soi.product_name"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         WHERE so.status IN ('pending', 'sorting'){} 
+         ORDER BY p.name, soi.product_name",
+        where_extra
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
     
     let mut purchaser_map: std::collections::HashMap<i64, serde_json::Value> = std::collections::HashMap::new();
     
@@ -25039,23 +25491,36 @@ async fn api_sales_order_sort_items_by_purchaser() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&purchasers).unwrap())
 }
 
-async fn api_sales_order_sort_items_by_purchaser_excel() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_purchaser_excel(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
                 pc.name as category_name, pc.parent_id, pc2.name as parent_name
-         FROM sales_order_item soi 
+         FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category pc ON pr.category_id = pc.id
          LEFT JOIN category pc2 ON pc.parent_id = pc2.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY p.name, soi.product_name"
-    )
-    .fetch_all(pool())
-    .await
-    .unwrap_or_default();
+         WHERE so.status IN ('pending', 'sorting'){}
+         ORDER BY p.name, soi.product_name",
+        where_extra
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool())
+        .await
+        .unwrap_or_default();
     
     let price_rows = sqlx::query(
         "SELECT poi.product_id, MAX(poi.unit_price) as max_price, MIN(poi.unit_price) as min_price,
