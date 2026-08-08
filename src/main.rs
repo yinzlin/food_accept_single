@@ -10321,11 +10321,15 @@ async fn page_mobile_sort() -> Html<String> {
         </div>
     </div>
     
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史分拣，留空显示当前待分拣">
+        <button onclick="loadItems()">检索历史分拣</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
     <div class="filter-bar">
-        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
-        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="resetDateFilter()">清除</button>
+        <button class="clear" onclick="clearSearch()">清除</button>
     </div>
     </div>
     
@@ -10351,7 +10355,10 @@ async fn page_mobile_sort() -> Html<String> {
 
         async function loadItems() {
             try {
-                const res = await fetch('/api/sales_order/sort_items');
+                const date = document.getElementById('historyDate').value;
+                let url = '/api/sales_order/sort_items';
+                if (date) url += '?date=' + encodeURIComponent(date);
+                const res = await fetch(url);
                 items = await res.json();
                 loadCheckedState();
                 loadCorrectedQuantities();
@@ -10473,6 +10480,12 @@ async fn page_mobile_sort() -> Html<String> {
             renderItems();
         }
 
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
+            document.getElementById('searchInput').value = '';
+            loadItems();
+        }
+
         function updateStats() {
             document.getElementById('totalCount').textContent = items.length;
             document.getElementById('checkedCount').textContent = checkedIds.size;
@@ -10519,7 +10532,10 @@ async fn page_mobile_sort() -> Html<String> {
         }
 
         function exportExcel() {
-            window.location.href = '/api/sales_order/sort_items_excel';
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/sales_order/sort_items_excel';
+            if (date) url += '?date=' + encodeURIComponent(date);
+            window.location.href = url;
         }
 
         loadItems();
@@ -10613,11 +10629,15 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
         </div>
     </div>
     
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史分拣，留空显示当前待分拣">
+        <button onclick="loadItems()">检索历史分拣</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
     <div class="filter-bar">
-        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
-        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="resetDateFilter()">清除</button>
+        <button class="clear" onclick="clearSearch()">清除</button>
     </div>
     </div>
     
@@ -10643,13 +10663,9 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
 
         async function loadItems() {
             try {
-                const startDate = document.getElementById('startDate').value;
-                const endDate = document.getElementById('endDate').value;
+                const date = document.getElementById('historyDate').value;
                 let url = '/api/sales_order/sort_items_by_purchaser';
-                const params = [];
-                if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
-                if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
-                if (params.length > 0) url += '?' + params.join('&');
+                if (date) url += '?date=' + encodeURIComponent(date);
                 const res = await fetch(url);
                 purchasers = await res.json();
                 loadCheckedState();
@@ -10661,9 +10677,8 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
             }
         }
 
-        function resetDateFilter() {
-            document.getElementById('startDate').value = '';
-            document.getElementById('endDate').value = '';
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
             document.getElementById('searchInput').value = '';
             loadItems();
         }
@@ -10854,13 +10869,9 @@ async fn page_mobile_sort_by_purchaser() -> Html<String> {
         }
 
         function exportExcel() {
-            const startDate = document.getElementById('startDate').value;
-            const endDate = document.getElementById('endDate').value;
-            const params = [];
-            if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
-            if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+            const date = document.getElementById('historyDate').value;
             let url = '/api/sales_order/sort_items_by_purchaser_excel';
-            if (params.length > 0) url += '?' + params.join('&');
+            if (date) url += '?date=' + encodeURIComponent(date);
             window.location.href = url;
         }
 
@@ -10969,11 +10980,15 @@ async fn page_mobile_sort_by_category() -> Html<String> {
         </div>
     </div>
     
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史分拣，留空显示当前待分拣">
+        <button onclick="loadItems()">检索历史分拣</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
     <div class="filter-bar">
-        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
-        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="resetDateFilter()">清除</button>
+        <button class="clear" onclick="clearSearch()">清除</button>
     </div>
     </div>
     
@@ -10999,13 +11014,9 @@ async fn page_mobile_sort_by_category() -> Html<String> {
 
         async function loadItems() {
             try {
-                const startDate = document.getElementById('startDate').value;
-                const endDate = document.getElementById('endDate').value;
+                const date = document.getElementById('historyDate').value;
                 let url = '/api/sales_order/sort_items_by_category';
-                const params = [];
-                if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
-                if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
-                if (params.length > 0) url += '?' + params.join('&');
+                if (date) url += '?date=' + encodeURIComponent(date);
                 const res = await fetch(url);
                 categories = await res.json();
                 loadCheckedState();
@@ -11136,9 +11147,8 @@ async fn page_mobile_sort_by_category() -> Html<String> {
             renderItems();
         }
 
-        function resetDateFilter() {
-            document.getElementById('startDate').value = '';
-            document.getElementById('endDate').value = '';
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
             document.getElementById('searchInput').value = '';
             loadItems();
         }
@@ -11261,12 +11271,10 @@ async fn page_mobile_sort_by_category() -> Html<String> {
         }
 
         function exportExcel() {
-            const startDate = document.getElementById('startDate').value;
-            const endDate = document.getElementById('endDate').value;
-            const params = [];
-            if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
-            if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
-            window.location.href = '/api/sales_order/sort_items_by_category_excel' + (params.length > 0 ? '?' + params.join('&') : '');
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/sales_order/sort_items_by_category_excel';
+            if (date) url += '?date=' + encodeURIComponent(date);
+            window.location.href = url;
         }
 
         loadItems();
@@ -11769,11 +11777,15 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
         </div>
     </div>
     
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史分拣，留空显示当前待分拣">
+        <button onclick="loadItems()">检索历史分拣</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
     <div class="filter-bar">
-        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
-        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="resetDateFilter()">清除</button>
+        <button class="clear" onclick="clearSearch()">清除</button>
     </div>
     </div>
     
@@ -11800,13 +11812,9 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
 
         async function loadItems() {
             try {
-                const startDate = document.getElementById('startDate').value;
-                const endDate = document.getElementById('endDate').value;
+                const date = document.getElementById('historyDate').value;
                 let url = '/api/sales_order/sort_comprehensive';
-                const params = [];
-                if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
-                if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
-                if (params.length > 0) url += '?' + params.join('&');
+                if (date) url += '?date=' + encodeURIComponent(date);
                 const res = await fetch(url);
                 purchasers = await res.json();
                 loadCheckedState();
@@ -11958,9 +11966,8 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
             renderItems();
         }
 
-        function resetDateFilter() {
-            document.getElementById('startDate').value = '';
-            document.getElementById('endDate').value = '';
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
             document.getElementById('searchInput').value = '';
             loadItems();
         }
@@ -12077,12 +12084,10 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
         }
 
         function exportExcel() {
-            const startDate = document.getElementById('startDate').value;
-            const endDate = document.getElementById('endDate').value;
-            const params = [];
-            if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
-            if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
-            window.location.href = '/api/sales_order/sort_comprehensive_excel' + (params.length > 0 ? '?' + params.join('&') : '');
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/sales_order/sort_comprehensive_excel';
+            if (date) url += '?date=' + encodeURIComponent(date);
+            window.location.href = url;
         }
 
         loadItems();
@@ -24566,31 +24571,27 @@ async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoR
     }
 }
 
-// 分拣相关 API 的日期筛选辅助函数
-fn build_date_where(params: &std::collections::HashMap<String, String>) -> String {
-    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
-    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
-    let mut where_extra = String::new();
-    if !start_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
-    }
-    if !end_date.is_empty() {
-        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
-    }
-    where_extra
-}
-
-async fn api_sales_order_sort_items() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY soi.product_name"
-    )
-    .fetch_all(pool())
+         {}
+         ORDER BY soi.product_name",
+        where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
     .await
     .unwrap_or_default();
     
@@ -24664,17 +24665,27 @@ async fn api_sales_order_sort_items() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
-async fn api_sales_order_sort_items_excel() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_excel(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY soi.product_name"
-    )
-    .fetch_all(pool())
+         {}
+         ORDER BY soi.product_name",
+        where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
     .await
     .unwrap_or_default();
     
@@ -24843,7 +24854,13 @@ async fn api_sales_order_sort_items_excel() -> impl IntoResponse {
 async fn api_sales_order_sort_items_by_category(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let where_extra = build_date_where(&params);
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
     let sql = format!(
         "SELECT soi.id as item_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
@@ -24852,12 +24869,13 @@ async fn api_sales_order_sort_items_by_category(
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting'){}
+         {}
          ORDER BY c.name, p.name, soi.product_name",
-        where_extra
+        where_sql
     );
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-    .fetch_all(pool())
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
     .await
     .unwrap_or_default();
     
@@ -24912,7 +24930,13 @@ async fn api_sales_order_sort_items_by_category(
 async fn api_sales_order_sort_items_by_category_excel(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let where_extra = build_date_where(&params);
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
     let sql = format!(
         "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
@@ -24921,12 +24945,13 @@ async fn api_sales_order_sort_items_by_category_excel(
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting'){}
+         {}
          ORDER BY c.name, p.name, soi.product_name",
-        where_extra
+        where_sql
     );
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-    .fetch_all(pool())
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
     .await
     .unwrap_or_default();
     
@@ -25557,19 +25582,26 @@ async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(param
 async fn api_sales_order_sort_items_by_purchaser(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let where_extra = build_date_where(&params);
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
-         WHERE so.status IN ('pending', 'sorting'){} 
+         {}
          ORDER BY p.name, soi.product_name",
-        where_extra
+        where_sql
     );
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-        .fetch_all(pool())
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
         .await
         .unwrap_or_default();
     
@@ -25614,7 +25646,13 @@ async fn api_sales_order_sort_items_by_purchaser(
 async fn api_sales_order_sort_items_by_purchaser_excel(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let where_extra = build_date_where(&params);
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
@@ -25625,12 +25663,13 @@ async fn api_sales_order_sort_items_by_purchaser_excel(
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category pc ON pr.category_id = pc.id
          LEFT JOIN category pc2 ON pc.parent_id = pc2.id
-         WHERE so.status IN ('pending', 'sorting'){}
+         {}
          ORDER BY p.name, soi.product_name",
-        where_extra
+        where_sql
     );
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-        .fetch_all(pool())
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
         .await
         .unwrap_or_default();
     
@@ -25817,7 +25856,13 @@ async fn api_sales_order_sort_items_by_purchaser_excel(
 async fn api_sales_order_sort_comprehensive(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let where_extra = build_date_where(&params);
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
@@ -25827,12 +25872,13 @@ async fn api_sales_order_sort_comprehensive(
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting'){}
+         {}
          ORDER BY p.name, c.name, soi.product_name",
-        where_extra
+        where_sql
     );
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-    .fetch_all(pool())
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
     .await
     .unwrap_or_default();
     
@@ -25953,7 +25999,13 @@ async fn api_sales_order_sort_comprehensive(
 async fn api_sales_order_sort_comprehensive_excel(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let where_extra = build_date_where(&params);
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
     let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
@@ -25963,12 +26015,13 @@ async fn api_sales_order_sort_comprehensive_excel(
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting'){}
+         {}
          ORDER BY p.name, c.name, soi.product_name",
-        where_extra
+        where_sql
     );
-    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-    .fetch_all(pool())
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date { q = q.bind(&date); }
+    let rows = q.fetch_all(pool())
     .await
     .unwrap_or_default();
     
