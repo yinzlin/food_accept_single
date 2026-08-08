@@ -24650,7 +24650,7 @@ async fn api_sales_order_sort_items(axum::extract::Query(params): axum::extract:
         }
     }
     
-    let items: Vec<serde_json::Value> = items_map.values()
+    let mut items: Vec<serde_json::Value> = items_map.values()
         .map(|v| {
             let mut v = v.clone();
             let purchasers: Vec<String> = v["purchaser_names"].as_array().unwrap()
@@ -24673,6 +24673,7 @@ async fn api_sales_order_sort_items(axum::extract::Query(params): axum::extract:
             v
         })
         .collect();
+    items.sort_by(|a, b| a["product_name"].as_str().unwrap_or("").cmp(b["product_name"].as_str().unwrap_or("")));
     
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
@@ -25650,7 +25651,8 @@ async fn api_sales_order_sort_items_by_purchaser(
         }));
     }
     
-    let purchasers: Vec<serde_json::Value> = purchaser_map.values().cloned().collect();
+    let mut purchasers: Vec<serde_json::Value> = purchaser_map.values().cloned().collect();
+    purchasers.sort_by(|a, b| a["purchaser_name"].as_str().unwrap_or("").cmp(b["purchaser_name"].as_str().unwrap_or("")));
     
     (StatusCode::OK, serde_json::to_string(&purchasers).unwrap())
 }
