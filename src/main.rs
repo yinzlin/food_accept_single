@@ -19255,6 +19255,9 @@ async fn api_sales_order_generate_purchase(
     // supplier_items 循环读取以做 UPDATE/INSERT/DELETE
     let mut old_items_by_po: std::collections::HashMap<i64, Vec<(i64, i64, String, f64, f64)>> = std::collections::HashMap::new();
 
+    // 收集 force 路径下受影响的 PO（后续清理不再有供应商明细的旧 PO 时需要）
+    let mut affected_po_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
     if !existed.is_empty() {
         let status_text = |s: &str| match s {
             "pending" => "待分拣",
@@ -19306,7 +19309,7 @@ async fn api_sales_order_generate_purchase(
         // 注：已删除的 PO 不在范围内，无须处理
 
         // 收集本销售单所贡献的 PO（按主表 source_sales_order_id 命中）
-        let mut affected_po_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        affected_po_ids = std::collections::HashSet::new();
         for x in &pending {
             affected_po_ids.insert(x.0);
         }
@@ -19422,6 +19425,8 @@ async fn api_sales_order_generate_purchase(
 
     let mut created_count = 0;
     let mut merged_count = 0;
+    // 跟踪已处理的 PO ID（force 清理时用于计算差集）
+    let mut processed_po_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     for (supplier_id, items) in supplier_items {
         // 计算该供应商所有明细的合计（用于新建 PO 时初始化主表金额）
@@ -19493,6 +19498,7 @@ async fn api_sales_order_generate_purchase(
                 }
             }
         };
+        processed_po_ids.insert(po_id);
 
         // 拉取 PO 中本销售单已存在的明细（按 product_id+sales_unit 去重，仅本销售单贡献的）
         // 这样其他销售单贡献的明细不会被错误合并
@@ -19640,6 +19646,62 @@ async fn api_sales_order_generate_purchase(
         let _ = removed_lines;
         let _ = added_lines;
         let _ = existing_items; // 兼容旧变量（CRUD 路径下不再使用）
+    }
+
+    // force 路径下，清理不再有当前供应商明细的旧 PO
+    // 场景：销售单原先有供应商 A 和 B 的明细，各生成了一张 PO。
+    // 用户修改销售单删除 B 的明细后 force=true 生成，supplier_items 循环只处理 A，
+    // B 的旧 PO 需要在此处清理
+    if force && !affected_po_ids.is_empty() {
+        let unprocessed: Vec<i64> = affected_po_ids.difference(&processed_po_ids).copied().collect();
+        for orphan_po_id in unprocessed {
+            // 计算本销售单贡献的旧明细金额
+            let orphan_removed: f64 = sqlx::query(
+                "SELECT COALESCE(SUM(amount), 0) as total FROM purchase_order_item WHERE order_id = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
+            )
+            .bind(orphan_po_id)
+            .bind(id)
+            .fetch_one(pool())
+            .await
+            .map(|r| r.get::<f64, _>("total"))
+            .unwrap_or(0.0);
+
+            // 删除本销售单贡献的明细
+            let _ = sqlx::query(
+                "DELETE FROM purchase_order_item WHERE order_id = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
+            )
+            .bind(orphan_po_id)
+            .bind(id)
+            .execute(pool())
+            .await;
+
+            // 同步更新主表金额（扣减被删除的旧明细金额）
+            if orphan_removed > 0.0 {
+                let _ = sqlx::query(
+                    "UPDATE purchase_order SET total_amount = COALESCE(total_amount, 0) - ?, final_amount = COALESCE(final_amount, 0) - ? WHERE id = ?"
+                )
+                .bind(orphan_removed)
+                .bind(orphan_removed)
+                .bind(orphan_po_id)
+                .execute(pool())
+                .await
+                .ok();
+            }
+
+            // 检查是否所有明细都被删空，是则删除主表
+            let remain: i64 = sqlx::query("SELECT COUNT(*) as c FROM purchase_order_item WHERE order_id = ?")
+                .bind(orphan_po_id)
+                .fetch_one(pool())
+                .await
+                .map(|r| r.get::<i64, _>("c"))
+                .unwrap_or(0);
+            if remain == 0 {
+                let _ = sqlx::query("DELETE FROM purchase_order WHERE id = ?")
+                    .bind(orphan_po_id)
+                    .execute(pool())
+                    .await;
+            }
+        }
     }
 
     log_operation(&ctx, "sales_order.generate_purchase", "sales_order", &id.to_string(),
