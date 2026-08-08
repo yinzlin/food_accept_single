@@ -1043,6 +1043,15 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 采购订单明细级仓库：同一订单的每行商品可分别入不同仓库
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN warehouse_id INTEGER DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN warehouse_name TEXT")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN user_id INTEGER DEFAULT 0")
         .execute(pool)
         .await;
@@ -1494,6 +1503,9 @@ struct PurchaseOrderItemReq {
     amount: f64,
     ordered_quantity: Option<f64>,
     remark: Option<String>,
+    /// 明细级仓库：同一订单各行可入不同仓库
+    warehouse_id: Option<i64>,
+    warehouse_name: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -4456,14 +4468,6 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         </div>
                     </div>
                     <div class="col-md-3">
-                        <label>入库仓库：</label>
-                        <div class="position-relative">
-                            <input type="text" id="warehouseInput" class="form-control" placeholder="单击选择 / 双击搜索" readonly>
-                            <input type="hidden" id="warehouseId" value="">
-                            <div id="warehouseDropdown" class="search-dropdown"></div>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
                         <label>订单号：</label>
                         <input type="text" id="orderNoInput" class="form-control" readonly>
                     </div>
@@ -4486,7 +4490,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
+                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:110px">仓库</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -4588,8 +4592,9 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             }}
             loadWarehouses();
 
-            function showWarehouseDropdown(filter) {{
-                const dropdown = document.getElementById('warehouseDropdown');
+            // 明细行仓库选择（每行独立）：单击弹下拉，双击可输入搜索
+            function showItemWarehouseDropdown(index, filter) {{
+                const dropdown = document.getElementById('warehouseDropdown_' + index);
                 if (!dropdown) return;
                 let list = warehouses;
                 if (filter) {{
@@ -4603,42 +4608,24 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
                 let html = '<ul class="search-results">';
                 list.forEach(w => {{
-                    html += '<li onclick="selectWarehouse(this)" data-id="' + w.id + '" data-name="' + w.name.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + w.name + '</li>';
+                    html += '<li onclick="selectItemWarehouse(' + index + ', this)" data-id="' + w.id + '" data-name="' + w.name.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + w.name + '</li>';
                 }});
                 html += '</ul>';
                 dropdown.innerHTML = html;
                 dropdown.style.display = 'block';
             }}
 
-            function selectWarehouse(li) {{
-                const input = document.getElementById('warehouseInput');
-                const dropdown = document.getElementById('warehouseDropdown');
-                if (li) {{
-                    document.getElementById('warehouseId').value = li.getAttribute('data-id');
-                    input.value = li.getAttribute('data-name');
+            function selectItemWarehouse(index, li) {{
+                const input = document.getElementById('warehouseInput_' + index);
+                const dropdown = document.getElementById('warehouseDropdown_' + index);
+                if (li && input) {{
+                    items[index].warehouse_id = parseInt(li.getAttribute('data-id')) || 0;
+                    items[index].warehouse_name = li.getAttribute('data-name');
+                    input.value = items[index].warehouse_name;
                     input.readOnly = true;
-                    dropdown.style.display = 'none';
+                    if (dropdown) dropdown.style.display = 'none';
                 }}
             }}
-
-            document.getElementById('warehouseInput').addEventListener('click', function() {{
-                showWarehouseDropdown('');
-            }});
-            document.getElementById('warehouseInput').addEventListener('dblclick', function() {{
-                this.readOnly = false;
-                this.value = '';
-                this.focus();
-                showWarehouseDropdown('');
-            }});
-            document.getElementById('warehouseInput').addEventListener('input', function() {{
-                showWarehouseDropdown(this.value);
-            }});
-            document.getElementById('warehouseInput').addEventListener('blur', function() {{
-                setTimeout(() => {{
-                    const dropdown = document.getElementById('warehouseDropdown');
-                    if (dropdown) dropdown.style.display = 'none';
-                }}, 200);
-            }});
 
             // 加载用户列表
             let users = [];
@@ -4854,7 +4841,7 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             loadOrders();
 
             function addItem() {{
-                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [] }});
+                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [], warehouse_id: 0, warehouse_name: '' }});
                 renderItems();
             }}
 
@@ -4899,6 +4886,19 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                             <td style="width:75px"><input type="text" value="${{item.quantity && item.quantity > 0 ? item.quantity.toFixed(2) : ''}}" onchange="updateQty(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'quantity')" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td style="width:85px"><input type="text" value="${{(item.unit_price || 0).toFixed(2)}}" onchange="updatePrice(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'unit_price')" class="form-control-sm text-right" enterkeyhint="next"></td>
                             <td style="width:110px">${{item.amount.toFixed(2)}}</td>
+                            <td style="width:110px">
+                                <div class="position-relative">
+                                    <input type="text" id="warehouseInput_${{index}}" class="form-control-sm" placeholder="单击选/双击搜" readonly
+                                           value="${{item.warehouse_name || ''}}"
+                                           onclick="showItemWarehouseDropdown(${{index}}, '')"
+                                           ondblclick="this.readOnly=false;this.value='';showItemWarehouseDropdown(${{index}},'')"
+                                           oninput="showItemWarehouseDropdown(${{index}}, this.value)"
+                                           onblur="setTimeout(function(){{var d=document.getElementById('warehouseDropdown_'+${{index}});if(d){{d.style.display='none';}}}},200)"
+                                           onkeydown="handleEnterKey(event, ${{index}}, 'warehouse')">
+                                    <input type="hidden" id="warehouseId_${{index}}" value="${{item.warehouse_id || 0}}">
+                                    <div id="warehouseDropdown_${{index}}" class="search-dropdown"></div>
+                                </div>
+                            </td>
                             <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'remark')" class="form-control-sm" placeholder="单品备注" enterkeyhint="next"></td>
                             <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
@@ -5326,8 +5326,8 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     discount_rate: parseFloat(document.getElementById('discountRateInput').value) || 0,
                     amount_reduction: parseFloat(document.getElementById('amountReductionInput').value) || 0,
                     final_amount: parseFloat(document.getElementById('finalAmount').textContent) || 0,
-                    warehouse_id: parseInt(document.getElementById('warehouseId').value) || 0,
-                    warehouse_name: document.getElementById('warehouseInput').value || '',
+                    warehouse_id: 0,
+                    warehouse_name: '',
                     user_id: parseInt(document.getElementById('handlerId').value) || null,
                     items: validItems,
                     remark: document.getElementById('remarkInput').value || null,
@@ -5354,8 +5354,6 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 currentVersion = order.version || 1;
                 document.getElementById('supplierId').value = order.supplier_id;
                 document.getElementById('supplierInput').value = order.supplier_name;
-                document.getElementById('warehouseId').value = order.warehouse_id || 0;
-                document.getElementById('warehouseInput').value = order.warehouse_name || '';
                 document.getElementById('orderNoInput').value = order.order_no;
                 document.getElementById('orderDateInput').value = order.order_date;
                 document.getElementById('remarkInput').value = order.remark || '';
@@ -5388,6 +5386,8 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         amount: item.amount || 0,
                         ordered_quantity: item.ordered_quantity || 0,
                         remark: item.remark || '',
+                        warehouse_id: item.warehouse_id || 0,
+                        warehouse_name: item.warehouse_name || '',
                         supplier_id: item.supplier_id || 0,
                         supplier_name: item.supplier_name || '',
                         base_unit: '',
@@ -5458,10 +5458,9 @@ async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 currentOrderId = null;
                 document.getElementById('supplierId').value = '';
                 document.getElementById('supplierInput').value = '';
-                document.getElementById('warehouseId').value = '';
-                document.getElementById('warehouseInput').value = '';
                 document.getElementById('orderNoInput').value = '';
-                document.getElementById('orderDateInput').value = '';
+                const d = new Date();
+                document.getElementById('orderDateInput').value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
                 document.getElementById('remarkInput').value = '';
                 document.getElementById('discountRateInput').value = '0';
                 items = [];
@@ -6779,7 +6778,8 @@ async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('warehouseId').value = '';
                 document.getElementById('warehouseInput').value = '';
                 document.getElementById('orderNoInput').value = '';
-                document.getElementById('orderDateInput').value = '';
+                const d = new Date();
+                document.getElementById('orderDateInput').value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
                 document.getElementById('remarkInput').value = '';
                 document.getElementById('discountRateInput').value = '20';
                 setSalesOrderImage('customer', null);
@@ -16026,6 +16026,18 @@ async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req): Js
         }
     }
 
+    // 主表仓库按明细汇总：各行全部同一仓库则记该仓库；否则仓库名去重后以"、"连接
+    let mut wh_id_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut wh_names: Vec<String> = Vec::new();
+    for it in &req.items {
+        let wid = it.warehouse_id.unwrap_or(0);
+        let wname = it.warehouse_name.clone().unwrap_or_default();
+        if wid > 0 { wh_id_set.insert(wid); }
+        if !wname.trim().is_empty() && !wh_names.contains(&wname) { wh_names.push(wname); }
+    }
+    let main_wh_id = if wh_id_set.len() == 1 { *wh_id_set.iter().next().unwrap() } else { 0 };
+    let main_wh_name = wh_names.join("、");
+
     let result = sqlx::query(
         "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, user_id, handler_phone, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -16036,8 +16048,8 @@ async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req): Js
     .bind(req.discount_rate)
     .bind(req.amount_reduction)
     .bind(req.final_amount)
-    .bind(req.warehouse_id)
-    .bind(&req.warehouse_name)
+    .bind(main_wh_id)
+    .bind(&main_wh_name)
     .bind(req.user_id.unwrap_or(0))
     .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
@@ -16049,10 +16061,10 @@ async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req): Js
             let order_id = res.last_insert_rowid();
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES {}",
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -16071,7 +16083,9 @@ async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req): Js
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
                         .bind(item.ordered_quantity.unwrap_or(0.0))
-                        .bind(&item.remark);
+                        .bind(&item.remark)
+                        .bind(item.warehouse_id.unwrap_or(0))
+                        .bind(&item.warehouse_name.clone().unwrap_or_default());
                 }
                 let _ = query.execute(pool()).await;
                 // 采购入库后更新商品进价（当前/最高/最低）
@@ -16215,7 +16229,7 @@ async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Pat
     }
     
     let item_rows = sqlx::query(
-        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark FROM purchase_order_item WHERE order_id = ?"
+        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name FROM purchase_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(pool())
@@ -16238,6 +16252,8 @@ async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Pat
             "amount": r.get::<f64, _>("amount"),
             "ordered_quantity": r.get::<Option<f64>, _>("ordered_quantity"),
             "remark": r.get::<Option<String>, _>("remark"),
+            "warehouse_id": r.get::<i64, _>("warehouse_id"),
+            "warehouse_name": r.get::<Option<String>, _>("warehouse_name"),
         }))
         .collect();
     
@@ -16300,6 +16316,18 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
         }
     }
 
+    // 主表仓库按明细汇总（与创建逻辑一致）
+    let mut wh_id_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut wh_names: Vec<String> = Vec::new();
+    for it in &req.items {
+        let wid = it.warehouse_id.unwrap_or(0);
+        let wname = it.warehouse_name.clone().unwrap_or_default();
+        if wid > 0 { wh_id_set.insert(wid); }
+        if !wname.trim().is_empty() && !wh_names.contains(&wname) { wh_names.push(wname); }
+    }
+    let main_wh_id = if wh_id_set.len() == 1 { *wh_id_set.iter().next().unwrap() } else { 0 };
+    let main_wh_name = wh_names.join("、");
+
     let result = sqlx::query(
         "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
@@ -16310,8 +16338,8 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
     .bind(req.discount_rate)
     .bind(req.amount_reduction)
     .bind(req.final_amount)
-    .bind(req.warehouse_id)
-    .bind(&req.warehouse_name)
+    .bind(main_wh_id)
+    .bind(&main_wh_name)
     .bind(req.user_id.unwrap_or(0))
     .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
@@ -16334,10 +16362,10 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
             
             if !req.items.is_empty() {
                 let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
                 let sql = format!(
-                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES {}",
+                    "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name) VALUES {}",
                     placeholders.join(", ")
                 );
                 
@@ -16357,7 +16385,9 @@ async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req): Js
                         .bind(item.base_quantity.unwrap_or(0.0))
                         .bind(item.amount)
                         .bind(item.ordered_quantity.unwrap_or(0.0))
-                        .bind(&item.remark);
+                        .bind(&item.remark)
+                        .bind(item.warehouse_id.unwrap_or(0))
+                        .bind(&item.warehouse_name.clone().unwrap_or_default());
                 }
                 let _ = query.execute(pool()).await;
                 // 采购单更新后同步商品进价（当前/最高/最低）
