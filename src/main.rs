@@ -10970,8 +10970,10 @@ async fn page_mobile_sort_by_category() -> Html<String> {
     </div>
     
     <div class="filter-bar">
+        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
+        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="clearSearch()">清除</button>
+        <button class="clear" onclick="resetDateFilter()">清除</button>
     </div>
     </div>
     
@@ -10997,7 +10999,14 @@ async fn page_mobile_sort_by_category() -> Html<String> {
 
         async function loadItems() {
             try {
-                const res = await fetch('/api/sales_order/sort_items_by_category');
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+                let url = '/api/sales_order/sort_items_by_category';
+                const params = [];
+                if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+                if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+                if (params.length > 0) url += '?' + params.join('&');
+                const res = await fetch(url);
                 categories = await res.json();
                 loadCheckedState();
                 loadCorrectedQuantities();
@@ -11127,6 +11136,13 @@ async fn page_mobile_sort_by_category() -> Html<String> {
             renderItems();
         }
 
+        function resetDateFilter() {
+            document.getElementById('startDate').value = '';
+            document.getElementById('endDate').value = '';
+            document.getElementById('searchInput').value = '';
+            loadItems();
+        }
+
         function updateStats() {
             let totalCount = 0;
             categories.forEach(cat => {
@@ -11245,7 +11261,12 @@ async fn page_mobile_sort_by_category() -> Html<String> {
         }
 
         function exportExcel() {
-            window.location.href = '/api/sales_order/sort_items_by_category_excel';
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            const params = [];
+            if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+            if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+            window.location.href = '/api/sales_order/sort_items_by_category_excel' + (params.length > 0 ? '?' + params.join('&') : '');
         }
 
         loadItems();
@@ -11749,8 +11770,10 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
     </div>
     
     <div class="filter-bar">
+        <input type="date" id="startDate" style="flex:0 0 130px;" onchange="loadItems()">
+        <input type="date" id="endDate" style="flex:0 0 130px;" onchange="loadItems()">
         <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
-        <button class="clear" onclick="clearSearch()">清除</button>
+        <button class="clear" onclick="resetDateFilter()">清除</button>
     </div>
     </div>
     
@@ -11777,7 +11800,14 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
 
         async function loadItems() {
             try {
-                const res = await fetch('/api/sales_order/sort_comprehensive');
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+                let url = '/api/sales_order/sort_comprehensive';
+                const params = [];
+                if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+                if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+                if (params.length > 0) url += '?' + params.join('&');
+                const res = await fetch(url);
                 purchasers = await res.json();
                 loadCheckedState();
                 loadExpandedState();
@@ -11928,6 +11958,13 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
             renderItems();
         }
 
+        function resetDateFilter() {
+            document.getElementById('startDate').value = '';
+            document.getElementById('endDate').value = '';
+            document.getElementById('searchInput').value = '';
+            loadItems();
+        }
+
         function updateStats() {
             document.getElementById('totalCount').textContent = purchasers.length;
             let totalItems = 0;
@@ -12040,7 +12077,12 @@ async fn page_mobile_sort_comprehensive() -> Html<String> {
         }
 
         function exportExcel() {
-            window.location.href = '/api/sales_order/sort_comprehensive_excel';
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            const params = [];
+            if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+            if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+            window.location.href = '/api/sales_order/sort_comprehensive_excel' + (params.length > 0 ? '?' + params.join('&') : '');
         }
 
         loadItems();
@@ -24784,8 +24826,19 @@ async fn api_sales_order_sort_items_excel() -> impl IntoResponse {
     }
 }
 
-async fn api_sales_order_sort_items_by_category() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_category(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sql = format!(
         "SELECT soi.id as item_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
          FROM sales_order_item soi 
@@ -24793,9 +24846,11 @@ async fn api_sales_order_sort_items_by_category() -> impl IntoResponse {
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY c.name, p.name, soi.product_name"
-    )
+         WHERE so.status IN ('pending', 'sorting'){}
+         ORDER BY c.name, p.name, soi.product_name",
+        where_extra
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
     .fetch_all(pool())
     .await
     .unwrap_or_default();
@@ -24848,8 +24903,19 @@ async fn api_sales_order_sort_items_by_category() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_sort_items_by_category_excel() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_items_by_category_excel(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sql = format!(
         "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
          FROM sales_order_item soi 
@@ -24857,9 +24923,11 @@ async fn api_sales_order_sort_items_by_category_excel() -> impl IntoResponse {
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY c.name, p.name, soi.product_name"
-    )
+         WHERE so.status IN ('pending', 'sorting'){}
+         ORDER BY c.name, p.name, soi.product_name",
+        where_extra
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
     .fetch_all(pool())
     .await
     .unwrap_or_default();
@@ -25764,8 +25832,19 @@ async fn api_sales_order_sort_items_by_purchaser_excel(
     }
 }
 
-async fn api_sales_order_sort_comprehensive() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_comprehensive(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
                 c.name as category_name
@@ -25774,9 +25853,11 @@ async fn api_sales_order_sort_comprehensive() -> impl IntoResponse {
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY p.name, c.name, soi.product_name"
-    )
+         WHERE so.status IN ('pending', 'sorting'){}
+         ORDER BY p.name, c.name, soi.product_name",
+        where_extra
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
     .fetch_all(pool())
     .await
     .unwrap_or_default();
@@ -25895,8 +25976,19 @@ async fn api_sales_order_sort_comprehensive() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-async fn api_sales_order_sort_comprehensive_excel() -> impl IntoResponse {
-    let rows = sqlx::query(
+async fn api_sales_order_sort_comprehensive_excel(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let mut where_extra = String::new();
+    if !start_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+    }
+    if !end_date.is_empty() {
+        where_extra.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+    }
+    let sql = format!(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
                 c.name as category_name
@@ -25905,9 +25997,11 @@ async fn api_sales_order_sort_comprehensive_excel() -> impl IntoResponse {
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
          LEFT JOIN category c ON pr.category_id = c.id
-         WHERE so.status IN ('pending', 'sorting')
-         ORDER BY p.name, c.name, soi.product_name"
-    )
+         WHERE so.status IN ('pending', 'sorting'){}
+         ORDER BY p.name, c.name, soi.product_name",
+        where_extra
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
     .fetch_all(pool())
     .await
     .unwrap_or_default();
