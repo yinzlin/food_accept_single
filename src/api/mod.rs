@@ -6714,12 +6714,13 @@ pub async fn api_sales_order_generate_purchase(
                 // 主表金额 delta = 新 amount - 旧 amount（替换而非新增）
                 let new_amount = quantity * unit_price;
                 let _ = sqlx::query(
-                    "UPDATE purchase_order_item SET quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ? WHERE order_id = ? AND product_id = ? AND COALESCE(sales_unit, '') = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
+                    "UPDATE purchase_order_item SET quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ?, remark = ? WHERE order_id = ? AND product_id = ? AND COALESCE(sales_unit, '') = ? AND (source_sales_order_id = ? OR source_sales_order_id = 0)"
                 )
                 .bind(quantity)
                 .bind(quantity)
                 .bind(new_amount)
                 .bind(ordered_quantity)
+                .bind(&remark)
                 .bind(po_id)
                 .bind(product_id)
                 .bind(sales_unit.trim())
