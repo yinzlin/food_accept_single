@@ -1,19 +1,24 @@
-﻿use axum::extract::{Json, Path, Query, Multipart};
+use axum::extract::{Json, Path, Query, Multipart};
 use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse};
+use axum::response::IntoResponse;
 use bytes::Bytes;
 use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use chrono::Local;
 use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, XlsxError};
-use crate::db::pool;
-use crate::auth::{get_user_ctx, check_api_permission, log_operation, has_permission, has_permission_point, can_access_purchase_order, can_access_sales_order};
-use crate::utils::{xlsx_response, xlsx_header_format, urlencode_filename, parse_keyword_pattern, parse_csv, sanitize_filename_prefix, image_url_to_path, operation_action_label, build_category_tree_json, generate_order_no, round_to_allowed_last_digit, layout_html, sidebar_html};
+use crate::utils::{xlsx_response, xlsx_header_format, parse_keyword_pattern, parse_csv, sanitize_filename_prefix, image_url_to_path, operation_action_label, build_category_tree_json, generate_order_no, round_to_allowed_last_digit};
 use crate::models::*;
 use crate::update_product_purchase_prices;
 use crate::log_price_change;
 use crate::recalc_base_price_by_markup;
+use crate::build_purchase_order_export_workbook;
+use crate::get_purchase_order_with_items;
+use crate::get_user_by_id;
+use crate::compute_stock_summary;
+use crate::compute_stock_summary_reimburse;
+use crate::get_category_sort_key;
+use crate::check_sales_order_access;
+use crate::build_accept_excel;
 use serde_json;
-use std::collections::HashMap;
 use sqlx::{AssertSqlSafe, Row};
 pub async fn api_system_config(Json(data): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     for (key, value) in data {

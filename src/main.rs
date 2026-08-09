@@ -14,7 +14,7 @@ use axum::extract::Multipart;
 use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, XlsxError};
 
 // ===== 导出通用辅助 =====
-fn xlsx_header_format(color: u32) -> rust_xlsxwriter::Format {
+pub(crate) fn xlsx_header_format(color: u32) -> rust_xlsxwriter::Format {
     rust_xlsxwriter::Format::new()
         .set_bold()
         .set_background_color(rust_xlsxwriter::Color::RGB(color))
@@ -23,7 +23,7 @@ fn xlsx_header_format(color: u32) -> rust_xlsxwriter::Format {
         .set_border(rust_xlsxwriter::FormatBorder::Thin)
 }
 
-fn xlsx_response(buf: Vec<u8>, filename: &str) -> axum::response::Response {
+pub(crate) fn xlsx_response(buf: Vec<u8>, filename: &str) -> axum::response::Response {
     let content_disposition = format!("attachment; filename*=UTF-8''{}", urlencode_filename(filename));
     (
         axum::http::StatusCode::OK,
@@ -35,7 +35,7 @@ fn xlsx_response(buf: Vec<u8>, filename: &str) -> axum::response::Response {
     ).into_response()
 }
 
-fn urlencode_filename(name: &str) -> String {
+pub(crate) fn urlencode_filename(name: &str) -> String {
     let mut out = String::new();
     for b in name.as_bytes() {
         let c = *b;
@@ -48,7 +48,6 @@ fn urlencode_filename(name: &str) -> String {
     out
 }
 
-use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Row};
 use sqlx::SqlitePool;
@@ -57,7 +56,14 @@ use tao::event_loop::{ControlFlow, EventLoop};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use crate::pages::*;
+use crate::models::*;
 pub mod pages;
+
+pub mod models;
+pub mod utils;
+pub mod db;
+pub mod auth;
+pub mod api;
 
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 
@@ -65,7 +71,7 @@ const BOOTSTRAP_CSS: &str = include_str!("../static/bootstrap.min.css");
 const BOOTSTRAP_JS: &str = include_str!("../static/bootstrap.bundle.min.js");
 const CHART_JS: &str = include_str!("../static/chart.umd.min.js");
 
-async fn get_user_role(headers: &axum::http::HeaderMap) -> String {
+pub(crate) async fn get_user_role(headers: &axum::http::HeaderMap) -> String {
     let session_token = headers.get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
@@ -103,7 +109,7 @@ async fn get_user_role(headers: &axum::http::HeaderMap) -> String {
     rows[0].get::<String, _>("role")
 }
 
-fn has_permission(role: &str, required_role: &str) -> bool {
+pub(crate) fn has_permission(role: &str, required_role: &str) -> bool {
     let role_permissions = std::collections::HashMap::from([
         ("super_admin", vec!["super_admin", "admin", "supplier", "purchaser", "query"]),
         ("admin", vec!["admin", "supplier", "purchaser", "query"]),
@@ -123,7 +129,7 @@ fn has_permission(role: &str, required_role: &str) -> bool {
 // 角色 → 权限点映射，super_admin 拥有全部权限
 
 /// 判断某角色是否拥有指定权限点
-fn has_permission_point(role: &str, permission: &str) -> bool {
+pub(crate) fn has_permission_point(role: &str, permission: &str) -> bool {
     use std::collections::HashSet;
     // 全部业务权限点（供 super_admin 全量拥有）
     const ALL_PERMS: [&str; 20] = [
@@ -155,16 +161,10 @@ fn has_permission_point(role: &str, permission: &str) -> bool {
 }
 
 /// 当前登录用户的上下文（角色 + 用户ID + 行级数据权限关联）
-#[derive(Debug, Clone)]
-struct UserCtx {
-    role: String,
-    user_id: i64,
-    supplier_id: i64,
-    purchaser_id: i64,
-}
+
 
 /// 解析用户上下文：cookie session -> (role, user_id, supplier_id, purchaser_id)
-async fn get_user_ctx(headers: &axum::http::HeaderMap) -> UserCtx {
+pub(crate) async fn get_user_ctx(headers: &axum::http::HeaderMap) -> UserCtx {
     let session_token = headers.get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
@@ -209,7 +209,7 @@ async fn get_user_ctx(headers: &axum::http::HeaderMap) -> UserCtx {
 }
 
 /// 记录操作审计日志（关键写操作）
-async fn log_operation(
+pub(crate) async fn log_operation(
     user: &UserCtx,
     action: &str,
     target_type: &str,
@@ -235,7 +235,7 @@ async fn log_operation(
 }
 
 /// 判断用户是否可操作该采购单（行级数据权限）：admin/super_admin 可见全部；supplier 仅可见自己绑定的供应商
-fn can_access_purchase_order(user: &UserCtx, order_supplier_id: i64) -> bool {
+pub(crate) fn can_access_purchase_order(user: &UserCtx, order_supplier_id: i64) -> bool {
     match user.role.as_str() {
         "super_admin" | "admin" => true,
         "supplier" => user.supplier_id == order_supplier_id,
@@ -244,7 +244,7 @@ fn can_access_purchase_order(user: &UserCtx, order_supplier_id: i64) -> bool {
 }
 
 /// 判断用户是否可操作该销售单（行级数据权限）：admin/super_admin 可见全部；purchaser 仅可见自己绑定的采购单位
-fn can_access_sales_order(user: &UserCtx, order_purchaser_id: i64) -> bool {
+pub(crate) fn can_access_sales_order(user: &UserCtx, order_purchaser_id: i64) -> bool {
     match user.role.as_str() {
         "super_admin" | "admin" => true,
         "purchaser" => user.purchaser_id == order_purchaser_id,
@@ -252,7 +252,7 @@ fn can_access_sales_order(user: &UserCtx, order_purchaser_id: i64) -> bool {
     }
 }
 
-fn get_route_required_role(path: &str) -> Option<&str> {
+pub(crate) fn get_route_required_role(path: &str) -> Option<&str> {
     match path {
         "/supplier" | "/api/supplier/create" | "/api/supplier/update" | "/api/supplier/delete" => Some("supplier"),
         "/purchaser" | "/api/purchaser/create" | "/api/purchaser/update" | "/api/purchaser/delete" => Some("purchaser"),
@@ -274,7 +274,7 @@ fn get_route_required_role(path: &str) -> Option<&str> {
     }
 }
 
-fn check_api_route_permission(path: &str) -> Option<&str> {
+pub(crate) fn check_api_route_permission(path: &str) -> Option<&str> {
     if path.starts_with("/api/supplier/") {
         // 供应商基础资料：supplier 角色以上可访问
         Some("supplier")
@@ -359,7 +359,7 @@ fn check_api_route_permission(path: &str) -> Option<&str> {
 }
 
 /// 校验 API 权限：返回权限点对应的角色校验（权限点系统）
-async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, (StatusCode, String)> {
+pub(crate) async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, (StatusCode, String)> {
     let ctx = get_user_ctx(headers).await;
     
     if let Some(permission) = check_api_route_permission(path) {
@@ -374,7 +374,7 @@ async fn check_api_permission(headers: &axum::http::HeaderMap, path: &str) -> Re
     Ok(ctx.role)
 }
 
-async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, Html<String>> {
+pub(crate) async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> Result<String, Html<String>> {
     let role = get_user_role(headers).await;
     
     if let Some(required_role) = get_route_required_role(path) {
@@ -396,7 +396,7 @@ async fn check_page_permission(headers: &axum::http::HeaderMap, path: &str) -> R
     Ok(role)
 }
 
-async fn serve_bootstrap_css() -> impl IntoResponse {
+pub(crate) async fn serve_bootstrap_css() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
@@ -404,7 +404,7 @@ async fn serve_bootstrap_css() -> impl IntoResponse {
     )
 }
 
-async fn serve_bootstrap_js() -> impl IntoResponse {
+pub(crate) async fn serve_bootstrap_js() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
@@ -412,7 +412,7 @@ async fn serve_bootstrap_js() -> impl IntoResponse {
     )
 }
 
-async fn serve_chart_js() -> impl IntoResponse {
+pub(crate) async fn serve_chart_js() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
@@ -421,7 +421,7 @@ async fn serve_chart_js() -> impl IntoResponse {
 }
 
 // 修复常见数据库损坏
-async fn repair_db_corruption(pool: &SqlitePool) {
+pub(crate) async fn repair_db_corruption(pool: &SqlitePool) {
     // 1. 先尝试 REINDEX + VACUUM
     let _ = sqlx::query("REINDEX").execute(pool).await;
     let _ = sqlx::query("VACUUM").execute(pool).await;
@@ -495,7 +495,7 @@ async fn repair_db_corruption(pool: &SqlitePool) {
     }
 }
 
-async fn init_pool() {
+pub(crate) async fn init_pool() {
     let pool = SqlitePoolOptions::new()
         .max_connections(16)
         .min_connections(4)
@@ -576,11 +576,11 @@ async fn init_pool() {
     DB_POOL.set(pool).expect("数据库连接池已初始化");
 }
 
-fn pool() -> &'static SqlitePool {
+pub(crate) fn pool() -> &'static SqlitePool {
     DB_POOL.get().expect("数据库连接池未初始化")
 }
 
-async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
+pub(crate) async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS category (
@@ -1404,207 +1404,37 @@ async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[derive(Deserialize, Serialize)]
-struct SupplierReq {
-    id: Option<i64>,
-    name: String,
-    contact: Option<String>,
-    phone: Option<String>,
-    address: Option<String>,
-    business_scope: Option<String>,
-    remark: Option<String>,
-    category_id: Option<i64>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct PurchaserReq {
-    id: Option<i64>,
-    name: String,
-    contact: Option<String>,
-    phone: Option<String>,
-    address: Option<String>,
-    business_scope: Option<String>,
-    remark: Option<String>,
-    category_id: Option<i64>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct DeleteReq {
-    id: i64,
-}
 
-#[derive(Deserialize)]
-struct LoginReq {
-    username: String,
-    password: String,
-}
 
-#[derive(Deserialize, Serialize)]
-struct ProductReq {
-    id: Option<i64>,
-    name: String,
-    spec: Option<String>,
-    alias1: Option<String>,
-    alias2: Option<String>,
-    unit: Option<String>,
-    base_unit: Option<String>,
-    base_price: Option<f64>,
-    purchase_price: Option<f64>,
-    image_url: Option<String>,
-    category_id: Option<i64>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct ProductUnitReq {
-    product_id: i64,
-    unit_name: String,
-    ratio: f64,
-    unit_price: Option<f64>,
-    purchase_price: Option<f64>,
-    sort_order: Option<i32>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct ProductPriceReq {
-    product_id: i64,
-    price_type: String,
-    price: Option<f64>,
-    collected_at: Option<String>,
-    source: Option<String>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct CategoryReq {
-    name: String,
-    parent_id: Option<i64>,
-    entity_type: String,
-    sort_order: Option<i32>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct PurchaseOrderReq {
-    id: Option<i64>,
-    supplier_id: i64,
-    order_no: String,
-    order_date: String,
-    total_amount: f64,
-    discount_rate: f64,
-    amount_reduction: f64,
-    final_amount: f64,
-    warehouse_id: i64,
-    warehouse_name: String,
-    user_id: Option<i64>,
-    handler_phone: Option<String>,
-    items: Vec<PurchaseOrderItemReq>,
-    remark: Option<String>,
-    /// 乐观锁版本号：编辑时从详情接口取得，提交时校验，防止覆盖他人修改
-    version: Option<i64>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct PurchaseOrderItemReq {
-    product_id: i64,
-    product_name: String,
-    alias1: Option<String>,
-    alias2: Option<String>,
-    spec: Option<String>,
-    unit: Option<String>,
-    unit_price: f64,
-    quantity: f64,
-    base_quantity: Option<f64>,
-    amount: f64,
-    ordered_quantity: Option<f64>,
-    remark: Option<String>,
-    /// 明细级仓库：同一订单各行可入不同仓库
-    warehouse_id: Option<i64>,
-    warehouse_name: Option<String>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct SalesOrderReq {
-    id: Option<i64>,
-    purchaser_id: i64,
-    order_no: String,
-    order_date: String,
-    total_amount: f64,
-    discount_rate: f64,
-    amount_reduction: f64,
-    final_amount: f64,
-    warehouse_id: i64,
-    warehouse_name: String,
-    items: Vec<SalesOrderItemReq>,
-    remark: Option<String>,
-    /// 乐观锁版本号：编辑时从详情接口取得，提交时校验，防止覆盖他人修改
-    version: Option<i64>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct SalesOrderItemReq {
-    product_id: i64,
-    product_name: String,
-    alias1: Option<String>,
-    alias2: Option<String>,
-    spec: Option<String>,
-    unit: Option<String>,
-    unit_price: f64,
-    quantity: f64,
-    base_quantity: Option<f64>,
-    amount: f64,
-    pre_sale_quantity: Option<f64>,
-    supplier_id: i64,
-    supplier_name: String,
-    category_id: Option<i64>,
-    remark: Option<String>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct OrderSupplementItemReq {
-    target_order_id: i64,
-    source_order_id: i64,
-    source_remark: Option<String>,
-    product_id: i64,
-    product_name: String,
-    alias1: Option<String>,
-    alias2: Option<String>,
-    spec: Option<String>,
-    unit: String,
-    unit_price: f64,
-    quantity: f64,
-    amount: f64,
-    allocate_date: String,
-    operation_type: String,
-    target_order_item_id: Option<i64>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct AcceptReq {
-    supplier_id: i64,
-    purchaser_id: i64,
-    car_no: Option<String>,
-    supply_time: String,
-    total_price: f64,
-    discount_rate: f64,
-    final_price: f64,
-    items: Vec<FoodItemReq>,
-}
 
-#[derive(Deserialize, Serialize)]
-struct FoodItemReq {
-    food_name: String,
-    spec: Option<String>,
-    unit_price: f64,
-    quantity: f64,
-    sub_total: f64,
-    produce_batch: Option<String>,
-    shelf_life: Option<String>,
-    has_veg_report: bool,
-    has_meat_quarantine: bool,
-    has_abnormal: bool,
-    pass_check: bool,
-    remark: Option<String>,
-}
 
-fn sidebar_html() -> String {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+pub(crate) fn sidebar_html() -> String {
     String::from(r#"
         <div class="sidebar">
             <div class="sidebar-header">
@@ -1838,7 +1668,7 @@ fn sidebar_html() -> String {
     "#)
 }
 
-fn layout_html(title: &str, page: &str, content: &str) -> String {
+pub(crate) fn layout_html(title: &str, page: &str, content: &str) -> String {
     let sidebar = sidebar_html();
     let sidebar_with_active = sidebar
         .replace(&format!("data-path=\"{}\"", page), &format!("data-path=\"{}\" data-active=\"1\"", page));
@@ -2764,7 +2594,7 @@ async fn api_system_config(Json(data): Json<std::collections::HashMap<String, St
 }
 
 /// 操作动作中文文案
-fn operation_action_label(action: &str) -> String {
+pub(crate) fn operation_action_label(action: &str) -> String {
     let map = [
         ("purchase_order.create", "创建采购单"),
         ("purchase_order.update", "修改采购单"),
@@ -3553,14 +3383,14 @@ async fn api_clean_invalid_orders(headers: axum::http::HeaderMap) -> impl IntoRe
     (StatusCode::OK, format!("清理完成，共删除 {} 条无效订单。清理前已备份到 {}", deleted_count, backup_file))
 }
 
-fn parse_keyword_pattern(params: &std::collections::HashMap<String, String>) -> String {
+pub(crate) fn parse_keyword_pattern(params: &std::collections::HashMap<String, String>) -> String {
     match params.get("keyword").filter(|s| !s.is_empty()) {
         Some(k) => format!("%{}%", k),
         None => "%".to_string(),
     }
 }
 
-fn parse_csv(content: &str) -> Vec<Vec<String>> {
+pub(crate) fn parse_csv(content: &str) -> Vec<Vec<String>> {
     let mut result = Vec::new();
     let mut current_row = Vec::new();
     let mut current_field = String::new();
@@ -4677,22 +4507,7 @@ async fn api_product_search(headers: axum::http::HeaderMap, axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&products).unwrap())
 }
 
-#[derive(Deserialize)]
-struct ProductUpdateReq {
-    id: i64,
-    name: String,
-    spec: Option<String>,
-    alias1: Option<String>,
-    alias2: Option<String>,
-    unit: Option<String>,
-    base_unit: Option<String>,
-    base_price: Option<f64>,
-    purchase_price: Option<f64>,
-    image_url: Option<String>,
-    category_id: Option<i64>,
-    markup_rate: Option<f64>,
-    auto_update_price: Option<i64>,
-}
+
 
 async fn api_product_update(headers: axum::http::HeaderMap, Json(mut req): Json<ProductUpdateReq>) -> impl IntoResponse {
     let role = match check_api_permission(&headers, "/api/product/update").await {
@@ -4846,7 +4661,7 @@ async fn api_product_delete(headers: axum::http::HeaderMap, Json(req): Json<serd
 }
 
 // 清理文件名前缀中的非法字符（保留中文、字母、数字、-、_）
-fn sanitize_filename_prefix(input: &str) -> String {
+pub(crate) fn sanitize_filename_prefix(input: &str) -> String {
     let cleaned: String = input
         .chars()
         .map(|c| {
@@ -4866,7 +4681,7 @@ fn sanitize_filename_prefix(input: &str) -> String {
 }
 
 // 将图片URL转换为服务器文件路径（兼容旧格式 /api/product/image/ 与新格式 /api/uploads/...）
-fn image_url_to_path(url: &str) -> Option<String> {
+pub(crate) fn image_url_to_path(url: &str) -> Option<String> {
     if let Some(rest) = url.strip_prefix("/api/uploads/") {
         Some(format!("uploads/{}", rest))
     } else if let Some(rest) = url.strip_prefix("/api/product/image/") {
@@ -5989,11 +5804,7 @@ async fn api_category_delete(Json(req): Json<serde_json::Value>) -> (StatusCode,
     }
 }
 
-#[derive(Deserialize)]
-struct CategoryRenameReq {
-    id: i64,
-    name: String,
-}
+
 
 async fn api_category_rename(Json(req): Json<CategoryRenameReq>) -> (StatusCode, String) {
     let result = sqlx::query("UPDATE category SET name = ? WHERE id = ?")
@@ -6021,7 +5832,7 @@ async fn api_category_tree(axum::extract::Query(params): axum::extract::Query<st
     (StatusCode::OK, serde_json::to_string(&tree).unwrap())
 }
 
-fn build_category_tree_json(rows: &[sqlx::sqlite::SqliteRow], parent_id: Option<i64>, entity_type: &str) -> Vec<serde_json::Value> {
+pub(crate) fn build_category_tree_json(rows: &[sqlx::sqlite::SqliteRow], parent_id: Option<i64>, entity_type: &str) -> Vec<serde_json::Value> {
     let mut result = vec![];
     for row in rows {
         let et: String = row.get("entity_type");
@@ -6096,15 +5907,7 @@ async fn api_warehouse_list() -> impl IntoResponse {
     (StatusCode::OK, serde_json::to_string(&warehouses).unwrap())
 }
 
-#[derive(Deserialize)]
-struct WarehouseCreateReq {
-    name: String,
-    code: Option<String>,
-    address: Option<String>,
-    contact: Option<String>,
-    phone: Option<String>,
-    sort_order: Option<i32>,
-}
+
 
 async fn api_warehouse_create(Json(req): Json<WarehouseCreateReq>) -> (StatusCode, String) {
     let result = sqlx::query(
@@ -6132,17 +5935,7 @@ async fn api_warehouse_create(Json(req): Json<WarehouseCreateReq>) -> (StatusCod
     }
 }
 
-#[derive(Deserialize)]
-struct WarehouseUpdateReq {
-    id: i64,
-    name: String,
-    code: Option<String>,
-    address: Option<String>,
-    contact: Option<String>,
-    phone: Option<String>,
-    status: Option<i32>,
-    sort_order: Option<i32>,
-}
+
 
 async fn api_warehouse_update(Json(req): Json<WarehouseUpdateReq>) -> (StatusCode, String) {
     let result = sqlx::query(
@@ -6200,7 +5993,7 @@ async fn api_warehouse_delete(Json(req): Json<std::collections::HashMap<String, 
     }
 }
 
-async fn generate_order_no(order_type: &str, order_date: &str) -> String {
+pub(crate) async fn generate_order_no(order_type: &str, order_date: &str) -> String {
     let prefix = if order_type == "sales" { "SO" } else { "PO" };
     
     let date_str: Vec<&str> = order_date.split('-').collect();
@@ -6244,7 +6037,7 @@ async fn api_order_generate_no(axum::extract::Query(params): axum::extract::Quer
 // 售价自动更新专用取整：保留两位小数，最末位仅允许 0/5/6/8/9
 // 就近取值（不向上靠）：末位与允许集合中最近者匹配
 // 映射表（百位百分位）：0→0, 1→0, 2→0, 3→5, 4→5, 5→5, 6→6, 7→8, 8→8, 9→9
-fn round_to_allowed_last_digit(price: f64) -> f64 {
+pub(crate) fn round_to_allowed_last_digit(price: f64) -> f64 {
     if price <= 0.0 {
         return price;
     }
@@ -6380,7 +6173,7 @@ mod price_rounding_tests {
 }
 
 // 记录价格变更日志（price_type: purchase_price / base_price）
-async fn log_price_change(
+pub(crate) async fn log_price_change(
     product_id: i64,
     price_type: &str,
     old_price: f64,
@@ -6409,7 +6202,7 @@ async fn log_price_change(
 
 // 根据加成率自动重算 base_price；返回是否实际更新了售价及旧/新值
 // 当商品开启 auto_update_price 且 purchase_price > 0 时生效
-async fn recalc_base_price_by_markup(
+pub(crate) async fn recalc_base_price_by_markup(
     product_id: i64,
     source: &str,
     ref_id: Option<i64>,
@@ -6598,7 +6391,7 @@ async fn api_product_last_purchase_price(
 }
 
 // 规则：当前进价 = 最近一次采购价；最高进价 = 历史最高；最低进价 = 历史最低（新品或价格为0时初始化）。
-async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
+pub(crate) async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq]) {
     for item in items {
         if item.product_id == 0 {
             continue;
@@ -7267,7 +7060,7 @@ async fn api_purchase_order_export(
     build_purchase_order_export_workbook(rows)
 }
 
-fn build_purchase_order_export_workbook(rows: Vec<sqlx::sqlite::SqliteRow>) -> axum::response::Response {
+pub(crate) fn build_purchase_order_export_workbook(rows: Vec<sqlx::sqlite::SqliteRow>) -> axum::response::Response {
     let result: Result<Vec<u8>, XlsxError> = (|| {
         let mut workbook = Workbook::new();
         let worksheet = workbook.add_worksheet();
@@ -7521,7 +7314,7 @@ async fn api_purchase_order_print_excel(
 }
 
 #[derive(Debug)]
-struct PurchaseOrderPrint {
+pub(crate) struct PurchaseOrderPrint {
     order_no: String,
     order_date: String,
     total_amount: f64,
@@ -7537,7 +7330,7 @@ struct PurchaseOrderPrint {
 }
 
 #[derive(Debug)]
-struct PurchaseOrderPrintItem {
+pub(crate) struct PurchaseOrderPrintItem {
     product_name: String,
     spec: Option<String>,
     unit: Option<String>,
@@ -7547,9 +7340,9 @@ struct PurchaseOrderPrintItem {
     remark: Option<String>,
 }
 
-struct UserSimple { nickname: String, phone: String }
+pub(crate) struct UserSimple { nickname: String, phone: String }
 
-async fn get_purchase_order_with_items(id: i64) -> Option<(PurchaseOrderPrint, Vec<PurchaseOrderPrintItem>)> {
+pub(crate) async fn get_purchase_order_with_items(id: i64) -> Option<(PurchaseOrderPrint, Vec<PurchaseOrderPrintItem>)> {
     let order = sqlx::query_as::<_, (
         String, String, f64, f64, f64, Option<String>, Option<String>,
         Option<String>, Option<String>, Option<String>, Option<String>, Option<String>,
@@ -7599,7 +7392,7 @@ async fn get_purchase_order_with_items(id: i64) -> Option<(PurchaseOrderPrint, V
     ))
 }
 
-async fn get_user_by_id(id: i64) -> Option<UserSimple> {
+pub(crate) async fn get_user_by_id(id: i64) -> Option<UserSimple> {
     sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT nickname, COALESCE(NULLIF(phone, ''), '') as phone FROM user_account WHERE id = ?"
     )
@@ -10751,7 +10544,7 @@ async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Query
     (StatusCode::OK, serde_json::to_string(&items).unwrap())
 }
 
-struct StockSummaryRow {
+pub(crate) struct StockSummaryRow {
     day: String,
     warehouse_id: i64,
     warehouse_name: String,
@@ -10766,7 +10559,7 @@ struct StockSummaryRow {
     gross_profit: f64,          // 毛利 = 下浮后出库金额 - 入库金额
 }
 
-async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
+pub(crate) async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
     // 采购入库按日+仓库汇总
     let mut purchase_where = String::from("WHERE 1=1");
     if !start_date.is_empty() {
@@ -10946,7 +10739,7 @@ async fn compute_stock_summary(start_date: &str, end_date: &str) -> (Vec<StockSu
     (rows, total_in, total_out, total_discounted_out)
 }
 
-async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
+pub(crate) async fn compute_stock_summary_reimburse(start_date: &str, end_date: &str) -> (Vec<StockSummaryRow>, f64, f64, f64) {
     // 入库：与真实账套一致
     let mut purchase_where = String::from("WHERE 1=1");
     if !start_date.is_empty() { purchase_where.push_str(&format!(" AND po.order_date >= '{}'", start_date)); }
@@ -12268,7 +12061,7 @@ async fn api_sales_order_accept(headers: axum::http::HeaderMap, Path(id): Path<i
     (StatusCode::OK, serde_json::to_string(&accept_data).unwrap())
 }
 
-fn get_category_sort_key(category_name: &str, parent_name: &str) -> i64 {
+pub(crate) fn get_category_sort_key(category_name: &str, parent_name: &str) -> i64 {
     let name = category_name.trim();
     let parent = parent_name.trim();
     if parent == "荤鲜类" || name == "荤鲜类" {
@@ -13115,7 +12908,7 @@ async fn api_sales_order_real_excel(
 }
 
 /// 校验用户是否有权查看/导出指定销售单（行级数据权限）
-async fn check_sales_order_access(
+pub(crate) async fn check_sales_order_access(
     headers: &axum::http::HeaderMap,
     id: i64,
 ) -> Result<(), (StatusCode, String)> {
@@ -13132,7 +12925,7 @@ async fn check_sales_order_access(
 }
 
 // reimburse=true 报销口径（合并分摊增项）；false 真实口径（真实账套）
-async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoResponse {
+pub(crate) async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoResponse {
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
                 p.name as purchaser_name, p.address as purchaser_address
@@ -15884,7 +15677,7 @@ fn build_router() -> Router {
         .route("/api/logout", get(api_logout))
 }
 
-fn make_app_icon() -> Icon {
+pub(crate) fn make_app_icon() -> Icon {
     let size = 64u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let cx = 32.0f32;
@@ -15912,7 +15705,7 @@ fn make_app_icon() -> Icon {
     Icon::from_rgba(rgba, size, size).expect("生成图标失败")
 }
 
-fn open_browser() {
+pub(crate) fn open_browser() {
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", "", "http://127.0.0.1:3000"])
         .spawn();
