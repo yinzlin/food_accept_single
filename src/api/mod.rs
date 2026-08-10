@@ -1673,10 +1673,13 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
     // 进价仅超级管理员可见：非 super_admin 返回的进价字段置 0
     let is_super_admin = crate::auth::get_user_ctx(&headers).await.role == "super_admin";
     let category_id = params.get("category_id").and_then(|v| v.parse::<i64>().ok());
+    let product_id = params.get("id").and_then(|v| v.parse::<i64>().ok());
     let keyword_pattern = parse_keyword_pattern(&params);
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * page_size;
+    // thumbs=1 返回 image_url 字段(默认);thumbs=0 精简返回,前端按需懒加载,适合远程大量商品场景
+    let include_thumbs = params.get("thumbs").map(|s| s != "0").unwrap_or(true);
 
     // 构造 WHERE 条件、绑定参数和 COUNT 基础 SQL
     #[derive(Debug)]
@@ -1684,9 +1687,18 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
         where_sql: String,
         binds: Vec<String>,
         category_bind: Option<i64>,
+        id_bind: Option<i64>,
     }
 
-    let query_parts = if let Some(cid) = category_id {
+    let query_parts = if let Some(pid) = product_id {
+        // 按 id 精确查询(用于前端按需加载单条商品图片)
+        QueryParts {
+            where_sql: "WHERE p.id = ?".to_string(),
+            binds: vec![],
+            category_bind: None,
+            id_bind: Some(pid),
+        }
+    } else if let Some(cid) = category_id {
         QueryParts {
             where_sql: format!(
                 "WHERE p.category_id IN (
@@ -1702,12 +1714,14 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
             ),
             binds: vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()],
             category_bind: Some(cid),
+            id_bind: None,
         }
     } else {
         QueryParts {
             where_sql: "WHERE p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?".to_string(),
             binds: vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()],
             category_bind: None,
+            id_bind: None,
         }
     };
 
@@ -1717,6 +1731,9 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
         query_parts.where_sql
     );
     let mut count_q = sqlx::query(AssertSqlSafe(count_sql.as_str()));
+    if let Some(pid) = query_parts.id_bind {
+        count_q = count_q.bind(pid);
+    }
     if let Some(cid) = query_parts.category_bind {
         count_q = count_q.bind(cid);
     }
@@ -1727,14 +1744,24 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
     let total: i64 = total_row.get("count");
 
     // 分页数据查询
+    let select_cols = if include_thumbs {
+        "p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.image_url, p.category_id, p.status, p.audit_status, c.name as category_name"
+    } else {
+        // thumbs=0 模式: 省 image_url 列,流量更小;前端按需单独请求 ?thumbs=1
+        "p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.category_id, p.status, p.audit_status, c.name as category_name"
+    };
     let data_sql = format!(
-        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.image_url, p.category_id, p.status, p.audit_status, c.name as category_name 
+        "SELECT {} 
          FROM product p LEFT JOIN category c ON p.category_id = c.id
          {}
          ORDER BY p.id DESC LIMIT ? OFFSET ?",
+        select_cols,
         query_parts.where_sql
     );
     let mut data_q = sqlx::query(AssertSqlSafe(data_sql.as_str()));
+    if let Some(pid) = query_parts.id_bind {
+        data_q = data_q.bind(pid);
+    }
     if let Some(cid) = query_parts.category_bind {
         data_q = data_q.bind(cid);
     }
@@ -1821,7 +1848,7 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
             "min_purchase_price": if is_super_admin { row.get::<f64, _>("min_purchase_price") } else { 0.0 },
             "markup_rate": row.get::<f64, _>("markup_rate"),
             "auto_update_price": row.get::<i64, _>("auto_update_price"),
-            "image_url": row.get::<Option<String>, _>("image_url"),
+            "image_url": if include_thumbs { row.get::<Option<String>, _>("image_url") } else { None },
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "status": row.get::<i64, _>("status"),
             "audit_status": row.get::<Option<String>, _>("audit_status"),

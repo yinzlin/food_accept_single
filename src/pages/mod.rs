@@ -906,6 +906,20 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 </div>
             </div>
         </div>
+        <div class="modal fade" id="imageViewerModal" tabindex="-1">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">商品图片</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body text-center p-0">
+                        <img id="imageViewerImg" src="" style="max-width:100%;max-height:85vh;">
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <script>
             let currentCategoryId = null;
             let currentCategoryName = '全部商品';
@@ -931,6 +945,61 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             window.addEventListener('resize', updateStickyHeaderOffset);
             document.addEventListener('DOMContentLoaded', updateStickyHeaderOffset);
 
+            function openImageViewer(url) {{
+                document.getElementById('imageViewerImg').src = url;
+                const modal = new bootstrap.Modal(document.getElementById('imageViewerModal'));
+                modal.show();
+            }}
+
+            // 事件委托: 商品缩略图点击放大
+            document.addEventListener('click', function(e) {{
+                const t = e.target;
+                if (t && t.classList && t.classList.contains('product-thumb')) {{
+                    const url = t.getAttribute('data-viewer-url');
+                    if (url) openImageViewer(url);
+                }}
+            }});
+
+            // P4: 按需懒加载单条商品缩略图 URL
+            // 后端 ?thumbs=0 默认不带 image_url,前端 hover/进入视口时单独请求一次
+            const _thumbCache = new Map();  // productId -> Promise<string|null>
+            function lazyLoadThumb(productId) {{
+                if (_thumbCache.has(productId)) return _thumbCache.get(productId);
+                const p = (async () => {{
+                    try {{
+                        const r = await fetch('/api/product/list?page=1&page_size=1&id=' + productId + '&thumbs=1');
+                        if (!r.ok) return null;
+                        const j = await r.json();
+                        const item = (j.data || [])[0];
+                        return (item && item.image_url) ? item.image_url : null;
+                    }} catch (e) {{ return null; }}
+                }})();
+                _thumbCache.set(productId, p);
+                return p;
+            }}
+
+            // 进入视口时加载缩略图
+            let _thumbObserver = null;
+            function ensureThumbObserver() {{
+                if (_thumbObserver) return _thumbObserver;
+                _thumbObserver = new IntersectionObserver((entries) => {{
+                    entries.forEach(entry => {{
+                        if (!entry.isIntersecting) return;
+                        const el = entry.target;
+                        _thumbObserver.unobserve(el);
+                        const pid = el.getAttribute('data-pid');
+                        if (!pid) return;
+                        lazyLoadThumb(parseInt(pid)).then(url => {{
+                            if (url) {{
+                                const img = el.querySelector('img.product-thumb');
+                                if (img && !img.src) {{ img.src = url; img.setAttribute('data-viewer-url', url); }}
+                            }}
+                        }});
+                    }});
+                }}, {{ rootMargin: '100px 0px' }});
+                return _thumbObserver;
+            }}
+
             async function loadProductsByCategory(categoryId, page) {{
                 const categoryChanged = categoryId !== undefined && categoryId !== currentCategoryId;
                 if (categoryChanged) currentCategoryId = categoryId;
@@ -945,6 +1014,9 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 if (currentKeyword) {{ params.push('keyword=' + encodeURIComponent(currentKeyword)); }}
                 params.push('page=' + currentPage);
                 params.push('page_size=' + pageSize);
+                // P4: 默认 thumbs=0 精简请求;分类切换、关键词搜索保持此行为
+                // 鼠标悬停/进入视口时再按需拉 ?thumbs=1 单条 URL(见 lazyLoadThumbs)
+                params.push('thumbs=0');
                 let url = '/api/product/list?' + params.join('&');
                 try {{
                     const res = await fetch(url);
@@ -992,12 +1064,21 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     if (p.units && p.units.length > 0) {{
                         unitsText = p.units.map(u => u.unit_name + '(' + u.ratio + ')').join(', ');
                     }}
-                    let imageHtml = '';
+                    // P4: 按需懒加载模式 - 始终创建 img 元素,由 IntersectionObserver 触发加载
+                    let imageHtml = '<div class="product-thumb-wrap" data-pid="' + p.id + '" style="width:50px;height:50px;background:#f5f5f5;border-radius:4px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center;">';
                     if (p.image_url) {{
-                        imageHtml = '<img src="' + p.image_url + '" style="width:50px;height:50px;object-fit:cover;border-radius:4px;" alt="商品图片">';
+                        // 已有 URL(thumbs=1 模式): 直接渲染图片
+                        imageHtml += '<img src="' + p.image_url + '" data-viewer-url="' + p.image_url + '" class="product-thumb" '
+                            + 'loading="lazy" decoding="async" '
+                            + 'style="width:50px;height:50px;object-fit:cover;cursor:pointer;opacity:0;transition:opacity .25s ease-in;" '
+                            + 'alt="商品图片" onload="this.style.opacity=1">';
                     }} else {{
-                        imageHtml = '<div style="width:50px;height:50px;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#ccc;">无图</div>';
+                        // 无 URL(thumbs=0 模式): 渲染空 img 元素,等待 IntersectionObserver 设置 src
+                        imageHtml += '<img class="product-thumb" data-viewer-url="" '
+                            + 'style="width:50px;height:50px;object-fit:cover;cursor:pointer;opacity:0;transition:opacity .25s ease-in;" '
+                            + 'alt="商品图片" onload="if(this.src)this.style.opacity=1">';
                     }}
+                    imageHtml += '</div>';
                     let nameDisplay = escapeHtml(p.name);
                     if (p.alias2 && p.alias2.trim() !== '') {{
                         nameDisplay += '(' + escapeHtml(p.alias2.trim()) + ')';
@@ -1021,6 +1102,13 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     html += '<td>' + auditBtns + '<button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
+                // P4: 渲染完成后,观察所有需要懒加载的占位符(没有 src 属性的 img)
+                const observer = ensureThumbObserver();
+                document.querySelectorAll('.product-thumb-wrap[data-pid]').forEach(el => {{
+                    const img = el.querySelector('img.product-thumb');
+                    // 观察有 img 元素但没有 src 属性的占位符
+                    if (img && !img.hasAttribute('src')) observer.observe(el);
+                }});
             }}
 
             function searchProducts() {{
