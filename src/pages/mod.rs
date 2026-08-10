@@ -1366,9 +1366,28 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     imagePlaceholder.style.border = 'none';
                     imageActions.style.display = 'block';
                 }} else {{
-                    imagePlaceholder.innerHTML = '<span>暂无图片</span>';
-                    imagePlaceholder.style.border = '2px dashed #ddd';
-                    imageActions.style.display = 'none';
+                    // thumbs=0 列表不返回 image_url,单独请求一次获取
+                    (async () => {{
+                        try {{
+                            const r = await fetch('/api/product/list?page=1&page_size=1&id=' + id + '&thumbs=1');
+                            if (!r.ok) return;
+                            const j = await r.json();
+                            const item = (j.data || [])[0];
+                            if (item && item.image_url) {{
+                                imagePlaceholder.innerHTML = '<img src="' + item.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;">';
+                                imagePlaceholder.style.border = 'none';
+                                imageActions.style.display = 'block';
+                            }} else {{
+                                imagePlaceholder.innerHTML = '<span>暂无图片</span>';
+                                imagePlaceholder.style.border = '2px dashed #ddd';
+                                imageActions.style.display = 'none';
+                            }}
+                        }} catch(e) {{
+                            imagePlaceholder.innerHTML = '<span>暂无图片</span>';
+                            imagePlaceholder.style.border = '2px dashed #ddd';
+                            imageActions.style.display = 'none';
+                        }}
+                    }})();
                 }}
 
                 const modal = new bootstrap.Modal(document.getElementById('editProductModal'));
