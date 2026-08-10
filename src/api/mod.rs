@@ -6843,11 +6843,15 @@ pub async fn api_sales_order_generate_purchase(
         // "补充式"语义（force=true 路径），按 sales_order.generated_purchase_item_ids 快照驱动：
         //   1) 销售单 (P,U) 在快照中（且 id 仍在 PO） → 按主键 UPDATE 同步
         //   2) 销售单 (P,U) 在快照中（但 id 已从 PO 消失/被删） → 退化为 INSERT 补回
-        //   3) 销售单 (P,U) 不在快照中 → INSERT 新条目（source=本单）
-        //   4) 快照中存在但销售单 (P,U) 不再出现 → 从快照中清掉（PO 中对应行保留，不删）
-        //   5) PO 中 source=本单 但不在新快照的明细：保留不动（兜底防误删）
+        //   3) 销售单 (P,U) 不在快照中，但 PO 中有同 (P,U) 的"孤儿"（其他 source，可能是老代码
+        //      INSERT fallback 留下的 source=主表兜底） → UPDATE 复用并把 source 改成本销售单
+        //      （关键：避免与孤儿并存形成 (P,U) 重复）
+        //   4) 销售单 (P,U) 不在快照中且 PO 中无同 (P,U) → INSERT 新条目（source=本单）
+        //   5) 快照中存在但销售单 (P,U) 不再出现 → 从快照中清掉（PO 中对应行保留，不删）
+        //   6) PO 中 source=本单 但不在新快照的明细：保留不动（兜底防误删）
         // 这样既保证"用户从 PO 删的明细能补回"（快照覆盖到被删的 id），
-        // 又不会因 (P,U) 严格匹配 source=本单的现存而漏匹配（"3 条全删→3 条全 INSERT" 重复 BUG 根因）。
+        // 又不会因老代码 INSERT fallback 留下的 source=主表兜底孤儿"被新代码当成本销售单的",
+        // 进而形成 (P,U) 重复插入。
         let mut updated_lines: i64 = 0;
         let mut added_lines: i64 = 0;
         let mut delta_amount: f64 = 0.0; // UPDATE 同步：金额增量 = 新 - 旧
@@ -6906,11 +6910,86 @@ pub async fn api_sales_order_generate_purchase(
                     delta_amount += new_amount - old_amount; // 差量计入主表
                     updated_lines += 1;
                 }
-                // affected == 0 → 快照 id 在 DB 中已被删，退化到下面的 INSERT 分支补回
+                // affected == 0 → 快照 id 在 DB 中已被删，退化到下面的"孤儿复用"或 INSERT 分支
             }
 
             if !updated_via_snapshot {
-                // 2) 快照命中但 id 已被删 或 3) 快照无此 (P,U) → INSERT 一条，声明 source=本单
+                // 2) 快照命中但 id 已被删 或 3) 快照无此 (P,U) →
+                //    先在 PO 中找同 (P,U) 的"孤儿"（任意 source；通常 source=主表兜底），
+                //    有就 UPDATE 复用并把 source 改成本销售单；没有才 INSERT。
+                // 这是修复"老代码 INSERT fallback 留下 source=主表兜底孤儿"的二次重复 BUG 的关键。
+                let new_amount = quantity * unit_price;
+                // 孤儿匹配：同 (P,U) 任意 source；优先选 source=本单的（极端兜底），
+                // 否则选 source=主表兜底的（最常见的老代码遗留），最后任意。
+                // 为简化逻辑，按 id 最小的（最早插入的）复用。
+                let orphan_id: Option<i64> = sqlx::query(
+                    "SELECT id FROM purchase_order_item
+                     WHERE order_id = ? AND product_id = ?
+                       AND COALESCE(NULLIF(TRIM(COALESCE(sales_unit, '')), ''), unit, '') = ?
+                     ORDER BY (CASE WHEN source_sales_order_id = ? THEN 0 ELSE 1 END), id
+                     LIMIT 1"
+                )
+                .bind(po_id)
+                .bind(product_id)
+                .bind(sales_unit.trim())
+                .bind(id)
+                .fetch_optional(crate::db::pool())
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.get::<i64, _>("id"));
+
+                if let Some(orphan_po_id) = orphan_id {
+                    // 读取旧 amount 以计算差量
+                    let old_amount: f64 = sqlx::query(
+                        "SELECT COALESCE(amount, 0) as amount FROM purchase_order_item WHERE id = ? AND order_id = ?"
+                    )
+                    .bind(orphan_po_id)
+                    .bind(po_id)
+                    .fetch_optional(crate::db::pool())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| r.get::<f64, _>("amount"))
+                    .unwrap_or(0.0);
+                    // UPDATE 复用孤儿：同步字段 + 把 source 改成本销售单
+                    let upd_res = sqlx::query(
+                        "UPDATE purchase_order_item SET product_id = ?, product_name = ?, alias1 = ?, alias2 = ?, spec = ?, unit = ?, unit_price = ?, quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ?, remark = ?, warehouse_id = ?, warehouse_name = ?, sales_unit = ?, source_sales_order_id = ? WHERE order_id = ? AND id = ?"
+                    )
+                    .bind(product_id)
+                    .bind(&product_name)
+                    .bind(&alias1)
+                    .bind(&alias2)
+                    .bind(&spec)
+                    .bind(&unit)
+                    .bind(unit_price)
+                    .bind(quantity)
+                    .bind(base_quantity)
+                    .bind(new_amount)
+                    .bind(ordered_quantity)
+                    .bind(&remark)
+                    .bind(main_wh_id)
+                    .bind(&main_wh_name)
+                    .bind(&sales_unit)
+                    .bind(id)
+                    .bind(po_id)
+                    .bind(orphan_po_id)
+                    .execute(crate::db::pool())
+                    .await
+                    .ok();
+                    if let Some(res) = upd_res {
+                        if res.rows_affected() > 0 {
+                            new_snapshot_ids.insert(orphan_po_id);
+                            delta_amount += new_amount - old_amount;
+                            updated_lines += 1;
+                            // 不加 added_lines：这是复用，不是新增
+                            continue; // 处理下一个销售单明细
+                        }
+                    }
+                    // UPDATE 0 行（极端情况：行已被并发删除）→ 回落到 INSERT
+                }
+
+                // 4) 快照无此 (P,U) 且 PO 中无孤儿 → INSERT 新条目（source=本单）
                 let ins_res = sqlx::query(
                     "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name, sales_unit, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
