@@ -4153,6 +4153,20 @@ pub async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id):
         return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许删除；已审核订单需管理员反审核后才能删除", order_status));
     }
 
+    // 删除前收集本单涉及的商品，便于删除后从剩余采购历史重算最近/最高/最低进价
+    let mut affected_products: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    if let Ok(rows) = sqlx::query("SELECT DISTINCT product_id FROM purchase_order_item WHERE order_id = ? AND product_id > 0")
+        .bind(id)
+        .fetch_all(crate::db::pool())
+        .await
+    {
+        for r in rows {
+            if let Ok(pid) = r.try_get::<i64, _>("product_id") {
+                affected_products.insert(pid);
+            }
+        }
+    }
+
     sqlx::query("DELETE FROM purchase_order_item WHERE order_id = ?")
         .bind(id)
         .execute(crate::db::pool())
@@ -4166,6 +4180,10 @@ pub async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id):
     
     match result {
         Ok(_) => {
+            // 删除成功后，对涉及的商品从剩余采购历史重算进价（回滚/刷新最高/最低/最近价）
+            for pid in affected_products {
+                crate::recalc_product_purchase_prices_from_history(pid).await;
+            }
             crate::auth::log_operation(&ctx, "purchase_order.delete", "purchase_order", &id.to_string(),
                 &format!("删除采购单 ID={}", id)).await;
             (StatusCode::OK, "删除成功".to_string())

@@ -1194,14 +1194,11 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
                         const diff = currentPrice - lastPrice;
                         const sign = diff > 0 ? '上涨' : '下降';
-                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
-                        if (!confirm(tip + '\\n\\n是否继续？')) {{
-                            // 用户取消：不清空已选商品，仅提示
-                        }}
+                        const tip = '【价格提示】\n商品：' + productName + '\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\n本次采购价：' + currentPrice.toFixed(2) + '\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）\n\n是否继续？';
+                        await priceConfirm(tip);
                     }} else if (kind === 'sales' && currentPrice < lastPrice) {{
-                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
-                        if (!confirm(tip + '\\n\\n是否继续？')) {{
-                        }}
+                        const tip = '【价格提示】\n商品：' + productName + '\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\n本次零售价：' + currentPrice.toFixed(2) + '\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2) + '\n\n是否继续？';
+                        await priceConfirm(tip);
                     }}
                 }} catch(e) {{
                     console.error('价格比较失败:', e);
@@ -1243,7 +1240,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             // 商品编辑页价格校验：进价/售价为零普通提醒；进价>售价严重提醒
-            function validateProductPrices() {{
+            async function validateProductPrices() {{
                 const form = document.getElementById('editForm');
                 const purchase = parseFloat(form.purchase_price.value) || 0;
                 const selling = parseFloat(form.base_price.value) || 0;
@@ -1252,13 +1249,14 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 if (selling <= 0) warnings.push('当前售价为 0');
                 if (purchase > 0 && selling > 0 && purchase > selling) {{
                     const msg = '警告：当前进价（{{0}}）高于当前售价（{{1}}），请确认是否倒置！'.replace('{{0}}', purchase.toFixed(2)).replace('{{1}}', selling.toFixed(2));
-                    if (!confirm('【严重提醒】\\n' + msg + '\\n\\n是否仍要保存？')) {{
+                    if (!await priceConfirm('【严重提醒】\n' + msg + '\n\n是否仍要保存？')) {{
                         return false;
                     }}
-                    return warnings.length > 0 ? confirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\\n\\n是否仍要保存？') : true;
+                    if (warnings.length > 0) return await priceConfirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\n\n是否仍要保存？');
+                    return true;
                 }}
                 if (warnings.length > 0) {{
-                    return confirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\\n\\n是否仍要保存？');
+                    return await priceConfirm('【普通提醒】以下价格为零：' + warnings.join('、') + '\n\n是否仍要保存？');
                 }}
                 return true;
             }}
@@ -1454,7 +1452,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             async function submitEdit() {{
-                if (!validateProductPrices()) return;
+                if (!(await validateProductPrices())) return;
                 const form = document.getElementById('editForm');
                 const p = allProducts.find(x => x.id === editingProductId);
                 const data = {{
@@ -2633,23 +2631,21 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
                         const diff = currentPrice - lastPrice;
                         const sign = diff > 0 ? '上涨' : '下降';
-                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
-                        if (!confirm(tip + '\\n\\n是否继续？')) {{
-                        }}
+                        const tip = '【价格提示】\n商品：' + productName + '\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\n本次采购价：' + currentPrice.toFixed(2) + '\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）\n\n是否继续？';
+                        await priceConfirm(tip);
                     }} else if (kind === 'sales' && currentPrice < lastPrice) {{
-                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
-                        if (!confirm(tip + '\\n\\n是否继续？')) {{
-                        }}
+                        const tip = '【价格提示】\n商品：' + productName + '\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\n本次零售价：' + currentPrice.toFixed(2) + '\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2) + '\n\n是否继续？';
+                        await priceConfirm(tip);
                     }}
                 }} catch(e) {{
                     console.error('价格比较失败:', e);
                 }}
             }}
 
-            function selectProduct(index, li, afterSelect) {{
+            async function selectProduct(index, li, afterSelect) {{
                 const input = document.querySelector('#itemsTable tr:nth-child(' + (index + 1) + ') .product-search-input');
                 const dropdown = document.getElementById('searchDropdown_' + index);
-                
+
                 items[index].product_id = parseInt(li.getAttribute('data-id'));
                 items[index].product_name = li.getAttribute('data-name');
                 items[index].alias1 = li.getAttribute('data-alias1') || '';
@@ -2663,13 +2659,13 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 if (items[index].quantity === undefined || items[index].quantity === null) items[index].quantity = 0;
                 if (items[index].base_quantity === undefined || items[index].base_quantity === null) items[index].base_quantity = 0;
                 items[index].amount = (items[index].quantity || 0) * (items[index].unit_price || 0);
-                
+
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
 
-                // 采购单：本次采购价与最近采购价对比（同基础单位）
-                checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'purchase', items[index].product_name);
+                // 采购单：本次采购价与最近采购价对比（同基础单位），等待价格提示弹窗关闭
+                await checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'purchase', items[index].product_name);
 
                 fetch('/api/product/unit/list?product_id=' + items[index].product_id)
                     .then(res => res.json())
@@ -3521,23 +3517,21 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     if (kind === 'purchase' && Math.abs(currentPrice - lastPrice) >= 0.01) {{
                         const diff = currentPrice - lastPrice;
                         const sign = diff > 0 ? '上涨' : '下降';
-                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次采购价：' + currentPrice.toFixed(2) + '\\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）';
-                        if (!confirm(tip + '\\n\\n是否继续？')) {{
-                        }}
+                        const tip = '【价格提示】\n商品：' + productName + '\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\n本次采购价：' + currentPrice.toFixed(2) + '\n' + sign + ' ' + Math.abs(diff).toFixed(2) + '（' + (Math.abs(diff / lastPrice * 100)).toFixed(1) + '%）\n\n是否继续？';
+                        await priceConfirm(tip);
                     }} else if (kind === 'sales' && currentPrice < lastPrice) {{
-                        const tip = '【价格提示】\\n商品：' + productName + '\\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\\n本次零售价：' + currentPrice.toFixed(2) + '\\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2);
-                        if (!confirm(tip + '\\n\\n是否继续？')) {{
-                        }}
+                        const tip = '【价格提示】\n商品：' + productName + '\n最近采购价（基础单位 ' + lastUnit + '）：' + lastPrice.toFixed(2) + '\n本次零售价：' + currentPrice.toFixed(2) + '\n零售价低于采购价 ' + (lastPrice - currentPrice).toFixed(2) + '\n\n是否继续？';
+                        await priceConfirm(tip);
                     }}
                 }} catch(e) {{
                     console.error('价格比较失败:', e);
                 }}
             }}
 
-            function selectProduct(index, li, afterSelect) {{
+            async function selectProduct(index, li, afterSelect) {{
                 const input = document.querySelector('#itemsTable tr:nth-child(' + (index + 1) + ') .product-search-input');
                 const dropdown = document.getElementById('searchDropdown_' + index);
-                
+
                 items[index].product_id = parseInt(li.getAttribute('data-id'));
                 items[index].product_name = li.getAttribute('data-name');
                 items[index].alias1 = li.getAttribute('data-alias1') || '';
@@ -3550,13 +3544,13 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 if (items[index].quantity === undefined || items[index].quantity === null) items[index].quantity = 0;
                 if (items[index].base_quantity === undefined || items[index].base_quantity === null) items[index].base_quantity = 0;
                 items[index].amount = (items[index].quantity || 0) * (items[index].unit_price || 0);
-                
+
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
 
-                // 销售单：本次零售价对比最近采购价（同基础单位），低于则提醒
-                checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'sales', items[index].product_name);
+                // 销售单：本次零售价对比最近采购价（同基础单位），低于则提醒，等待价格提示弹窗关闭
+                await checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'sales', items[index].product_name);
 
                 fetch('/api/product/unit/list?product_id=' + items[index].product_id)
                     .then(res => res.json())
@@ -4183,8 +4177,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             async function updatePrices() {{
-                if (!currentOrderId) {{ alert('请先选择要编辑的订单'); return; }}
-                if (!confirm('将自动填入商品最新基础售价，请核对后手动保存修改。\n确定继续？')) return;
+                if (!currentOrderId) {{ await priceAlert('请先选择要编辑的订单', '提示'); return; }}
+                if (!await priceConfirm('将自动填入商品最新基础售价，请核对后手动保存修改。\n\n确定继续？')) return;
                 const btn = document.getElementById('updatePricesBtn');
                 btn.disabled = true;
                 btn.textContent = '获取中...';
@@ -4192,7 +4186,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const res = await fetch('/api/sales_order/update_prices/' + currentOrderId, {{ method: 'POST' }});
                     const data = await res.json();
                     if (data.errors && data.errors.length > 0) {{
-                        alert('部分商品获取售价失败：\n' + data.errors.join('\n'));
+                        await priceAlert('部分商品获取售价失败：\n' + data.errors.join('\n'), '提示');
                     }}
                     // 记录变动明细
                     const changes = [];
@@ -4253,11 +4247,11 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 if (contentType.includes('application/json')) {{
                     const data = await res.json();
                     if (data.warning) {{
-                        if (confirm(data.message + '\n\n确定导出？')) {{
+                        if (await priceConfirm(data.message + '\n\n确定导出？')) {{
                             downloadExcel(url, id, true);
                         }}
                     }} else if (data.error) {{
-                        alert(data.message);
+                        await priceAlert(data.message, '提示');
                     }}
                     return;
                 }}
@@ -4299,21 +4293,21 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const data = await res.json();
                     // 已处理的采购订单：不允许重新生成，直接提示
                     if (data.error) {{
-                        alert(data.message);
+                        await priceAlert(data.message, '提示');
                         return;
                     }}
                     // pending 状态的重复：提示确认后删除旧单重新生成
                     if (data.warning) {{
-                        if (confirm(data.message)) {{
+                        if (await priceConfirm(data.message)) {{
                             generatePurchaseOrders(id, true);
                         }}
                         return;
                     }}
                     if (res.ok) {{
-                        alert('成功生成 ' + data.count + ' 张采购订单');
+                        await priceAlert('成功生成 ' + data.count + ' 张采购订单', '提示');
                         loadOrders();
                     }} else {{
-                        alert('生成失败：' + (data.message || '未知错误'));
+                        await priceAlert('生成失败：' + (data.message || '未知错误'), '提示');
                     }}
                     return;
                 }}
@@ -5012,7 +5006,7 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
                 data.forEach(flow => {
                     detail += flow.type + ' ' + flow.quantity.toFixed(2) + ' ' + flow.create_time + '\n';
                 });
-                alert(detail);
+                await priceAlert(detail, '库存流水');
             }
             loadCategories();
             searchStock();
@@ -11195,14 +11189,14 @@ pub async fn page_supplement() -> Html<String> {
                 const projected = allocated_amount + pendingSum;  // 预计总分摊
                 const diff = projected - total_amount;            // 与耗材总额的差额
                 if (Math.abs(diff) > 5.0) {
-                    alert(`保存失败：预计总分摊金额超出耗材总额 ${diff.toFixed(2)} 元（超出±5元限制）。` +
+                    await priceAlert(`保存失败：预计总分摊金额超出耗材总额 ${diff.toFixed(2)} 元（超出±5元限制）。` +
                           `\n\n耗材总额: ${total_amount.toFixed(2)} 元` +
                           `\n已分摊: ${allocated_amount.toFixed(2)} 元` +
                           `\n剩余余额: ${remaining_balance.toFixed(2)} 元` +
                           `\n本次待保存: ${pendingSum.toFixed(2)} 元` +
                           `\n预计总分摊: ${projected.toFixed(2)} 元` +
                           `\n超额: ${diff.toFixed(2)} 元` +
-                          `\n\n请调整增项后再保存。`);
+                          `\n\n请调整增项后再保存。`, '提示');
                     return;
                 }
                 for (const item of toSave) {

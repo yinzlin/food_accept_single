@@ -404,7 +404,91 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         </div>
     </div>
     <div class="context-menu" id="contextMenu"></div>
+
+    <!-- 价格提示确认模态框（支持换行，替代原生 confirm） -->
+    <div class="modal fade" id="priceConfirmModal" tabindex="-1" style="z-index:1070;">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">价格提示</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="priceConfirmBody" style="white-space:pre-line;line-height:1.7;"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="priceConfirmCancel">取消</button>
+                    <button type="button" class="btn btn-primary" id="priceConfirmOk">确定</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 通用提示模态框（支持换行，替代原生 alert） -->
+    <div class="modal fade" id="appAlertModal" tabindex="-1" style="z-index:1070;">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="appAlertTitle">提示</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="appAlertBody" style="white-space:pre-line;line-height:1.7;"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal" id="appAlertOk">确定</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // 价格提示确认（支持换行的 confirm 替代）
+        function priceConfirm(message) {{
+            return new Promise(function(resolve) {{
+                const el = document.getElementById('priceConfirmModal');
+                const body = document.getElementById('priceConfirmBody');
+                const okBtn = document.getElementById('priceConfirmOk');
+                const cancelBtn = document.getElementById('priceConfirmCancel');
+                const modal = bootstrap.Modal.getOrCreateInstance(el);
+                body.textContent = message;
+                let settled = false;
+                const finish = function(result) {{
+                    if (settled) return;
+                    settled = true;
+                    okBtn.removeEventListener('click', onOk);
+                    cancelBtn.removeEventListener('click', onCancel);
+                    el.removeEventListener('hidden.bs.modal', onHidden);
+                    resolve(result);
+                }};
+                const onOk = function() {{ modal.hide(); finish(true); }};
+                const onCancel = function() {{ modal.hide(); finish(false); }};
+                const onHidden = function() {{ finish(false); }};
+                okBtn.addEventListener('click', onOk);
+                cancelBtn.addEventListener('click', onCancel);
+                el.addEventListener('hidden.bs.modal', onHidden);
+                modal.show();
+            }});
+        }}
+
+        // 通用提示（支持换行，替代原生 alert）
+        function priceAlert(message, title) {{
+            return new Promise(function(resolve) {{
+                const el = document.getElementById('appAlertModal');
+                const body = document.getElementById('appAlertBody');
+                const titleEl = document.getElementById('appAlertTitle');
+                const okBtn = document.getElementById('appAlertOk');
+                const modal = bootstrap.Modal.getOrCreateInstance(el);
+                body.textContent = message;
+                titleEl.textContent = title || '提示';
+                const onHidden = function() {{
+                    okBtn.removeEventListener('click', onOk);
+                    el.removeEventListener('hidden.bs.modal', onHidden);
+                    resolve();
+                }};
+                const onOk = function() {{ modal.hide(); }};
+                okBtn.addEventListener('click', onOk);
+                el.addEventListener('hidden.bs.modal', onHidden, {{ once: true }});
+                modal.show();
+            }});
+        }}
+
         let currentUser = null;
         
         async function checkLogin() {{
@@ -691,7 +775,7 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!await priceConfirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -703,9 +787,9 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
                     hideContextMenu();
                     loadProductCategories();
                 }} else {{
-                    alert(text || '删除失败');
+                    await priceAlert(text || '删除失败', '提示');
                 }}
-            }} catch(e) {{ alert('删除失败: ' + e.message); }}
+            }} catch(e) {{ await priceAlert('删除失败: ' + e.message, '提示'); }}
         }}
         
         function ctxRefreshCategoryTree() {{
@@ -897,7 +981,7 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteSupplierCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!await priceConfirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -909,9 +993,9 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
                     hideContextMenu();
                     loadSupplierCategories();
                 }} else {{
-                    alert(text || '删除失败');
+                    await priceAlert(text || '删除失败', '提示');
                 }}
-            }} catch(e) {{ alert('删除失败: ' + e.message); }}
+            }} catch(e) {{ await priceAlert('删除失败: ' + e.message, '提示'); }}
         }}
         
         function ctxRefreshSupplierCategoryTree() {{
@@ -1103,7 +1187,7 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeletePurchaserCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!confirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n注意：有子分类或已被引用的分类无法删除。')) return;
+            if (!await priceConfirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
@@ -1115,9 +1199,9 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
                     hideContextMenu();
                     loadPurchaserCategories();
                 }} else {{
-                    alert(text || '删除失败');
+                    await priceAlert(text || '删除失败', '提示');
                 }}
-            }} catch(e) {{ alert('删除失败: ' + e.message); }}
+            }} catch(e) {{ await priceAlert('删除失败: ' + e.message, '提示'); }}
         }}
         
         function ctxRefreshPurchaserCategoryTree() {{
