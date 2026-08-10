@@ -190,6 +190,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             phone TEXT,
             address TEXT,
             category_id INTEGER REFERENCES category(id),
+            audit_status TEXT NOT NULL DEFAULT 'pending',
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         "#,
@@ -206,6 +207,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             phone TEXT,
             address TEXT,
             category_id INTEGER REFERENCES category(id),
+            audit_status TEXT NOT NULL DEFAULT 'pending',
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         "#,
@@ -226,6 +228,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             max_purchase_price REAL DEFAULT 0,
             min_purchase_price REAL DEFAULT 0,
             category_id INTEGER REFERENCES category(id),
+            audit_status TEXT NOT NULL DEFAULT 'pending',
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(name, spec)
         )
@@ -379,6 +382,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             phone TEXT,
             status INTEGER DEFAULT 1,
             sort_order INTEGER DEFAULT 0,
+            audit_status TEXT NOT NULL DEFAULT 'pending',
             create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             update_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -947,6 +951,17 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool).await?;
     sqlx::query("INSERT OR IGNORE INTO category(id, name, parent_id, entity_type) VALUES (16, '耗材类', NULL, 'product')")
         .execute(pool).await?;
+
+    // 基础数据审核状态迁移：为旧库补充 audit_status 字段。
+    // pending=待审核，confirmed=已审核；存量数据（本次 ALTER 成功）统一视为已审核，不影响现有业务；
+    // 后续新增/修改的记录走 pending 待审核流程，由超级管理员审核。
+    for table in ["supplier", "purchaser", "product", "warehouse"] {
+        let sql = format!("ALTER TABLE {} ADD COLUMN audit_status TEXT NOT NULL DEFAULT 'pending'", table);
+        if sqlx::query(AssertSqlSafe(sql.as_str())).execute(pool).await.is_ok() {
+            let update_sql = format!("UPDATE {} SET audit_status = 'confirmed'", table);
+            let _ = sqlx::query(AssertSqlSafe(update_sql.as_str())).execute(pool).await;
+        }
+    }
 
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_purchaser_id ON sales_order(purchaser_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_order_no ON sales_order(order_no)").execute(pool).await;

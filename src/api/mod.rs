@@ -1099,7 +1099,7 @@ pub async fn api_supplier_list(axum::extract::Query(params): axum::extract::Quer
     
     let rows = if let Some(cid) = category_id {
         sqlx::query(
-            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, c.name as category_name 
+            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, s.audit_status, c.name as category_name 
              FROM supplier s LEFT JOIN category c ON s.category_id = c.id
              WHERE s.category_id IN (
                  WITH RECURSIVE cat_tree(id) AS (
@@ -1120,7 +1120,7 @@ pub async fn api_supplier_list(axum::extract::Query(params): axum::extract::Quer
         .unwrap_or_default()
     } else {
         sqlx::query(
-            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, c.name as category_name 
+            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, s.audit_status, c.name as category_name 
              FROM supplier s LEFT JOIN category c ON s.category_id = c.id
              WHERE s.name LIKE ?
              ORDER BY s.id DESC"
@@ -1143,6 +1143,7 @@ pub async fn api_supplier_list(axum::extract::Query(params): axum::extract::Quer
             "remark": row.get::<Option<String>, _>("remark"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "category_name": row.get::<Option<String>, _>("category_name"),
+            "audit_status": row.get::<Option<String>, _>("audit_status"),
         }))
         .collect();
     
@@ -1179,8 +1180,11 @@ pub async fn api_supplier_update(headers: axum::http::HeaderMap, Json(req): Json
         Err(e) => return e,
         Ok(_) => {}
     }
+    if let Err((code, msg)) = check_basic_not_confirmed("supplier", req.id.unwrap_or(0)).await {
+        return (code, msg);
+    }
     let result = sqlx::query(
-        "UPDATE supplier SET name=?, contact=?, phone=?, address=?, business_scope=?, remark=?, category_id=? WHERE id=?"
+        "UPDATE supplier SET name=?, contact=?, phone=?, address=?, business_scope=?, remark=?, category_id=?, audit_status='pending' WHERE id=?"
     )
     .bind(&req.name)
     .bind(&req.contact)
@@ -1204,6 +1208,9 @@ pub async fn api_supplier_delete(headers: axum::http::HeaderMap, Json(req): Json
         Err(e) => return e,
         Ok(_) => {}
     }
+    if let Err((code, msg)) = check_basic_not_confirmed("supplier", req.id).await {
+        return (code, msg);
+    }
     let result = sqlx::query("DELETE FROM supplier WHERE id=?")
         .bind(req.id)
         .execute(crate::db::pool())
@@ -1212,6 +1219,128 @@ pub async fn api_supplier_delete(headers: axum::http::HeaderMap, Json(req): Json
     match result {
         Ok(_) => (StatusCode::OK, "删除成功".to_string()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string()),
+    }
+}
+
+// ===== 基础数据审核状态管理 =====
+// audit_status：pending=待审核，confirmed=已审核
+// 审核/反审核仅超级管理员可执行（超级用户始终拥有最高权限），操作记入审计日志
+async fn set_basic_audit_status(
+    headers: &axum::http::HeaderMap,
+    table: &str,
+    id: i64,
+    to_status: &str,
+    action: &str,
+) -> Result<(), (StatusCode, String)> {
+    let ctx = crate::auth::get_user_ctx(headers).await;
+    if ctx.role != "super_admin" {
+        return Err((StatusCode::FORBIDDEN, "仅超级管理员可执行审核/反审核操作".to_string()));
+    }
+    let sql = format!("UPDATE {} SET audit_status = ? WHERE id = ?", table);
+    let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(to_status)
+        .bind(id)
+        .execute(crate::db::pool())
+        .await;
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            let status_text = if to_status == "confirmed" { "已审核" } else { "待审核" };
+            crate::auth::log_operation(&ctx, action, table, &id.to_string(), &format!("{} ID={} 审核状态 → {}", table, id, status_text)).await;
+            Ok(())
+        }
+        Ok(_) => Err((StatusCode::NOT_FOUND, "记录不存在".to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("操作失败: {}", e))),
+    }
+}
+
+/// 已审核记录锁定校验：记录已审核（confirmed）时禁止修改/删除，需先反审核。
+/// 用于基础数据及其子资源（商品单位/价格）的写操作。
+async fn check_basic_not_confirmed(table: &str, id: i64) -> Result<(), (StatusCode, String)> {
+    if id <= 0 {
+        return Err((StatusCode::BAD_REQUEST, "缺少记录ID".to_string()));
+    }
+    let sql = format!("SELECT audit_status FROM {} WHERE id = ?", table);
+    let status: Option<String> = sqlx::query_scalar(AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .unwrap_or(None);
+    match status.as_deref() {
+        Some("confirmed") => Err((StatusCode::BAD_REQUEST, "该记录已审核，如需修改/删除请先反审核".to_string())),
+        Some(_) => Ok(()),
+        None => Err((StatusCode::NOT_FOUND, "记录不存在".to_string())),
+    }
+}
+
+/// 基础数据是否已审核（下单校验用；id<=0 视为通过，避免误伤无关联的零值）
+async fn is_audit_confirmed(table: &str, id: i64) -> bool {
+    if id <= 0 {
+        return true;
+    }
+    let sql = format!("SELECT audit_status FROM {} WHERE id = ?", table);
+    sqlx::query_scalar::<_, String>(AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .unwrap_or(None)
+        .as_deref()
+        == Some("confirmed")
+}
+
+pub async fn api_supplier_approve(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "supplier", id, "confirmed", "supplier.approve").await {
+        Ok(()) => (StatusCode::OK, "审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_supplier_unapprove(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "supplier", id, "pending", "supplier.unapprove").await {
+        Ok(()) => (StatusCode::OK, "反审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_purchaser_approve(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "purchaser", id, "confirmed", "purchaser.approve").await {
+        Ok(()) => (StatusCode::OK, "审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_purchaser_unapprove(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "purchaser", id, "pending", "purchaser.unapprove").await {
+        Ok(()) => (StatusCode::OK, "反审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_product_approve(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "product", id, "confirmed", "product.approve").await {
+        Ok(()) => (StatusCode::OK, "审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_product_unapprove(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "product", id, "pending", "product.unapprove").await {
+        Ok(()) => (StatusCode::OK, "反审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_warehouse_approve(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "warehouse", id, "confirmed", "warehouse.approve").await {
+        Ok(()) => (StatusCode::OK, "审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+pub async fn api_warehouse_unapprove(headers: axum::http::HeaderMap, Json(req): Json<serde_json::Value>) -> impl IntoResponse {
+    let id = req["id"].as_i64().unwrap_or(0);
+    match set_basic_audit_status(&headers, "warehouse", id, "pending", "warehouse.unapprove").await {
+        Ok(()) => (StatusCode::OK, "反审核成功".to_string()).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
     }
 }
 
@@ -1386,7 +1515,7 @@ pub async fn api_purchaser_list(axum::extract::Query(params): axum::extract::Que
     
     let rows = if let Some(cid) = category_id {
         sqlx::query(
-            "SELECT p.id, p.name, p.contact, p.phone, p.address, p.business_scope, p.remark, p.category_id, c.name as category_name
+            "SELECT p.id, p.name, p.contact, p.phone, p.address, p.business_scope, p.remark, p.category_id, p.audit_status, c.name as category_name
              FROM purchaser p LEFT JOIN category c ON p.category_id = c.id
              WHERE p.category_id IN (
                  WITH RECURSIVE cat_tree(id) AS (
@@ -1407,7 +1536,7 @@ pub async fn api_purchaser_list(axum::extract::Query(params): axum::extract::Que
         .unwrap_or_default()
     } else {
         sqlx::query(
-            "SELECT p.id, p.name, p.contact, p.phone, p.address, p.business_scope, p.remark, p.category_id, c.name as category_name
+            "SELECT p.id, p.name, p.contact, p.phone, p.address, p.business_scope, p.remark, p.category_id, p.audit_status, c.name as category_name
              FROM purchaser p LEFT JOIN category c ON p.category_id = c.id
              WHERE p.name LIKE ?
              ORDER BY p.id DESC"
@@ -1430,6 +1559,7 @@ pub async fn api_purchaser_list(axum::extract::Query(params): axum::extract::Que
             "remark": row.get::<Option<String>, _>("remark"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "category_name": row.get::<Option<String>, _>("category_name"),
+            "audit_status": row.get::<Option<String>, _>("audit_status"),
         }))
         .collect();
     
@@ -1465,8 +1595,11 @@ pub async fn api_purchaser_update(headers: axum::http::HeaderMap, Json(req): Jso
         Err(e) => return e,
         Ok(_) => {}
     }
+    if let Err((code, msg)) = check_basic_not_confirmed("purchaser", req.id.unwrap_or(0)).await {
+        return (code, msg);
+    }
     let result = sqlx::query(
-        "UPDATE purchaser SET name=?, contact=?, phone=?, address=?, business_scope=?, remark=?, category_id=? WHERE id=?"
+        "UPDATE purchaser SET name=?, contact=?, phone=?, address=?, business_scope=?, remark=?, category_id=?, audit_status='pending' WHERE id=?"
     )
     .bind(&req.name)
     .bind(&req.contact)
@@ -1490,6 +1623,9 @@ pub async fn api_purchaser_delete(headers: axum::http::HeaderMap, Json(req): Jso
         Err(e) => return e,
         Ok(_) => {}
     }
+    if let Err((code, msg)) = check_basic_not_confirmed("purchaser", req.id).await {
+        return (code, msg);
+    }
     let result = sqlx::query("DELETE FROM purchaser WHERE id=?")
         .bind(req.id)
         .execute(crate::db::pool())
@@ -1502,6 +1638,9 @@ pub async fn api_purchaser_delete(headers: axum::http::HeaderMap, Json(req): Jso
 }
 
 pub async fn api_product_toggle_status(Path(id): Path<i64>) -> impl IntoResponse {
+    if let Err((code, msg)) = check_basic_not_confirmed("product", id).await {
+        return (code, msg);
+    }
     let row = sqlx::query("SELECT status FROM product WHERE id = ?")
         .bind(id)
         .fetch_optional(crate::db::pool())
@@ -1589,7 +1728,7 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
 
     // 分页数据查询
     let data_sql = format!(
-        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.image_url, p.category_id, p.status, c.name as category_name 
+        "SELECT p.id, p.name, p.spec, p.alias1, p.alias2, p.unit, p.base_unit, p.base_price, p.purchase_price, p.max_purchase_price, p.min_purchase_price, p.markup_rate, p.auto_update_price, p.image_url, p.category_id, p.status, p.audit_status, c.name as category_name 
          FROM product p LEFT JOIN category c ON p.category_id = c.id
          {}
          ORDER BY p.id DESC LIMIT ? OFFSET ?",
@@ -1685,6 +1824,7 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
             "image_url": row.get::<Option<String>, _>("image_url"),
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "status": row.get::<i64, _>("status"),
+            "audit_status": row.get::<Option<String>, _>("audit_status"),
             "category_name": row.get::<Option<String>, _>("category_name"),
             "units": units,
             "prices": prices,
@@ -1817,25 +1957,34 @@ pub async fn api_product_search(headers: axum::http::HeaderMap, axum::extract::Q
     if keyword.is_none() {
         return (StatusCode::OK, serde_json::to_string(&Vec::<serde_json::Value>::new()).unwrap());
     }
+    // audited=1：仅返回已审核商品（开单商品选择用）
+    let only_audited = params.get("audited").map(|s| s == "1").unwrap_or(false);
     
     let pattern = format!("%{}%", keyword.unwrap());
     
-    let rows = sqlx::query(
+    let where_clause = if only_audited {
+        "WHERE p.status = 1 AND p.audit_status = 'confirmed' AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)"
+    } else {
+        "WHERE p.status = 1 AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)"
+    };
+    let sql = format!(
         "SELECT p.id, p.name, p.alias1, p.alias2, p.spec, p.unit, p.base_unit, p.base_price, p.purchase_price,
                 COALESCE(NULLIF((SELECT price FROM product_price WHERE product_id = p.id AND price_type = 'gov_procurement'), 0),
                          (SELECT MAX(price) FROM product_price WHERE product_id = p.id AND price_type LIKE 'supermarket_%'),
                          p.base_price) as selling_price,
                 c.name as category_name
          FROM product p LEFT JOIN category c ON p.category_id = c.id
-         WHERE p.status = 1 AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)
-         ORDER BY p.name"
-    )
-    .bind(&pattern)
-    .bind(&pattern)
-    .bind(&pattern)
-    .fetch_all(crate::db::pool())
-    .await
-    .unwrap_or_default();
+         {}
+         ORDER BY p.name",
+        where_clause
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .fetch_all(crate::db::pool())
+        .await
+        .unwrap_or_default();
     
     let products: Vec<serde_json::Value> = rows
         .iter()
@@ -1862,6 +2011,9 @@ pub async fn api_product_update(headers: axum::http::HeaderMap, Json(mut req): J
         Err(e) => return e,
         Ok(role) => role,
     };
+    if let Err((code, msg)) = check_basic_not_confirmed("product", req.id).await {
+        return (code, msg);
+    }
     // 读取旧值用于日志
     let old_row = sqlx::query(
         "SELECT base_price, purchase_price, markup_rate, auto_update_price FROM product WHERE id = ?"
@@ -1887,7 +2039,7 @@ pub async fn api_product_update(headers: axum::http::HeaderMap, Json(mut req): J
     }
 
     let result = sqlx::query(
-        "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ?, markup_rate = ?, auto_update_price = ? WHERE id = ?"
+        "UPDATE product SET name = ?, spec = ?, alias1 = ?, alias2 = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, image_url = ?, category_id = ?, markup_rate = ?, auto_update_price = ?, audit_status='pending' WHERE id = ?"
     )
     .bind(&req.name)
     .bind(&req.spec)
@@ -1959,6 +2111,9 @@ pub async fn api_product_delete(headers: axum::http::HeaderMap, Json(req): Json<
     }
 
     let id = req["id"].as_i64().unwrap_or(0);
+    if let Err((code, msg)) = check_basic_not_confirmed("product", id).await {
+        return (code, msg);
+    }
 
     let check_tables = vec![
         ("库存", "SELECT COUNT(*) FROM inventory WHERE product_id = ?"),
@@ -2728,6 +2883,9 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
 }
 
 pub async fn api_product_unit_create(Json(req): Json<ProductUnitReq>) -> impl IntoResponse {
+    if let Err((code, msg)) = check_basic_not_confirmed("product", req.product_id).await {
+        return (code, msg);
+    }
     let result = sqlx::query(
         "INSERT INTO product_unit(product_id, unit_name, ratio, unit_price, purchase_price, sort_order) VALUES (?, ?, ?, ?, ?, ?)"
     )
@@ -2793,6 +2951,9 @@ pub async fn api_product_unit_delete(Json(req): Json<DeleteReq>) -> (StatusCode,
 
 pub async fn api_product_unit_delete_by_product(Json(req): Json<serde_json::Value>) -> (StatusCode, String) {
     let product_id = req["product_id"].as_i64().unwrap_or(0);
+    if let Err((code, msg)) = check_basic_not_confirmed("product", product_id).await {
+        return (code, msg);
+    }
     let result = sqlx::query("DELETE FROM product_unit WHERE product_id = ?")
         .bind(product_id)
         .execute(crate::db::pool())
@@ -2835,6 +2996,9 @@ pub async fn api_product_unit_list(headers: axum::http::HeaderMap, axum::extract
 }
 
 pub async fn api_product_price_upsert(Json(req): Json<ProductPriceReq>) -> impl IntoResponse {
+    if let Err((code, msg)) = check_basic_not_confirmed("product", req.product_id).await {
+        return (code, msg).into_response();
+    }
     let result = sqlx::query(
         "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source) VALUES (?, ?, ?, ?, ?)"
     )
@@ -2847,10 +3011,10 @@ pub async fn api_product_price_upsert(Json(req): Json<ProductPriceReq>) -> impl 
     .await;
 
     match result {
-        Ok(_) => StatusCode::OK,
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) => {
             eprintln!("保存价格失败: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -2902,14 +3066,17 @@ pub async fn api_product_price_delete(Json(req): Json<DeleteReq>) -> (StatusCode
 pub async fn api_product_price_delete_by_product(Json(req): Json<std::collections::HashMap<String, i64>>) -> impl IntoResponse {
     let product_id = match req.get("product_id") {
         Some(&id) => id,
-        None => return StatusCode::BAD_REQUEST,
+        None => return StatusCode::BAD_REQUEST.into_response(),
     };
+    if let Err((code, msg)) = check_basic_not_confirmed("product", product_id).await {
+        return (code, msg).into_response();
+    }
     sqlx::query("DELETE FROM product_price WHERE product_id = ?")
         .bind(product_id)
         .execute(crate::db::pool())
         .await
         .ok();
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
 pub async fn api_product_sync_base_price(Json(req): Json<std::collections::HashMap<String, i64>>) -> impl IntoResponse {
@@ -3172,7 +3339,7 @@ pub async fn api_inventory_list() -> impl IntoResponse {
 
 pub async fn api_warehouse_list() -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT id, name, code, address, contact, phone, status, sort_order, create_at, update_at FROM warehouse ORDER BY sort_order, id"
+        "SELECT id, name, code, address, contact, phone, status, sort_order, audit_status, create_at, update_at FROM warehouse ORDER BY sort_order, id"
     )
     .fetch_all(crate::db::pool())
     .await
@@ -3189,6 +3356,7 @@ pub async fn api_warehouse_list() -> impl IntoResponse {
             "phone": row.get::<Option<String>, _>("phone"),
             "status": row.get::<i32, _>("status"),
             "sort_order": row.get::<i32, _>("sort_order"),
+            "audit_status": row.get::<Option<String>, _>("audit_status"),
             "create_at": row.get::<Option<String>, _>("create_at"),
             "update_at": row.get::<Option<String>, _>("update_at"),
         }))
@@ -3224,8 +3392,11 @@ pub async fn api_warehouse_create(Json(req): Json<WarehouseCreateReq>) -> (Statu
 }
 
 pub async fn api_warehouse_update(Json(req): Json<WarehouseUpdateReq>) -> (StatusCode, String) {
+    if let Err((code, msg)) = check_basic_not_confirmed("warehouse", req.id).await {
+        return (code, msg);
+    }
     let result = sqlx::query(
-        "UPDATE warehouse SET name = ?, code = ?, address = ?, contact = ?, phone = ?, status = ?, sort_order = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?"
+        "UPDATE warehouse SET name = ?, code = ?, address = ?, contact = ?, phone = ?, status = ?, sort_order = ?, audit_status='pending', update_at = CURRENT_TIMESTAMP WHERE id = ?"
     )
     .bind(&req.name)
     .bind(req.code)
@@ -3255,6 +3426,9 @@ pub async fn api_warehouse_delete(Json(req): Json<std::collections::HashMap<Stri
     let id = req.get("id").copied().unwrap_or(0);
     if id == 1 {
         return (StatusCode::BAD_REQUEST, "默认仓库无法删除".to_string());
+    }
+    if let Err((code, msg)) = check_basic_not_confirmed("warehouse", id).await {
+        return (code, msg);
     }
     
     let count: i64 = sqlx::query("SELECT COUNT(*) FROM inventory WHERE warehouse_id = ?")
@@ -3424,6 +3598,11 @@ pub async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req)
         Ok(_) => {}
     }
     let ctx = crate::auth::get_user_ctx(&headers).await;
+
+    // 仅已审核的供应商允许下单
+    if !is_audit_confirmed("supplier", req.supplier_id).await {
+        return (StatusCode::BAD_REQUEST, "该供应商尚未审核通过，暂不能下单".to_string());
+    }
 
     // 行级数据权限：supplier 只能为自己绑定的供应商创建采购单
     if ctx.role == "supplier" {
@@ -8276,6 +8455,16 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
         Ok(_) => {}
     }
     let ctx = crate::auth::get_user_ctx(&headers).await;
+
+    // 仅已审核的采购方与商品允许下单
+    if !is_audit_confirmed("purchaser", req.purchaser_id).await {
+        return (StatusCode::BAD_REQUEST, "该采购方尚未审核通过，暂不能下单".to_string());
+    }
+    for item in &req.items {
+        if !is_audit_confirmed("product", item.product_id).await {
+            return (StatusCode::BAD_REQUEST, format!("商品「{}」尚未审核通过，暂不能下单", item.product_name));
+        }
+    }
 
     // 行级数据权限：purchaser 只能为自己绑定的采购单位创建销售单
     if ctx.role == "purchaser" {

@@ -183,7 +183,7 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
         </div>
 
         <table class="table table-bordered table-sm">
-            <thead><tr><th>ID</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>经营范围</th><th>备注</th><th>分类</th><th style="width:140px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>经营范围</th><th>备注</th><th>分类</th><th>审核状态</th><th style="width:260px">操作</th></tr></thead>
             <tbody id="supplierTableBody">
                 <tr><td colspan="10" class="text-center text-muted">加载中...</td></tr>
             </tbody>
@@ -217,6 +217,25 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
         </div>
         <script>
             let currentCategoryId=null,currentCategoryName='全部供应商',currentKeyword='',allSuppliers=[];
+            let isSuperAdmin=false;
+            fetch('/api/login/check').then(r=>r.json()).then(d=>{{
+                if(d&&d.logged_in){{
+                    isSuperAdmin=(d.user.role==='super_admin');
+                    if(isSuperAdmin){{loadSuppliersByCategory(currentCategoryId);}}
+                }}
+            }});
+            async function approveSupplier(id){{
+                if(!confirm('确定审核通过该供应商吗？'))return;
+                const res=await fetch('/api/supplier/approve',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
+                const text=await res.text();
+                if(res.ok){{loadSuppliersByCategory(currentCategoryId);}}else{{alert(text);}}
+            }}
+            async function unapproveSupplier(id){{
+                if(!confirm('确定反审核该供应商吗？反审核后需重新审核。'))return;
+                const res=await fetch('/api/supplier/unapprove',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
+                const text=await res.text();
+                if(res.ok){{loadSuppliersByCategory(currentCategoryId);}}else{{alert(text);}}
+            }}
             async function loadSuppliersByCategory(categoryId){{
                 currentCategoryId=categoryId;
                 let params=[];
@@ -236,13 +255,22 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                 allSuppliers=suppliers||[];
                 const tbody=document.getElementById('supplierTableBody');
                 if(!suppliers||suppliers.length===0){{
-                    tbody.innerHTML='<tr><td colspan="9" class="text-center text-muted">暂无供应商数据</td></tr>';
+                    tbody.innerHTML='<tr><td colspan="10" class="text-center text-muted">暂无供应商数据</td></tr>';
                     return;
                 }}
                 let html='';
                 suppliers.forEach(function(p){{
-                    html+='<tr><td>'+p.id+'</td><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.contact||'')+'</td><td>'+escapeHtml(p.phone||'')+'</td><td>'+escapeHtml(p.address||'')+'</td><td title="'+escapeHtml(p.business_scope||'')+'">'+escapeHtml(truncateText(p.business_scope||'',20))+'</td><td title="'+escapeHtml(p.remark||'')+'">'+escapeHtml(truncateText(p.remark||'',20))+'</td><td>'+escapeHtml(p.category_name||'无分类')+'</td>';
-                    html+='<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editSupplier('+p.id+')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deleteSupplier('+p.id+')">删除</button></td></tr>';
+                    let auditBadge=(p.audit_status==='confirmed')?'<span class="badge bg-success">已审核</span>':'<span class="badge bg-warning text-dark">待审核</span>';
+                    let auditBtns='';
+                    if(isSuperAdmin){{
+                        if(p.audit_status==='confirmed'){{
+                            auditBtns+='<button class="btn btn-sm btn-warning me-1" onclick="unapproveSupplier('+p.id+')">反审核</button>';
+                        }}else{{
+                            auditBtns+='<button class="btn btn-sm btn-success me-1" onclick="approveSupplier('+p.id+')">审核</button>';
+                        }}
+                    }}
+                    html+='<tr><td>'+p.id+'</td><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.contact||'')+'</td><td>'+escapeHtml(p.phone||'')+'</td><td>'+escapeHtml(p.address||'')+'</td><td title="'+escapeHtml(p.business_scope||'')+'">'+escapeHtml(truncateText(p.business_scope||'',20))+'</td><td title="'+escapeHtml(p.remark||'')+'">'+escapeHtml(truncateText(p.remark||'',20))+'</td><td>'+escapeHtml(p.category_name||'无分类')+'</td><td>'+auditBadge+'</td>';
+                    html+='<td>'+auditBtns+'<button class="btn btn-sm btn-outline-primary me-1" onclick="editSupplier('+p.id+')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deleteSupplier('+p.id+')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML=html;
             }}
@@ -263,6 +291,7 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
             function editSupplier(id){{
                 const p=allSuppliers.find(x=>x.id===id);
                 if(!p)return;
+                if(p.audit_status==='confirmed'){{alert('该供应商已审核，如需修改请先反审核');return;}}
                 const form=document.getElementById('editForm');
                 form.id.value=p.id;
                 form.name.value=p.name||'';
@@ -293,6 +322,7 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
             async function deleteSupplier(id){{
                 const p=allSuppliers.find(x=>x.id===id);
                 const name=p?p.name:'';
+                if(p&&p.audit_status==='confirmed'){{alert('该供应商已审核，如需删除请先反审核');return;}}
                 if(!confirm('确定要删除供应商「'+name+'」吗？'))return;
                 const res=await fetch('/api/supplier/delete',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
                 if(res.ok){{loadSuppliersByCategory(currentCategoryId);}}
@@ -410,7 +440,7 @@ pub async fn page_purchaser(headers: axum::http::HeaderMap) -> Html<String> {
         </div>
 
         <table class="table table-bordered table-sm">
-            <thead><tr><th>ID</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>经营范围</th><th>备注</th><th>分类</th><th style="width:140px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>经营范围</th><th>备注</th><th>分类</th><th>审核状态</th><th style="width:260px">操作</th></tr></thead>
             <tbody id="purchaserTableBody">
                 <tr><td colspan="10" class="text-center text-muted">加载中...</td></tr>
             </tbody>
@@ -444,6 +474,25 @@ pub async fn page_purchaser(headers: axum::http::HeaderMap) -> Html<String> {
         </div>
         <script>
             let currentCategoryId=null,currentCategoryName='全部采购方',currentKeyword='',allPurchasers=[];
+            let isSuperAdmin=false;
+            fetch('/api/login/check').then(r=>r.json()).then(d=>{{
+                if(d&&d.logged_in){{
+                    isSuperAdmin=(d.user.role==='super_admin');
+                    if(isSuperAdmin){{loadPurchasersByCategory(currentCategoryId);}}
+                }}
+            }});
+            async function approvePurchaser(id){{
+                if(!confirm('确定审核通过该采购方吗？'))return;
+                const res=await fetch('/api/purchaser/approve',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
+                const text=await res.text();
+                if(res.ok){{loadPurchasersByCategory(currentCategoryId);}}else{{alert(text);}}
+            }}
+            async function unapprovePurchaser(id){{
+                if(!confirm('确定反审核该采购方吗？反审核后需重新审核。'))return;
+                const res=await fetch('/api/purchaser/unapprove',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
+                const text=await res.text();
+                if(res.ok){{loadPurchasersByCategory(currentCategoryId);}}else{{alert(text);}}
+            }}
             async function loadPurchasersByCategory(categoryId){{
                 currentCategoryId=categoryId;
                 let params=[];
@@ -463,13 +512,22 @@ pub async fn page_purchaser(headers: axum::http::HeaderMap) -> Html<String> {
                 allPurchasers=purchasers||[];
                 const tbody=document.getElementById('purchaserTableBody');
                 if(!purchasers||purchasers.length===0){{
-                    tbody.innerHTML='<tr><td colspan="9" class="text-center text-muted">暂无采购方数据</td></tr>';
+                    tbody.innerHTML='<tr><td colspan="10" class="text-center text-muted">暂无采购方数据</td></tr>';
                     return;
                 }}
                 let html='';
                 purchasers.forEach(function(p){{
-                    html+='<tr><td>'+p.id+'</td><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.contact||'')+'</td><td>'+escapeHtml(p.phone||'')+'</td><td>'+escapeHtml(p.address||'')+'</td><td title="'+escapeHtml(p.business_scope||'')+'">'+escapeHtml(truncateText(p.business_scope||'',20))+'</td><td title="'+escapeHtml(p.remark||'')+'">'+escapeHtml(truncateText(p.remark||'',20))+'</td><td>'+escapeHtml(p.category_name||'无分类')+'</td>';
-                    html+='<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editPurchaser('+p.id+')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deletePurchaser('+p.id+')">删除</button></td></tr>';
+                    let auditBadge=(p.audit_status==='confirmed')?'<span class="badge bg-success">已审核</span>':'<span class="badge bg-warning text-dark">待审核</span>';
+                    let auditBtns='';
+                    if(isSuperAdmin){{
+                        if(p.audit_status==='confirmed'){{
+                            auditBtns+='<button class="btn btn-sm btn-warning me-1" onclick="unapprovePurchaser('+p.id+')">反审核</button>';
+                        }}else{{
+                            auditBtns+='<button class="btn btn-sm btn-success me-1" onclick="approvePurchaser('+p.id+')">审核</button>';
+                        }}
+                    }}
+                    html+='<tr><td>'+p.id+'</td><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.contact||'')+'</td><td>'+escapeHtml(p.phone||'')+'</td><td>'+escapeHtml(p.address||'')+'</td><td title="'+escapeHtml(p.business_scope||'')+'">'+escapeHtml(truncateText(p.business_scope||'',20))+'</td><td title="'+escapeHtml(p.remark||'')+'">'+escapeHtml(truncateText(p.remark||'',20))+'</td><td>'+escapeHtml(p.category_name||'无分类')+'</td><td>'+auditBadge+'</td>';
+                    html+='<td>'+auditBtns+'<button class="btn btn-sm btn-outline-primary me-1" onclick="editPurchaser('+p.id+')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deletePurchaser('+p.id+')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML=html;
             }}
@@ -490,6 +548,7 @@ pub async fn page_purchaser(headers: axum::http::HeaderMap) -> Html<String> {
             function editPurchaser(id){{
                 const p=allPurchasers.find(x=>x.id===id);
                 if(!p)return;
+                if(p.audit_status==='confirmed'){{alert('该采购方已审核，如需修改请先反审核');return;}}
                 const form=document.getElementById('editForm');
                 form.id.value=p.id;
                 form.name.value=p.name||'';
@@ -520,6 +579,7 @@ pub async fn page_purchaser(headers: axum::http::HeaderMap) -> Html<String> {
             async function deletePurchaser(id){{
                 const p=allPurchasers.find(x=>x.id===id);
                 const name=p?p.name:'';
+                if(p&&p.audit_status==='confirmed'){{alert('该采购方已审核，如需删除请先反审核');return;}}
                 if(!confirm('确定要删除采购方「'+name+'」吗？'))return;
                 const res=await fetch('/api/purchaser/delete',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
                 if(res.ok){{loadPurchasersByCategory(currentCategoryId);}}
@@ -661,9 +721,9 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
         <div class="product-list-section">
         <table class="table table-bordered product-sticky-table">
-            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th style="width:140px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>审核</th><th style="width:260px">操作</th></tr></thead>
             <tbody id="productTableBody">
-                <tr><td colspan="12" class="text-center text-muted">加载中...</td></tr>
+                <tr><td colspan="13" class="text-center text-muted">加载中...</td></tr>
             </tbody>
         </table>
         <div id="productPagination" class="mt-3"></div>
@@ -923,7 +983,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             function renderProductTable(products) {{
                 const tbody = document.getElementById('productTableBody');
                 if (!products || products.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="12" class="text-center text-muted">暂无商品数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="13" class="text-center text-muted">暂无商品数据</td></tr>';
                     return;
                 }}
                 let html = '';
@@ -948,8 +1008,17 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     let autoBadge = (p.auto_update_price === 1) ? '<span class="badge bg-info" title="开启自动更新售价">自动</span>' : '<span class="badge bg-light text-dark" title="人工维护售价">人工</span>';
                     let autoBtnClass = (p.auto_update_price === 1) ? 'btn-outline-secondary' : 'btn-outline-info';
                     let autoBtnText = (p.auto_update_price === 1) ? '关闭自动' : '开启自动';
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
-                    html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
+                    let auditBadge = (p.audit_status === 'confirmed') ? '<span class="badge bg-success">已审核</span>' : '<span class="badge bg-warning text-dark">待审核</span>';
+                    let auditBtns = '';
+                    if (isSuperAdmin) {{
+                        if (p.audit_status === 'confirmed') {{
+                            auditBtns += '<button class="btn btn-sm btn-warning me-1" onclick="unapproveProduct(' + p.id + ')">反审核</button>';
+                        }} else {{
+                            auditBtns += '<button class="btn btn-sm btn-success me-1" onclick="approveProduct(' + p.id + ')">审核</button>';
+                        }}
+                    }}
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td><td>' + auditBadge + '</td>';
+                    html += '<td>' + auditBtns + '<button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
             }}
@@ -1121,7 +1190,21 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     isSuperAdmin = (d.user.role === 'super_admin');
                 }}
                 applyPurchasePriceRestriction();
+                if (isSuperAdmin) loadProductsByCategory(currentCategoryId);
             }});
+
+            async function approveProduct(id) {{
+                if (!confirm('确定审核通过该商品吗？')) return;
+                const res = await fetch('/api/product/approve', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ id: id }}) }});
+                const text = await res.text();
+                if (res.ok) {{ loadProductsByCategory(currentCategoryId); }} else {{ alert(text); }}
+            }}
+            async function unapproveProduct(id) {{
+                if (!confirm('确定反审核该商品吗？反审核后需重新审核。')) return;
+                const res = await fetch('/api/product/unapprove', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ id: id }}) }});
+                const text = await res.text();
+                if (res.ok) {{ loadProductsByCategory(currentCategoryId); }} else {{ alert(text); }}
+            }}
 
             function addUnitRow(unitData) {{
                 const tbody = document.getElementById('unitTableBody');
@@ -1142,6 +1225,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 editingProductId = id;
                 const p = allProducts.find(x => x.id === id);
                 if (!p) return;
+                if (p.audit_status === 'confirmed') {{ alert('该商品已审核，如需修改请先反审核'); return; }}
                 const form = document.getElementById('editForm');
                 form.id.value = p.id;
                 form.name.value = p.name || '';
@@ -1367,6 +1451,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             async function toggleProductStatus(id) {{
                 const p = allProducts.find(x => x.id === id);
                 const name = p ? p.name : '';
+                if (p && p.audit_status === 'confirmed') {{ alert('该商品已审核，如需停用/启用请先反审核'); return; }}
                 const action = p && p.status === 1 ? '停用' : '启用';
                 if (!confirm('确定要' + action + '商品「' + name + '」吗？')) return;
                 const res = await fetch('/api/product/toggle_status/' + id, {{
@@ -1381,6 +1466,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             async function deleteProduct(id) {{
                 const p = allProducts.find(x => x.id === id);
                 const name = p ? p.name : '';
+                if (p && p.audit_status === 'confirmed') {{ alert('该商品已审核，如需删除请先反审核'); return; }}
                 if (!confirm('确定要删除商品「' + name + '」吗？')) return;
                 const res = await fetch('/api/product/delete', {{
                     method: 'POST',
@@ -1529,9 +1615,9 @@ pub async fn page_warehouse(headers: axum::http::HeaderMap) -> Html<String> {
                 <input type="text" id="searchKeyword" class="form-control" placeholder="搜索仓库名称或编号..." oninput="searchWarehouses()">
             </div>
             <table class="table table-bordered table-sm">
-                <thead><tr><th>ID</th><th>编号</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>状态</th><th style="width:120px">操作</th></tr></thead>
+                <thead><tr><th>ID</th><th>编号</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>状态</th><th>审核状态</th><th style="width:260px">操作</th></tr></thead>
                 <tbody id="warehouseTableBody">
-                    <tr><td colspan="8" class="text-center text-muted">加载中...</td></tr>
+                    <tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -1569,6 +1655,33 @@ pub async fn page_warehouse(headers: axum::http::HeaderMap) -> Html<String> {
         </div>
         <script>
             let allWarehouses = [];
+            let isSuperAdmin = false;
+            fetch('/api/login/check').then(r => r.json()).then(d => {
+                if (d && d.logged_in) {
+                    isSuperAdmin = (d.user.role === 'super_admin');
+                    if (isSuperAdmin) loadWarehouses();
+                }
+            });
+            async function approveWarehouse(id) {
+                if (!confirm('确定审核通过该仓库吗？')) return;
+                const res = await fetch('/api/warehouse/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id })
+                });
+                const text = await res.text();
+                if (res.ok) { loadWarehouses(); } else { alert(text); }
+            }
+            async function unapproveWarehouse(id) {
+                if (!confirm('确定反审核该仓库吗？反审核后需重新审核。')) return;
+                const res = await fetch('/api/warehouse/unapprove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id })
+                });
+                const text = await res.text();
+                if (res.ok) { loadWarehouses(); } else { alert(text); }
+            }
             async function loadWarehouses() {
                 try {
                     const res = await fetch('/api/warehouse/list');
@@ -1582,7 +1695,7 @@ pub async fn page_warehouse(headers: axum::http::HeaderMap) -> Html<String> {
             function renderWarehouseTable(warehouses) {
                 const tbody = document.getElementById('warehouseTableBody');
                 if (!warehouses || warehouses.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">暂无仓库数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无仓库数据</td></tr>';
                     return;
                 }
                 let html = '';
@@ -1590,11 +1703,22 @@ pub async fn page_warehouse(headers: axum::http::HeaderMap) -> Html<String> {
                     const statusBadge = w.status === 1 
                         ? '<span class="badge bg-success">启用</span>' 
                         : '<span class="badge bg-secondary">停用</span>';
-                    html += '<tr><td>' + w.id + '</td><td>' + escapeHtml(w.code || '') + '</td><td>' + escapeHtml(w.name) + '</td><td>' + escapeHtml(w.contact || '') + '</td><td>' + escapeHtml(w.phone || '') + '</td><td title="' + escapeHtml(w.address || '') + '">' + escapeHtml(truncateText(w.address || '', 20)) + '</td><td>' + statusBadge + '</td>';
+                    const auditBadge = (w.audit_status === 'confirmed')
+                        ? '<span class="badge bg-success">已审核</span>'
+                        : '<span class="badge bg-warning text-dark">待审核</span>';
+                    let auditBtns = '';
+                    if (isSuperAdmin) {
+                        if (w.audit_status === 'confirmed') {
+                            auditBtns += '<button class="btn btn-sm btn-warning me-1" onclick="unapproveWarehouse(' + w.id + ')">反审核</button>';
+                        } else {
+                            auditBtns += '<button class="btn btn-sm btn-success me-1" onclick="approveWarehouse(' + w.id + ')">审核</button>';
+                        }
+                    }
+                    html += '<tr><td>' + w.id + '</td><td>' + escapeHtml(w.code || '') + '</td><td>' + escapeHtml(w.name) + '</td><td>' + escapeHtml(w.contact || '') + '</td><td>' + escapeHtml(w.phone || '') + '</td><td title="' + escapeHtml(w.address || '') + '">' + escapeHtml(truncateText(w.address || '', 20)) + '</td><td>' + statusBadge + '</td><td>' + auditBadge + '</td>';
                     if (w.id === 1) {
-                        html += '<td><button class="btn btn-sm btn-outline-primary" onclick="editWarehouse(' + w.id + ')">编辑</button></td></tr>';
+                        html += '<td>' + auditBtns + '<button class="btn btn-sm btn-outline-primary" onclick="editWarehouse(' + w.id + ')">编辑</button></td></tr>';
                     } else {
-                        html += '<td><button class="btn btn-sm btn-outline-primary me-1" onclick="editWarehouse(' + w.id + ')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deleteWarehouse(' + w.id + ')">删除</button></td></tr>';
+                        html += '<td>' + auditBtns + '<button class="btn btn-sm btn-outline-primary me-1" onclick="editWarehouse(' + w.id + ')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deleteWarehouse(' + w.id + ')">删除</button></td></tr>';
                     }
                 });
                 tbody.innerHTML = html;
@@ -1621,6 +1745,7 @@ pub async fn page_warehouse(headers: axum::http::HeaderMap) -> Html<String> {
             function editWarehouse(id) {
                 const warehouse = allWarehouses.find(w => w.id === id);
                 if (!warehouse) return;
+                if (warehouse.audit_status === 'confirmed') { alert('该仓库已审核，如需修改请先反审核'); return; }
                 document.getElementById('warehouseModalTitle').textContent = '编辑仓库';
                 const form = document.getElementById('warehouseForm');
                 form.querySelector('input[name="id"]').value = warehouse.id;
@@ -1668,6 +1793,8 @@ pub async fn page_warehouse(headers: axum::http::HeaderMap) -> Html<String> {
                 }
             }
             async function deleteWarehouse(id) {
+                const warehouse = allWarehouses.find(w => w.id === id);
+                if (warehouse && warehouse.audit_status === 'confirmed') { alert('该仓库已审核，如需删除请先反审核'); return; }
                 if (!confirm('确定要删除该仓库吗？删除后无法恢复！')) return;
                 try {
                     const res = await fetch('/api/warehouse/delete', {
@@ -1853,6 +1980,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
         <script>
             let suppliers = [];
+            let auditedSuppliers = [];
             let items = [];
             let sortField = '';
             let sortOrder = 'desc';
@@ -1881,6 +2009,8 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             async function loadSuppliers() {{
                 const res = await fetch('/api/supplier/list');
                 suppliers = await res.json();
+                // 新建订单仅可选已审核供应商；订单列表筛选下拉仍显示全部
+                auditedSuppliers = suppliers.filter(s => s.audit_status === 'confirmed');
                 const select = document.getElementById('supplierSelect');
                 if (select && suppliers.length > 0) {{
                     suppliers.forEach(s => {{
@@ -1980,13 +2110,13 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
             function showSupplierDropdown(filter) {{
                 const dropdown = document.getElementById('supplierDropdown');
-                let list = suppliers;
+                let list = auditedSuppliers;
                 if (filter) {{
                     const kw = filter.toLowerCase();
-                    list = suppliers.filter(s => s.name.toLowerCase().includes(kw));
+                    list = auditedSuppliers.filter(s => s.name.toLowerCase().includes(kw));
                 }}
                 if (list.length === 0) {{
-                    dropdown.innerHTML = '<div class="p-2 text-muted">无匹配供应商</div>';
+                    dropdown.innerHTML = '<div class="p-2 text-muted">无匹配供应商（仅显示已审核）</div>';
                     dropdown.style.display = 'block';
                     return;
                 }}
@@ -2350,7 +2480,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 if (searchTimeout) clearTimeout(searchTimeout);
                 
                 searchTimeout = setTimeout(async () => {{
-                    const res = await fetch('/api/product/search?keyword=' + encodeURIComponent(keyword));
+                    const res = await fetch('/api/product/search?audited=1&keyword=' + encodeURIComponent(keyword));
                     const products = await res.json();
                     
                     if (products.length > 0) {{
@@ -2951,6 +3081,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
         <script>
             let purchasers = [];
+            let auditedPurchasers = [];
             let items = [];
             let sortField = '';
             let sortOrder = 'desc';
@@ -2978,13 +3109,13 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
             function showPurchaserDropdown(filter) {{
                 const dropdown = document.getElementById('purchaserDropdown');
-                let list = purchasers;
+                let list = auditedPurchasers;
                 if (filter) {{
                     const kw = filter.toLowerCase();
-                    list = purchasers.filter(p => p.name.toLowerCase().includes(kw));
+                    list = auditedPurchasers.filter(p => p.name.toLowerCase().includes(kw));
                 }}
                 if (list.length === 0) {{
-                    dropdown.innerHTML = '<div class="p-2 text-muted">无匹配采购单位</div>';
+                    dropdown.innerHTML = '<div class="p-2 text-muted">无匹配采购单位（仅显示已审核）</div>';
                     dropdown.style.display = 'block';
                     return;
                 }}
@@ -3237,7 +3368,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 if (searchTimeout) clearTimeout(searchTimeout);
                 
                 searchTimeout = setTimeout(async () => {{
-                    const res = await fetch('/api/product/search?keyword=' + encodeURIComponent(keyword));
+                    const res = await fetch('/api/product/search?audited=1&keyword=' + encodeURIComponent(keyword));
                     const products = await res.json();
                     
                     if (products.length > 0) {{
@@ -3483,7 +3614,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             let suppliers = [];
             async function loadSuppliers() {{
                 const res = await fetch('/api/supplier/list');
-                suppliers = await res.json();
+                // 销售单明细行指定供应商（用于生成采购单），仅可选已审核供应商
+                suppliers = (await res.json()).filter(s => s.audit_status === 'confirmed');
             }}
             loadSuppliers();
 
@@ -4148,6 +4280,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             async function loadPurchasers() {{
                 const res = await fetch('/api/purchaser/list');
                 purchasers = await res.json();
+                // 新建销售单仅可选已审核采购单位；订单列表筛选下拉仍显示全部
+                auditedPurchasers = purchasers.filter(p => p.audit_status === 'confirmed');
                 const select = document.getElementById('purchaserSelect');
                 if (select && purchasers.length > 0) {{
                     purchasers.forEach(p => {{
