@@ -6501,6 +6501,10 @@ pub async fn api_sales_order_generate_purchase(
     // force 路径下受影响的 PO 集合（仅在 force=true 时填充并使用）
     let mut affected_po_ids: std::collections::HashSet<i64>;
 
+    // 把"销售单 (P,U) -> PO 明细 id"索引提到外层作用域，
+    // supplier_items 循环需要用它做"按主键 UPDATE"判定
+    let mut snapshot_by_pu: std::collections::HashMap<(i64, String), i64> = std::collections::HashMap::new();
+
     if !existed.is_empty() {
         let status_text = |s: &str| match s {
             "pending" => "待分拣",
@@ -6625,7 +6629,70 @@ pub async fn api_sales_order_generate_purchase(
                 old_items_by_po.insert(*po_id, rows);
             }
         }
+
+        // 读取本销售单"曾生成过的 PO 明细 id 快照"（用于跨调用追踪）：
+        // 解决 force=true 路径下"用户从 PO 中删了明细 → to_consume 池因 source=id 过滤
+        // 而为 0 → 重新 INSERT 全部 3 条"造成的重复 BUG。
+        // 快照是一组 PO 明细主键 id。每次 force 结束时，会用"本次实际 UPDATE/INSERT
+        // 的 PO 明细 id 集合"覆盖写回，所以它始终代表"本销售单最新一次生成时
+        // 写入/更新的 PO 明细"。
+        // 匹配策略：
+        //   - 销售单 (P,U) 在快照中：按主键 UPDATE（id 在 DB 中消失时退化为 INSERT）
+        //   - 销售单 (P,U) 不在快照中：INSERT 新条目（source=本单）
+        //   - 快照中存在但销售单 (P,U) 不再出现：从快照中清掉（PO 中对应行保留，不删）
+        //   - PO 中 source=本单 但不在新快照的明细：保留不动（兜底防误删）
+        let snapshot_str: Option<String> = sqlx::query(
+            "SELECT generated_purchase_item_ids FROM sales_order WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .unwrap_or(None)
+        .and_then(|r| r.try_get::<Option<String>, _>("generated_purchase_item_ids").ok().flatten());
+        let snapshot_ids: std::collections::HashSet<i64> = snapshot_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+
+        // 把快照 id 翻译成 (P,U) -> po_item_id 索引（仅 source=本单的 id 纳入）
+        // 同一 (P,U) 在快照中只可能 1 条（销售单明细与 PO 明细 1:1 关系）
+        // snapshot_by_pu 已在外层定义
+        if !snapshot_ids.is_empty() {
+            let placeholders = std::iter::repeat("?")
+                .take(snapshot_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, product_id, COALESCE(NULLIF(TRIM(COALESCE(sales_unit, '')), ''), unit, '') as unit_key
+                 FROM purchase_order_item
+                 WHERE source_sales_order_id = ? AND id IN ({})",
+                placeholders
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(id);
+            for iid in &snapshot_ids {
+                q = q.bind(iid);
+            }
+            let snap_rows: Vec<(i64, i64, String)> = q
+                .fetch_all(crate::db::pool())
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (
+                    r.get::<i64, _>("id"),
+                    r.get::<i64, _>("product_id"),
+                    r.get::<String, _>("unit_key"),
+                ))
+                .collect();
+            for (po_id, pid, ukey) in snap_rows {
+                snapshot_by_pu.insert((pid, ukey), po_id);
+            }
+        }
     }
+
+    // 本轮 force 实际写入/更新的 PO 明细 id（循环结束后回写 sales_order 快照）
+    // 提到外层作用域以供 supplier_items 循环后的快照回写使用
+    let mut new_snapshot_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // 取销售订单明细（含销售单位 unit、备注）
     let item_rows = sqlx::query(
@@ -6773,18 +6840,14 @@ pub async fn api_sales_order_generate_purchase(
             .collect()
         };
 
-        // "补充式"语义（force=true 路径）：
-        //   1) 拉取 PO 中本销售单已有的明细（严格 source=id），得到 to_consume 池
-        //   2) 对当前销售单的每条明细：
-        //      - PO 中已有同 (product_id, sales_unit) 且 source=本单的项：UPDATE 同步（写回 source=本单）
-        //      - 没有：INSERT 一条（声明 source=本单）
-        //   3) 不删除任何明细、不清理其他销售单的 PO（"补充"而非"重写"）
-        // 这样既能补全用户在 PO 中删除的明细，又不会误伤其他销售单（other_so）贡献的明细。
-        let mut to_consume: Vec<(i64, i64, String, f64, f64)> = if let Some(old_rows) = old_items_by_po.get(&po_id) {
-            old_rows.clone()
-        } else {
-            Vec::new()
-        };
+        // "补充式"语义（force=true 路径），按 sales_order.generated_purchase_item_ids 快照驱动：
+        //   1) 销售单 (P,U) 在快照中（且 id 仍在 PO） → 按主键 UPDATE 同步
+        //   2) 销售单 (P,U) 在快照中（但 id 已从 PO 消失/被删） → 退化为 INSERT 补回
+        //   3) 销售单 (P,U) 不在快照中 → INSERT 新条目（source=本单）
+        //   4) 快照中存在但销售单 (P,U) 不再出现 → 从快照中清掉（PO 中对应行保留，不删）
+        //   5) PO 中 source=本单 但不在新快照的明细：保留不动（兜底防误删）
+        // 这样既保证"用户从 PO 删的明细能补回"（快照覆盖到被删的 id），
+        // 又不会因 (P,U) 严格匹配 source=本单的现存而漏匹配（"3 条全删→3 条全 INSERT" 重复 BUG 根因）。
         let mut updated_lines: i64 = 0;
         let mut added_lines: i64 = 0;
         let mut delta_amount: f64 = 0.0; // UPDATE 同步：金额增量 = 新 - 旧
@@ -6793,35 +6856,62 @@ pub async fn api_sales_order_generate_purchase(
             let amount = quantity * unit_price;
             let base_quantity = quantity;
             let sales_unit = unit.clone();
+            let key = (product_id, sales_unit.trim().to_string());
 
-            // 在 to_consume 中找 (product_id, sales_unit) 匹配的本单已有项
-            if let Some(dup_idx) = to_consume.iter().position(|(_id, pid, sunit, _q, _a)| {
-                *pid == product_id && sunit.trim() == sales_unit.trim()
-            }) {
-                let (_old_id, _old_pid, _old_sunit, _old_qty, old_amount) = to_consume.remove(dup_idx);
-                // 重新生成时同步：数量/订购/备注/仓库/规格；金额按"新-旧"差量计入主表
+            // 1) 快照中找 (P,U) → 尝试按主键 UPDATE
+            let mut updated_via_snapshot = false;
+            if let Some(snap_po_id) = snapshot_by_pu.get(&key).copied() {
+                snapshot_by_pu.remove(&key);
                 let new_amount = quantity * unit_price;
-                let _ = sqlx::query(
-                    "UPDATE purchase_order_item SET quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ?, remark = ?, warehouse_id = ?, warehouse_name = ?, spec = ? WHERE order_id = ? AND id = ?"
+                // 读取旧 amount 以计算差量（保持主表金额正确）
+                let old_amount: f64 = sqlx::query(
+                    "SELECT COALESCE(amount, 0) as amount FROM purchase_order_item WHERE id = ? AND order_id = ?"
                 )
+                .bind(snap_po_id)
+                .bind(po_id)
+                .fetch_optional(crate::db::pool())
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.get::<f64, _>("amount"))
+                .unwrap_or(0.0);
+                let upd_res = sqlx::query(
+                    "UPDATE purchase_order_item SET product_id = ?, product_name = ?, alias1 = ?, alias2 = ?, spec = ?, unit = ?, unit_price = ?, quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ?, remark = ?, warehouse_id = ?, warehouse_name = ?, sales_unit = ? WHERE order_id = ? AND id = ?"
+                )
+                .bind(product_id)
+                .bind(&product_name)
+                .bind(&alias1)
+                .bind(&alias2)
+                .bind(&spec)
+                .bind(&unit)
+                .bind(unit_price)
                 .bind(quantity)
-                .bind(quantity)
+                .bind(base_quantity)
                 .bind(new_amount)
                 .bind(ordered_quantity)
                 .bind(&remark)
                 .bind(main_wh_id)
                 .bind(&main_wh_name)
-                .bind(&spec)
+                .bind(&sales_unit)
                 .bind(po_id)
-                .bind(_old_id)
+                .bind(snap_po_id)
                 .execute(crate::db::pool())
                 .await
                 .ok();
-                delta_amount += new_amount - old_amount;
-                updated_lines += 1;
-            } else {
-                // PO 中本单没有此 (P,U)：INSERT 一条，声明 source=本单 id
-                let _ = sqlx::query(
+                let affected = upd_res.map(|r| r.rows_affected()).unwrap_or(0);
+                if affected > 0 {
+                    // 真正命中 DB 中存在的明细 → UPDATE 成功
+                    new_snapshot_ids.insert(snap_po_id);
+                    updated_via_snapshot = true;
+                    delta_amount += new_amount - old_amount; // 差量计入主表
+                    updated_lines += 1;
+                }
+                // affected == 0 → 快照 id 在 DB 中已被删，退化到下面的 INSERT 分支补回
+            }
+
+            if !updated_via_snapshot {
+                // 2) 快照命中但 id 已被删 或 3) 快照无此 (P,U) → INSERT 一条，声明 source=本单
+                let ins_res = sqlx::query(
                     "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name, sales_unit, source_sales_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 .bind(po_id)
@@ -6844,13 +6934,18 @@ pub async fn api_sales_order_generate_purchase(
                 .execute(crate::db::pool())
                 .await
                 .ok();
+                if let Some(res) = ins_res {
+                    let new_po_id = res.last_insert_rowid();
+                    if new_po_id > 0 {
+                        new_snapshot_ids.insert(new_po_id);
+                    }
+                }
                 delta_amount += amount;
                 added_lines += 1;
             }
         }
-        // 注意：to_consume 剩余的项不删除——它们是用户在 PO 中保留的本单历史明细，
-        // 也可能是被 purchase_order_update 编辑过的项；"补充式"语义下不动它们。
-        let _ = to_consume;
+        // 注意：snapshot_by_pu 中剩余的项（快照有但销售单 (P,U) 不再出现）
+        // → 不写入 new_snapshot_ids（让它们从快照中清掉，PO 中对应行保留，不删）
 
         // 同步更新主表总金额：仅按"补充式"的差量调整（新增/UPDATE 金额变化）
         if delta_amount.abs() > 0.0001 {
@@ -6869,6 +6964,19 @@ pub async fn api_sales_order_generate_purchase(
 
         merged_count += updated_lines + added_lines;
         let _ = existing_items; // 兼容旧变量（CRUD 路径下不再使用）
+    }
+
+    // 把本次 force 实际写入/更新的 PO 明细 id 写回 sales_order 快照列
+    // （只有 force=true 路径填充了 new_snapshot_ids；非 force 走警告返回，不会到这里）
+    if !new_snapshot_ids.is_empty() {
+        let mut ids: Vec<i64> = new_snapshot_ids.into_iter().collect();
+        ids.sort();
+        let json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+        let _ = sqlx::query("UPDATE sales_order SET generated_purchase_item_ids = ? WHERE id = ?")
+            .bind(&json)
+            .bind(id)
+            .execute(crate::db::pool())
+            .await;
     }
 
     // "补充式"语义：不再强制清理/删除其他销售单主导的 PO。

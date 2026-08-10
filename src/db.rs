@@ -710,6 +710,18 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 销售订单"曾生成过的采购订单明细 id 快照"（JSON 数组形式存文本）：
+    // 解决 force=true 重新生成采购订单时，to_consume 池因 source=本单id 严格过滤而漏掉
+    // "用户已删除的明细"和"其他销售单贡献的同 (P,U) 明细"造成的重复插入 BUG。
+    // 每次 force 生成时按快照判定：
+    //   - 快照中 id 仍在 PO 中 → 按主键 UPDATE 同步
+    //   - 快照中 id 已从 PO 消失（被用户删除）→ 补回 INSERT（source=本单）
+    //   - 快照之外的 PO 明细（其他销售单贡献）→ 不动
+    //   - 销售单当前明细不在快照中 → 新出现的明细，INSERT（source=本单）
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN generated_purchase_item_ids TEXT")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN alias1 TEXT")
         .execute(pool)
         .await;
