@@ -1071,12 +1071,14 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                         imageHtml += '<img src="' + p.image_url + '" data-viewer-url="' + p.image_url + '" class="product-thumb" '
                             + 'loading="lazy" decoding="async" '
                             + 'style="width:50px;height:50px;object-fit:cover;cursor:pointer;opacity:0;transition:opacity .25s ease-in;" '
-                            + 'alt="商品图片" onload="this.style.opacity=1">';
+                            + 'alt="商品图片" onload="this.style.opacity=1" '
+                            + 'onerror="this.style.display=\'none\';this.parentElement.innerHTML=\'<span style=\\\'color:#ccc;font-size:12px\\\'>无图</span>\'">';
                     }} else {{
                         // 无 URL(thumbs=0 模式): 渲染空 img 元素,等待 IntersectionObserver 设置 src
                         imageHtml += '<img class="product-thumb" data-viewer-url="" '
                             + 'style="width:50px;height:50px;object-fit:cover;cursor:pointer;opacity:0;transition:opacity .25s ease-in;" '
-                            + 'alt="商品图片" onload="if(this.src)this.style.opacity=1">';
+                            + 'alt="商品图片" onload="if(this.src)this.style.opacity=1" '
+                            + 'onerror="this.style.display=\'none\';this.parentElement.innerHTML=\'<span style=\\\'color:#ccc;font-size:12px\\\'>无图</span>\'">';
                     }}
                     imageHtml += '</div>';
                     let nameDisplay = escapeHtml(p.name);
