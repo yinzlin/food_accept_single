@@ -2694,6 +2694,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 items = [];
                 for (const item of order.items) {{
                     const itemData = {{
+                        id: item.id || null,
                         product_id: item.product_id,
                         product_name: item.product_name,
                         alias1: item.alias1 || '',

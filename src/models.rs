@@ -108,6 +108,8 @@ pub struct PurchaseOrderReq {
 
 #[derive(Deserialize, Serialize)]
 pub struct PurchaseOrderItemReq {
+    /// 明细主键 id：编辑回传时用于按 id 精确同步，保留 source_sales_order_id 归属
+    pub id: Option<i64>,
     pub product_id: i64,
     pub product_name: String,
     pub alias1: Option<String>,
