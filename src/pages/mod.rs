@@ -2052,6 +2052,14 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
             let currentPage = 1;
             let currentKeyword = '';
+            // 超级管理员任何时刻都拥有反审核权限，故其反审核按钮不受订单状态限制
+            let isSuperAdmin = false;
+            fetch('/api/login/check').then(r => r.json()).then(d => {{
+                if (d && d.logged_in) {{
+                    isSuperAdmin = (d.user.role === 'super_admin');
+                }}
+                if (isSuperAdmin) loadOrders();
+            }});
 
             function resetSearch() {{
                 document.getElementById('searchInput').value = '';
@@ -2123,7 +2131,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + orderStatusLabel(order.status) + '</td>' +
                         '<td>' +
                         (order.status === 'pending' ? '<button onclick="event.stopPropagation(); approveOrder(' + order.id + ')" class="btn btn-success btn-sm me-1">审核</button>' : '') +
-                        (order.status === 'confirmed' ? '<button onclick="event.stopPropagation(); unapproveOrder(' + order.id + ')" class="btn btn-warning btn-sm me-1">反审核</button>' : '') +
+                        ((order.status === 'confirmed' || isSuperAdmin) ? '<button onclick="event.stopPropagation(); unapproveOrder(' + order.id + ')" class="btn btn-warning btn-sm me-1">反审核</button>' : '') +
                         '<button onclick="event.stopPropagation(); exportPurchaseOrder(' + order.id + ')" class="btn btn-info btn-sm me-1">导出采购单</button>' +
                         '<button onclick="event.stopPropagation(); deleteOrder(' + order.id + ')" class="btn btn-danger btn-sm">删除</button>' +
                         '</td></tr>';
@@ -3723,6 +3731,14 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
             let currentPage = 1;
             let currentKeyword = '';
+            // 超级管理员任何时刻都拥有反审核权限，故其反审核按钮不受订单状态限制
+            let isSuperAdmin = false;
+            fetch('/api/login/check').then(r => r.json()).then(d => {{
+                if (d && d.logged_in) {{
+                    isSuperAdmin = (d.user.role === 'super_admin');
+                }}
+                if (isSuperAdmin) loadOrders();
+            }});
 
             function resetSearch() {{
                 document.getElementById('searchInput').value = '';
@@ -3806,7 +3822,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     }};
                     const nextInfo = JSON.parse(nextStatusMap[order.status] || '{{"text":"","status":""}}');
                     const nextBtn = nextInfo.text ? '<button onclick="event.stopPropagation(); updateOrderStatus(' + order.id + ', \'' + nextInfo.status + '\')" class="btn btn-primary btn-sm">' + nextInfo.text + '</button> ' : '';
-                    const unapproveBtn = order.status === 'confirmed' ? '<button onclick="event.stopPropagation(); unapproveSalesOrder(' + order.id + ')" class="btn btn-warning btn-sm">反审核</button> ' : '';
+                    const unapproveBtn = (order.status === 'confirmed' || isSuperAdmin) ? '<button onclick="event.stopPropagation(); unapproveSalesOrder(' + order.id + ')" class="btn btn-warning btn-sm">反审核</button> ' : '';
                     const reimburseBtn = order.is_reimburse ? '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-warning btn-sm">导出报销单</button> ' : '';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')"' + selected + '>' +
                         '<td>' + order.id + '</td>' +

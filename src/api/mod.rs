@@ -4036,11 +4036,18 @@ pub async fn api_purchase_order_unapprove(headers: axum::http::HeaderMap, Path(i
     if !crate::auth::can_access_purchase_order(&ctx, order_supplier_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
-    if order_status != "confirmed" {
+    // 超级管理员拥有任何时刻的反审核权限；其他角色仅允许对已审核（confirmed）订单反审核
+    let is_super_admin = ctx.role == "super_admin";
+    if !is_super_admin && order_status != "confirmed" {
         return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅已审核状态的订单允许反审核", order_status));
     }
 
-    let result = sqlx::query("UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'")
+    let update_sql = if is_super_admin {
+        "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ?"
+    } else {
+        "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
+    };
+    let result = sqlx::query(update_sql)
         .bind(id)
         .execute(crate::db::pool())
         .await;
@@ -11350,11 +11357,18 @@ pub async fn api_sales_order_unapprove(headers: axum::http::HeaderMap, Path(id):
     if !crate::auth::can_access_sales_order(&ctx, order_purchaser_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
-    if order_status != "confirmed" {
+    // 超级管理员拥有任何时刻的反审核权限；其他角色仅允许对已审核（confirmed）订单反审核
+    let is_super_admin = ctx.role == "super_admin";
+    if !is_super_admin && order_status != "confirmed" {
         return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅已审核状态的订单允许反审核", order_status));
     }
 
-    let result = sqlx::query("UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'")
+    let update_sql = if is_super_admin {
+        "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ?"
+    } else {
+        "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
+    };
+    let result = sqlx::query(update_sql)
         .bind(id)
         .execute(crate::db::pool())
         .await;
