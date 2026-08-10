@@ -906,7 +906,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 </div>
             </div>
         </div>
-        <div class="modal fade" id="imageViewerModal" tabindex="-1">
+        <div class="modal fade" id="imageViewerModal" tabindex="-1" style="z-index:1060;">
             <div class="modal-dialog modal-lg modal-dialog-centered">
                 <div class="modal-content">
                     <div class="modal-header">
@@ -1362,7 +1362,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 const imagePlaceholder = document.getElementById('imagePlaceholder');
                 const imageActions = document.getElementById('imageActions');
                 if (p.image_url) {{
-                    imagePlaceholder.innerHTML = '<img src="' + p.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;">';
+                    imagePlaceholder.innerHTML = '<img src="' + p.image_url + '" class="product-thumb" data-viewer-url="' + p.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;cursor:pointer;" alt="商品图片">';
                     imagePlaceholder.style.border = 'none';
                     imageActions.style.display = 'block';
                 }} else {{
@@ -1374,7 +1374,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                             const j = await r.json();
                             const item = (j.data || [])[0];
                             if (item && item.image_url) {{
-                                imagePlaceholder.innerHTML = '<img src="' + item.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;">';
+                                imagePlaceholder.innerHTML = '<img src="' + item.image_url + '" class="product-thumb" data-viewer-url="' + item.image_url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;cursor:pointer;" alt="商品图片">';
                                 imagePlaceholder.style.border = 'none';
                                 imageActions.style.display = 'block';
                             }} else {{
@@ -1412,7 +1412,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     if (res.ok && result.url) {{
                         const imagePlaceholder = document.getElementById('imagePlaceholder');
                         const imageActions = document.getElementById('imageActions');
-                        imagePlaceholder.innerHTML = '<img src="' + result.url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;">';
+                        imagePlaceholder.innerHTML = '<img src="' + result.url + '" class="product-thumb" data-viewer-url="' + result.url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;cursor:pointer;" alt="商品图片">';
                         imagePlaceholder.style.border = 'none';
                         imageActions.style.display = 'block';
                         
