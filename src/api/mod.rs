@@ -6503,7 +6503,7 @@ pub async fn api_sales_order_generate_purchase(
 
     // 把"销售单 (P,U) -> PO 明细 id"索引提到外层作用域，
     // supplier_items 循环需要用它做"按主键 UPDATE"判定
-    let mut snapshot_by_pu: std::collections::HashMap<(i64, String), i64> = std::collections::HashMap::new();
+    let mut snapshot_by_pu: std::collections::HashMap<(i64, String, i64), i64> = std::collections::HashMap::new();
 
     if !existed.is_empty() {
         let status_text = |s: &str| match s {
@@ -6664,7 +6664,7 @@ pub async fn api_sales_order_generate_purchase(
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, product_id, COALESCE(NULLIF(TRIM(COALESCE(sales_unit, '')), ''), unit, '') as unit_key
+                "SELECT id, product_id, COALESCE(NULLIF(TRIM(COALESCE(sales_unit, '')), ''), unit, '') as unit_key, warehouse_id
                  FROM purchase_order_item
                  WHERE source_sales_order_id = ? AND id IN ({})",
                 placeholders
@@ -6673,7 +6673,7 @@ pub async fn api_sales_order_generate_purchase(
             for iid in &snapshot_ids {
                 q = q.bind(iid);
             }
-            let snap_rows: Vec<(i64, i64, String)> = q
+            let snap_rows: Vec<(i64, i64, String, i64)> = q
                 .fetch_all(crate::db::pool())
                 .await
                 .unwrap_or_default()
@@ -6682,10 +6682,13 @@ pub async fn api_sales_order_generate_purchase(
                     r.get::<i64, _>("id"),
                     r.get::<i64, _>("product_id"),
                     r.get::<String, _>("unit_key"),
+                    r.get::<i64, _>("warehouse_id"),
                 ))
                 .collect();
-            for (po_id, pid, ukey) in snap_rows {
-                snapshot_by_pu.insert((pid, ukey), po_id);
+            // 索引用 (P, U, warehouse_id) 三元组：相同 (P,U) 在不同 warehouse 的明细
+            // 是不同行，跨仓库复用会破坏"不同仓库出库同商品同时保留"的业务规则。
+            for (po_id, pid, ukey, wh_id) in snap_rows {
+                snapshot_by_pu.insert((pid, ukey, wh_id), po_id);
             }
         }
     }
@@ -6860,10 +6863,10 @@ pub async fn api_sales_order_generate_purchase(
             let amount = quantity * unit_price;
             let base_quantity = quantity;
             let sales_unit = unit.clone();
-            let key = (product_id, sales_unit.trim().to_string());
-
-            // 1) 快照中找 (P,U) → 尝试按主键 UPDATE
+            // 1) 快照中找 (P,U, warehouse) → 尝试按主键 UPDATE
+            // key 加 warehouse_id：跨仓库同 (P,U) 是不同行，必须区分
             let mut updated_via_snapshot = false;
+            let key = (product_id, sales_unit.trim().to_string(), main_wh_id);
             if let Some(snap_po_id) = snapshot_by_pu.get(&key).copied() {
                 snapshot_by_pu.remove(&key);
                 let new_amount = quantity * unit_price;
@@ -6915,23 +6918,30 @@ pub async fn api_sales_order_generate_purchase(
 
             if !updated_via_snapshot {
                 // 2) 快照命中但 id 已被删 或 3) 快照无此 (P,U) →
-                //    先在 PO 中找同 (P,U) 的"孤儿"（任意 source；通常 source=主表兜底），
+                //    先在 PO 中找同 (P,U,**warehouse**) 的"孤儿"（任意 source；通常 source=主表兜底），
                 //    有就 UPDATE 复用并把 source 改成本销售单；没有才 INSERT。
                 // 这是修复"老代码 INSERT fallback 留下 source=主表兜底孤儿"的二次重复 BUG 的关键。
+                //
+                // 关键：匹配键必须包含 warehouse_id！否则"不同仓库出库同 (P,U) 商品"场景下，
+                // SO Y force 生成时会错误地 UPDATE SO X 留下的 wh=X 的孤儿，把 SO Y 的
+                // 明细（数量/仓库等）覆盖到 SO X 的行上，导致不同仓库的明细被吞并成最后一条。
+                // 业务上要求"不同仓库出库的相同商品在同一个 PO 中要同时保留"，
+                // 所以仓库是行级区分维度，不能跨仓库复用。
                 let new_amount = quantity * unit_price;
-                // 孤儿匹配：同 (P,U) 任意 source；优先选 source=本单的（极端兜底），
-                // 否则选 source=主表兜底的（最常见的老代码遗留），最后任意。
-                // 为简化逻辑，按 id 最小的（最早插入的）复用。
+                // 孤儿匹配：同 (P,U,warehouse_id) 任意 source；优先选 source=本单的（极端兜底），
+                // 否则按 id 最小的（最早插入的）复用。
                 let orphan_id: Option<i64> = sqlx::query(
                     "SELECT id FROM purchase_order_item
                      WHERE order_id = ? AND product_id = ?
                        AND COALESCE(NULLIF(TRIM(COALESCE(sales_unit, '')), ''), unit, '') = ?
+                       AND warehouse_id = ?
                      ORDER BY (CASE WHEN source_sales_order_id = ? THEN 0 ELSE 1 END), id
                      LIMIT 1"
                 )
                 .bind(po_id)
                 .bind(product_id)
                 .bind(sales_unit.trim())
+                .bind(main_wh_id)
                 .bind(id)
                 .fetch_optional(crate::db::pool())
                 .await
