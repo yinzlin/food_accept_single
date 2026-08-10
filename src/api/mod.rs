@@ -6522,7 +6522,7 @@ pub async fn api_sales_order_generate_purchase(
         if !processed.is_empty() {
             let detail = processed.iter()
                 .map(|x| format!("{}（{}，状态：{}）", x.1, x.3, status_text(&x.2)))
-                .collect::<Vec<_>>().join("、");
+                .collect::<Vec<_>>().join("\n");
             return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -6536,7 +6536,7 @@ pub async fn api_sales_order_generate_purchase(
         if !force {
             let detail = pending.iter()
                 .map(|x| format!("{}（{}）", x.1, x.3))
-                .collect::<Vec<_>>().join("、");
+                .collect::<Vec<_>>().join("\n");
             return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
