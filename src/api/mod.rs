@@ -1436,7 +1436,11 @@ pub async fn api_purchaser_list(axum::extract::Query(params): axum::extract::Que
     (StatusCode::OK, serde_json::to_string(&purchasers).unwrap())
 }
 
-pub async fn api_purchaser_create(Json(req): Json<PurchaserReq>) -> impl IntoResponse {
+pub async fn api_purchaser_create(headers: axum::http::HeaderMap, Json(req): Json<PurchaserReq>) -> impl IntoResponse {
+    match crate::auth::check_api_permission(&headers, "/api/purchaser/create").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
     let result = sqlx::query(
         "INSERT INTO purchaser(name, contact, phone, address, business_scope, remark, category_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
@@ -1451,8 +1455,8 @@ pub async fn api_purchaser_create(Json(req): Json<PurchaserReq>) -> impl IntoRes
     .await;
     
     match result {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(_) => (StatusCode::OK, "创建成功".to_string()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "创建失败".to_string()),
     }
 }
 

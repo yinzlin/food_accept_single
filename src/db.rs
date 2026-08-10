@@ -948,22 +948,6 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     sqlx::query("INSERT OR IGNORE INTO category(id, name, parent_id, entity_type) VALUES (16, '耗材类', NULL, 'product')")
         .execute(pool).await?;
 
-    sqlx::query(
-        "INSERT OR IGNORE INTO supplier(name, contact, phone, address, category_id) VALUES ('湖南食全味美餐饮管理有限公司', '张经理', '13800138000', '湖南省长沙市', 1)",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO purchaser(name, contact, phone, address) VALUES ('胜利派出所', '李所长', '13900139000', '巡警城区')",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO purchaser(name, contact, phone, address) VALUES ('城东派出所', '王所长', '13700137000', '城东新区')",
-    )
-    .execute(pool)
-    .await?;
-
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_purchaser_id ON sales_order(purchaser_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_order_no ON sales_order(order_no)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sales_order_order_date ON sales_order(order_date)").execute(pool).await;

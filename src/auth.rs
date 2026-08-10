@@ -67,24 +67,24 @@ pub fn has_permission(role: &str, required_role: &str) -> bool {
 /// 判断某角色是否拥有指定权限点
 pub fn has_permission_point(role: &str, permission: &str) -> bool {
     // 全部业务权限点（供 super_admin 全量拥有）
-    const ALL_PERMS: [&str; 20] = [
+    // supplier/purchaser 为基础资料管理权限点：供应商/采购方角色及以上可维护各自基础资料
+    const ALL_PERMS: [&str; 22] = [
         "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.unapprove", "purchase_order.cancel", "purchase_order.delete",
         "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.unapprove", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
         "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
+        "supplier", "purchaser",
     ];
 
     let role_perms: HashSet<&str> = match role {
         "super_admin" => HashSet::from(ALL_PERMS),
-        "admin" => HashSet::from([
-            "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.unapprove", "purchase_order.cancel", "purchase_order.delete",
-            "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.unapprove", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
-            "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
-        ]),
+        "admin" => HashSet::from(ALL_PERMS),
         "supplier" => HashSet::from([
+            "supplier",
             "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.cancel",
             "sales_order.view", "query.view",
         ]),
         "purchaser" => HashSet::from([
+            "purchaser",
             "purchase_order.view",
             "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel",
             "query.view",
