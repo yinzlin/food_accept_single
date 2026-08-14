@@ -124,6 +124,9 @@ pub fn sidebar_html() -> String {
                         <li class="tree-node leaf" data-path="/supplement" data-role="admin">
                             <a href="/supplement"><span class="node-icon">🔄</span><span class="node-label">耗材分摊管理</span></a>
                         </li>
+                        <li class="tree-node leaf" data-path="/mobile/today_price" data-role="super_admin">
+                            <a href="/mobile/today_price"><span class="node-icon">💰</span><span class="node-label">今日进价采集</span></a>
+                        </li>
                     </ul>
                 </li>
                 <li class="tree-node folder" data-path="query" data-role="query">

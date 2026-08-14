@@ -7,6 +7,24 @@ pub async fn page_index(headers: axum::http::HeaderMap) -> Html<String> {
         Err(e) => return e,
         Ok(_) => {}
     }
+    // 今日进价采集仅超级管理员可见
+    let user_ctx = crate::auth::get_user_ctx(&headers).await;
+    let is_super_admin = user_ctx.role == "super_admin";
+    
+    let today_price_card = if is_super_admin {
+        r#"            <div class="col">
+                <div class="card" style="background-color: #f97316; color: white;">
+                    <div class="card-body">
+                        <h5 class="card-title">今日进价采集</h5>
+                        <p class="card-text">按供应商采集录入今日进价</p>
+                        <a href="/mobile/today_price" class="btn btn-light">进入</a>
+                    </div>
+                </div>
+            </div>
+"#.to_string()
+    } else {
+        String::new()
+    };
     
     let content = format!(r#"
         <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-4">
@@ -109,6 +127,7 @@ pub async fn page_index(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                 </div>
             </div>
+            {today_price_card}
         </div>
     "#);
     
@@ -7857,6 +7876,7 @@ pub async fn page_mobile_sort() -> Html<String> {
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_by_category" class="switch-link">按分类分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
+            <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -8091,6 +8111,11 @@ pub async fn page_mobile_sort() -> Html<String> {
             window.location.href = url;
         }
 
+        // 默认加载当天数据
+        {
+            const d0 = new Date();
+            document.getElementById('historyDate').value = d0.getFullYear() + '-' + String(d0.getMonth()+1).padStart(2,'0') + '-' + String(d0.getDate()).padStart(2,'0');
+        }
         loadItems();
     </script>
 </body>
@@ -8169,6 +8194,7 @@ pub async fn page_mobile_sort_by_purchaser() -> Html<String> {
             <a href="/mobile/sort" class="switch-link">统筹分拣</a>
             <a href="/mobile/sort_by_category" class="switch-link">按分类分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
+            <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -8432,6 +8458,11 @@ pub async fn page_mobile_sort_by_purchaser() -> Html<String> {
             window.location.href = url;
         }
 
+        // 默认加载当天数据
+        {
+            const d0 = new Date();
+            document.getElementById('historyDate').value = d0.getFullYear() + '-' + String(d0.getMonth()+1).padStart(2,'0') + '-' + String(d0.getDate()).padStart(2,'0');
+        }
         loadItems();
     </script>
 </body>
@@ -8524,6 +8555,7 @@ pub async fn page_mobile_sort_by_category() -> Html<String> {
             <a href="/mobile/sort" class="switch-link">统筹分拣</a>
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
+            <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -8838,6 +8870,11 @@ pub async fn page_mobile_sort_by_category() -> Html<String> {
             window.location.href = url;
         }
 
+        // 默认加载当天数据
+        {
+            const d0 = new Date();
+            document.getElementById('historyDate').value = d0.getFullYear() + '-' + String(d0.getMonth()+1).padStart(2,'0') + '-' + String(d0.getDate()).padStart(2,'0');
+        }
         loadItems();
     </script>
 </body>
@@ -8926,6 +8963,7 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             <a href="/mobile/sort_by_supplier" class="switch-link">按供应商分拣</a>
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
+            <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -9233,6 +9271,311 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             window.location.href = url;
         }
 
+        // 默认加载当天数据
+        {
+            const d0 = new Date();
+            document.getElementById('historyDate').value = d0.getFullYear() + '-' + String(d0.getMonth()+1).padStart(2,'0') + '-' + String(d0.getDate()).padStart(2,'0');
+        }
+        loadItems();
+    </script>
+</body>
+</html>
+    "#.to_string())
+}
+
+pub async fn page_mobile_today_price(headers: axum::http::HeaderMap) -> Html<String> {
+    // 今日进价采集仅超级管理员可用
+    let user_ctx = crate::auth::get_user_ctx(&headers).await;
+    if user_ctx.role != "super_admin" {
+        let content = r#"<div class="container mt-5"><div class="alert alert-danger text-center" style="font-size:1.5rem;">您没有权限访问此页面</div></div>"#;
+        return Html(crate::layout_html("无权限", "/mobile/today_price", content));
+    }
+    Html(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>今日进价采集</title>
+    <link rel="stylesheet" href="/static/bootstrap.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background: #f5f7fa; }
+        .sticky-header { position: sticky; top: 0; z-index: 100; }
+        .page-header { background: linear-gradient(135deg, #f97316 0%, #fb923c 100%); color: white; padding: 16px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .page-header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+        .header-info { font-size: 13px; opacity: 0.9; margin-top: 4px; }
+        .switch-links { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+        .switch-link { padding: 6px 12px; background: rgba(255,255,255,0.2); border-radius: 6px; font-size: 13px; text-decoration: none; color: white; }
+        .switch-link:hover { background: rgba(255,255,255,0.3); }
+        .stats-bar { display: flex; gap: 12px; margin-top: 12px; }
+        .stat-item { background: rgba(255,255,255,0.2); padding: 8px 12px; border-radius: 8px; flex: 1; text-align: center; }
+        .stat-value { font-size: 16px; font-weight: bold; }
+        .stat-label { font-size: 11px; opacity: 0.8; }
+        .content-area { padding: 12px; padding-bottom: 80px; }
+        .category-section { border-radius: 12px; margin-bottom: 16px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .category-header { padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; }
+        .category-header h3 { font-size: 16px; margin: 0; color: white; font-weight: 600; }
+        .category-stats { font-size: 13px; opacity: 0.9; color: white; }
+        .category-body { background: white; padding: 0; }
+        .cat-supplier { background: linear-gradient(135deg, #f97316 0%, #fb923c 100%); }
+        .price-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #f0f0f0; }
+        .price-card:last-child { border-bottom: none; }
+        .item-info { flex: 1; min-width: 0; }
+        .item-name { font-size: 15px; font-weight: 600; color: #333; margin-bottom: 3px; }
+        .item-detail { font-size: 12px; color: #666; display: flex; gap: 8px; flex-wrap: wrap; }
+        .item-detail span { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; }
+        .price-badge { flex-shrink: 0; text-align: right; }
+        .price-input { width: 84px; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 15px; text-align: center; }
+        .price-input:focus { outline: none; border-color: #f97316; }
+        .price-label { font-size: 11px; color: #666; margin-bottom: 2px; }
+        .filter-bar { background: white; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .filter-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .filter-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-size: 14px; }
+        .filter-bar button.clear { background: #f3f4f6; color: #666; }
+        .history-bar { background: #fff7ed; padding: 12px; border-bottom: 1px solid #eee; display: flex; gap: 8px; }
+        .history-bar input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+        .history-bar button { padding: 10px 16px; border: none; border-radius: 8px; background: #f97316; color: white; font-size: 14px; white-space: nowrap; }
+        .history-bar button.clear { background: #f3f4f6; color: #666; }
+        .bottom-bar { background: white; padding: 6px 12px; position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 6px; box-shadow: 0 -2px 8px rgba(0,0,0,0.05); }
+        .bottom-bar button { flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; }
+        .btn-save { background: #f97316; color: white; }
+        .btn-export { background: #10b981; color: white; }
+        .btn-export-plain { background: #3b82f6; color: white; }
+        .empty-state { text-align: center; padding: 60px 20px; color: #999; }
+        .empty-icon { font-size: 48px; margin-bottom: 16px; }
+        .saved-tag { background: #dcfce7; color: #16a34a; padding: 2px 5px; border-radius: 3px; font-size: 11px; }
+    </style>
+</head>
+<body>
+    <div class="sticky-header">
+    <div class="page-header">
+        <h1>💰 今日进价采集</h1>
+        <div class="header-info">按供应商汇总当天商品，采集并录入今日进价（最近价）</div>
+        <div class="switch-links">
+            <a href="/mobile/sort" class="switch-link">统筹分拣</a>
+            <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
+            <a href="/mobile/sort_by_category" class="switch-link">按分类分拣</a>
+            <a href="/mobile/sort_by_supplier" class="switch-link">按供应商分拣</a>
+            <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
+        </div>
+        <div class="stats-bar">
+            <div class="stat-item">
+                <div class="stat-value" id="totalCount">0</div>
+                <div class="stat-label">商品种类</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="supplierCount">0</div>
+                <div class="stat-label">供应商数</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="savedCount">0</div>
+                <div class="stat-label">已录入</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="history-bar">
+        <input type="date" id="historyDate" title="选择日期检索该日期的历史销售订单，留空显示当前待分拣">
+        <button onclick="loadItems()">检索</button>
+        <button class="clear" onclick="clearHistory()">清除</button>
+    </div>
+    
+    <div class="filter-bar">
+        <input type="text" id="searchInput" placeholder="搜索商品名称..." oninput="filterItems()">
+        <button class="clear" onclick="clearSearch()">清除</button>
+    </div>
+    </div>
+    
+    <div class="content-area" id="itemsContainer">
+        <div class="empty-state">
+            <div class="empty-icon">📭</div>
+            <div>暂无采购订单</div>
+        </div>
+    </div>
+    
+    <div class="bottom-bar">
+        <button class="btn-save" onclick="savePrices()">保存今日价</button>
+        <button class="btn-export" onclick="exportExcel(true)">导出XLSX</button>
+        <button class="btn-export-plain" onclick="exportExcel(false)">导出(手写价)</button>
+        <button class="btn-export" onclick="exportExcelByCategory(true)">导出(按分类)</button>
+    </div>
+
+    <script>
+        let suppliers = [];
+        // 今日价录入值：product_id -> price（字符串保留用户输入）
+        let todayPrices = {};
+
+        async function loadItems() {
+            try {
+                const date = document.getElementById('historyDate').value;
+                let url = '/api/product/today_price_items';
+                if (date) url += '?date=' + encodeURIComponent(date);
+                const res = await fetch(url);
+                suppliers = await res.json();
+                renderItems();
+                updateStats();
+            } catch (e) {
+                console.error('加载失败:', e);
+            }
+        }
+
+        function clearHistory() {
+            document.getElementById('historyDate').value = '';
+            loadItems();
+        }
+
+        function updatePriceInput(productId, value) {
+            const num = parseFloat(value);
+            if (!isNaN(num) && num > 0) {
+                todayPrices[productId] = num;
+            } else {
+                delete todayPrices[productId];
+            }
+            updateStats();
+        }
+
+        function updateStats() {
+            let totalCount = 0;
+            suppliers.forEach(supplier => {
+                totalCount += (supplier.items ? supplier.items.length : 0);
+            });
+            document.getElementById('totalCount').textContent = totalCount;
+            document.getElementById('supplierCount').textContent = suppliers.length;
+            document.getElementById('savedCount').textContent = Object.keys(todayPrices).length;
+        }
+
+        function filterItems() {
+            renderItems();
+        }
+
+        function clearSearch() {
+            document.getElementById('searchInput').value = '';
+            renderItems();
+        }
+
+        function renderItems() {
+            const container = document.getElementById('itemsContainer');
+            const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
+            
+            let hasItems = false;
+            let html = '';
+            
+            suppliers.forEach(supplier => {
+                let filteredItems = [];
+                if (supplier.items) {
+                    filteredItems = supplier.items.filter(item =>
+                        item.product_name.toLowerCase().includes(keyword) ||
+                        (item.spec || '').toLowerCase().includes(keyword)
+                    );
+                }
+                if (filteredItems.length === 0) return;
+                hasItems = true;
+                
+                html += '<div class="category-section">';
+                html += '<div class="category-header cat-supplier">';
+                html += '<h3>🏭 ' + supplier.supplier_name + '</h3>';
+                html += '<div class="category-stats">共 ' + supplier.items.length + ' 种</div>';
+                html += '</div>';
+                html += '<div class="category-body">';
+                
+                filteredItems.forEach(item => {
+                    const pid = item.product_id;
+                    const hasInput = todayPrices[pid] !== undefined;
+                    const inputValue = hasInput ? todayPrices[pid] : '';
+                    html += '<div class="price-card">';
+                    html += '<div class="item-info">';
+                    html += '<div class="item-name">' + item.product_name + (item.spec ? ' ' + item.spec : '') + '</div>';
+                    html += '<div class="item-detail">';
+                    html += '<span>基本单位: ' + item.base_unit + '</span>';
+                    html += '<span>合计: ' + item.total_qty + ' ' + item.base_unit + '</span>';
+                    html += '</div>';
+                    html += '<div class="item-detail" style="margin-top:4px;">';
+                    html += '<span style="color:#16a34a;">最高 ' + formatPrice(item.max_purchase_price) + '</span>';
+                    html += '<span style="color:#dc2626;">最低 ' + formatPrice(item.min_purchase_price) + '</span>';
+                    html += '<span style="color:#d97706;">最近 ' + formatPrice(item.purchase_price) + '</span>';
+                    if (hasInput) {
+                        html += '<span class="saved-tag">已录入</span>';
+                    }
+                    html += '</div>';
+                    html += '</div>';
+                    html += '<div class="price-badge">';
+                    html += '<div class="price-label">今日价</div>';
+                    html += '<input type="number" min="0" step="any" class="price-input" placeholder="' + (item.purchase_price > 0 ? Number(item.purchase_price).toFixed(2) : '') + '" value="' + inputValue + '" oninput="updatePriceInput(' + pid + ', this.value)" onclick="event.stopPropagation()">';
+                    html += '</div>';
+                    html += '</div>';
+                });
+                
+                html += '</div></div>';
+            });
+            
+            if (!hasItems) {
+                container.innerHTML = '<div class="empty-state"><div class="empty-icon">🔍</div><div>没有找到匹配的商品</div></div>';
+                return;
+            }
+            
+            container.innerHTML = html;
+        }
+
+        function formatPrice(v) {
+            if (!v || v <= 0) return '-';
+            return Number(v).toFixed(2);
+        }
+
+        async function savePrices() {
+            const keys = Object.keys(todayPrices);
+            if (keys.length === 0) {
+                alert('请先录入今日价');
+                return;
+            }
+            const items = keys.map(pid => ({ product_id: parseInt(pid), price: todayPrices[pid] }));
+            try {
+                const res = await fetch('/api/product/today_price_save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items })
+                });
+                const text = await res.text();
+                // 后端可能返回 JSON（{message,...}）或纯文本，统一提取 message 展示
+                let msg = text;
+                try {
+                    const j = JSON.parse(text);
+                    if (j && j.message) msg = j.message;
+                } catch (e) { /* 纯文本直接展示 */ }
+                alert(msg);
+                todayPrices = {};
+                loadItems();
+            } catch (e) {
+                console.error('保存失败:', e);
+                alert('保存失败，请重试');
+            }
+        }
+
+        function exportExcel(withValues) {
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/product/today_price_excel';
+            let params = [];
+            if (date) params.push('date=' + encodeURIComponent(date));
+            if (withValues) params.push('print_values=1');
+            if (params.length) url += '?' + params.join('&');
+            window.location.href = url;
+        }
+
+        function exportExcelByCategory(withValues) {
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/product/today_price_excel_by_category';
+            let params = [];
+            if (date) params.push('date=' + encodeURIComponent(date));
+            if (withValues) params.push('print_values=1');
+            if (params.length) url += '?' + params.join('&');
+            window.location.href = url;
+        }
+
+        // 默认加载当天数据
+        {
+            const d0 = new Date();
+            document.getElementById('historyDate').value = d0.getFullYear() + '-' + String(d0.getMonth()+1).padStart(2,'0') + '-' + String(d0.getDate()).padStart(2,'0');
+        }
         loadItems();
     </script>
 </body>
@@ -9321,6 +9664,7 @@ pub async fn page_mobile_sort_comprehensive() -> Html<String> {
             <a href="/mobile/sort" class="switch-link">统筹分拣</a>
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_by_category" class="switch-link">按分类分拣</a>
+            <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -9651,6 +9995,11 @@ pub async fn page_mobile_sort_comprehensive() -> Html<String> {
             window.location.href = url;
         }
 
+        // 默认加载当天数据
+        {
+            const d0 = new Date();
+            document.getElementById('historyDate').value = d0.getFullYear() + '-' + String(d0.getMonth()+1).padStart(2,'0') + '-' + String(d0.getDate()).padStart(2,'0');
+        }
         loadItems();
     </script>
 </body>
