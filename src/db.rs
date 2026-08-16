@@ -85,6 +85,20 @@ pub async fn init_pool() {
         .min_connections(4)
         .idle_timeout(std::time::Duration::from_secs(300))
         .max_lifetime(std::time::Duration::from_secs(3600))
+        .after_connect(|conn, _meta| Box::pin(async move {
+            // 连接级 PRAGMA：每次新连接拉出时都重新设置，
+            // 避免 sqlx 连接池复用/重建时 busy_timeout 被重置回默认
+            use sqlx::Executor;
+            let _ = conn.execute("PRAGMA busy_timeout = 5000").await;
+            let _ = conn.execute("PRAGMA journal_mode = DELETE").await;
+            let _ = conn.execute("PRAGMA synchronous = NORMAL").await;
+            let _ = conn.execute("PRAGMA temp_store = MEMORY").await;
+            let _ = conn.execute("PRAGMA cache_size = -20000").await;
+            let _ = conn.execute("PRAGMA locking_mode = NORMAL").await;
+            let _ = conn.execute("PRAGMA auto_vacuum = INCREMENTAL").await;
+            let _ = conn.execute("PRAGMA page_size = 4096").await;
+            Ok(())
+        }))
         .connect_with(
             SqliteConnectOptions::new()
                 .filename("food_accept_v3.db")
@@ -93,7 +107,9 @@ pub async fn init_pool() {
                 .pragma("cache_size", "-20000")
                 .pragma("synchronous", "NORMAL")
                 .pragma("temp_store", "MEMORY")
-                .pragma("journal_mode", "DELETE"),
+                .pragma("journal_mode", "DELETE")
+                // busy_timeout 在 after_connect 中设置，避免被 connect_with pragma 列表冲掉
+                .pragma("busy_timeout", "5000"),
         )
         .await
         .expect("数据库连接失败");
@@ -105,6 +121,9 @@ pub async fn init_pool() {
     let _ = sqlx::query("PRAGMA locking_mode = NORMAL").execute(&pool).await;
     let _ = sqlx::query("PRAGMA auto_vacuum = INCREMENTAL").execute(&pool).await;
     let _ = sqlx::query("PRAGMA page_size = 4096").execute(&pool).await;
+    // 写并发：让 BEGIN IMMEDIATE 拿不到写锁时自动等待 5s 再报错（默认是立即 SQLITE_BUSY），
+    // 配合 order update 中使用 BEGIN IMMEDIATE 事务，可消除连点保存时的并发丢明细问题。
+    let _ = sqlx::query("PRAGMA busy_timeout = 5000").execute(&pool).await;
     
     // 使用 integrity_check 检测数据库损坏
     let integrity_check: String = sqlx::query_scalar("PRAGMA integrity_check")

@@ -2077,7 +2077,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                 </div>
 
-                <button onclick="saveOrder()" class="btn btn-success mt-3">保存采购订单</button>
+                <button onclick="saveOrder()" class="btn btn-success mt-3" id="savePurchaseBtn">保存采购订单</button>
                 <button onclick="resetForm()" class="btn btn-secondary mt-3 ml-2">新建订单</button>
             </div>
         </div>
@@ -2889,14 +2889,34 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             async function saveOrder() {{
+                // 最顶部拦截：保存中直接 return，杜绝两次保存并发打到后端
+                const saveBtn = document.getElementById('savePurchaseBtn') || document.getElementById('saveBtn');
+                if (currentOrderId && saveBtn && saveBtn.dataset.saving === '1') {{
+                    return;
+                }}
+                if (saveBtn) {{
+                    saveBtn.dataset.saving = '1';
+                    saveBtn.disabled = true;
+                    saveBtn.textContent = '保存中…';
+                }}
+                // 任何分支退出都要恢复按钮状态（成功、失败、异常、提前 return 都覆盖）
+                const restorePurchaseBtn = () => {{
+                    if (saveBtn) {{
+                        saveBtn.disabled = false;
+                        saveBtn.dataset.saving = '';
+                        saveBtn.textContent = currentOrderId ? '保存修改' : '保存采购订单';
+                    }}
+                }};
                 const supplierId = document.getElementById('supplierId').value;
                 if (!supplierId) {{
                     alert('请选择供应商');
+                    restorePurchaseBtn();
                     return;
                 }}
                 const validItems = items.filter(item => item.product_id > 0 && item.product_name.trim() !== '');
                 if (validItems.length === 0) {{
                     alert('请添加商品明细');
+                    restorePurchaseBtn();
                     return;
                 }}
                 const data = {{
@@ -2916,16 +2936,24 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     version: currentVersion
                 }};
                 const url = currentOrderId ? '/api/purchase_order/update' : '/api/purchase_order/create';
-                const res = await fetch(url, {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify(data)
-                }});
-                if (res.ok) {{
-                    location.reload();
-                }} else {{
-                    const text = await res.text();
-                    alert(text || '保存失败');
+                try {{
+                    const res = await fetch(url, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify(data)
+                    }});
+                    if (res.ok) {{
+                        // 先恢复按钮状态再刷新，避免 location.reload 被浏览器/扩展拦截时按钮永久卡在「保存中…」
+                        restorePurchaseBtn();
+                        location.reload();
+                    }} else {{
+                        const text = await res.text();
+                        alert(text || '保存失败');
+                        restorePurchaseBtn();
+                    }}
+                }} catch (e) {{
+                    alert('网络错误：' + e);
+                    restorePurchaseBtn();
                 }}
             }}
 
@@ -3883,14 +3911,35 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             async function saveOrder() {{
+                // 最顶部拦截：保存中直接 return，杜绝两次保存并发打到后端
+                const isNew = !currentOrderId;
+                const saveBtn = document.getElementById('saveBtn');
+                if (!isNew && saveBtn && saveBtn.dataset.saving === '1') {{
+                    return;
+                }}
+                if (saveBtn) {{
+                    saveBtn.dataset.saving = '1';
+                    saveBtn.disabled = true;
+                    saveBtn.textContent = '保存中…';
+                }}
+                // 任何分支退出都要恢复按钮状态
+                const restoreBtn = () => {{
+                    if (saveBtn) {{
+                        saveBtn.disabled = false;
+                        saveBtn.dataset.saving = '';
+                        saveBtn.textContent = isNew ? '保存销售订单' : '保存修改';
+                    }}
+                }};
                 const purchaserId = document.getElementById('purchaserId').value;
                 if (!purchaserId) {{
                     alert('请选择采购单位');
+                    restoreBtn();
                     return;
                 }}
                 const validItems = items.filter(item => item.product_id > 0 && item.product_name.trim() !== '');
                 if (validItems.length === 0) {{
                     alert('请添加商品明细');
+                    restoreBtn();
                     return;
                 }}
                 const data = {{
@@ -3908,24 +3957,31 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     remark: document.getElementById('remarkInput').value || null,
                     version: currentVersion
                 }};
-                const isNew = !currentOrderId;
                 const url = isNew ? '/api/sales_order/create' : '/api/sales_order/update';
-                const res = await fetch(url, {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify(data)
-                }});
-                if (res.ok) {{
-                    if (isNew) {{
-                        resetForm();
-                        alert('订单创建成功');
+                try {{
+                    const res = await fetch(url, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify(data)
+                    }});
+                    if (res.ok) {{
+                        if (isNew) {{
+                            resetForm();
+                            restoreBtn();
+                            alert('订单创建成功');
+                        }} else {{
+                            restoreBtn();
+                            await loadOrderDetail(currentOrderId);
+                            alert('订单保存成功');
+                        }}
                     }} else {{
-                        await loadOrderDetail(currentOrderId);
-                        alert('订单保存成功');
+                        const errText = await res.text();
+                        alert('保存失败: ' + (errText || res.statusText));
+                        restoreBtn();
                     }}
-                }} else {{
-                    const errText = await res.text();
-                    alert('保存失败: ' + (errText || res.statusText));
+                }} catch (e) {{
+                    alert('网络错误：' + e);
+                    restoreBtn();
                 }}
             }}
 

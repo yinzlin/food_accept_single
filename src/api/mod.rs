@@ -3925,6 +3925,7 @@ pub async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id):
 /// 采购单明细单条 INSERT（更新流程中新增明细/兜底插入共用）：
 /// source_sales_order_id 用主表 source 兜底，保证新增明细归属到生成它的销售单。
 async fn insert_purchase_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     order_id: i64,
     item: &crate::models::PurchaseOrderItemReq,
     fallback_source: Option<i64>,
@@ -3949,7 +3950,7 @@ async fn insert_purchase_item(
     .bind(&item.warehouse_name.clone().unwrap_or_default())
     .bind(&item.unit.clone().unwrap_or_default())
     .bind(fallback_source)
-    .execute(crate::db::pool())
+    .execute(&mut **tx)
     .await
     .ok();
 }
@@ -3961,8 +3962,8 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     }
     let ctx = crate::auth::get_user_ctx(&headers).await;
 
-    // 状态约束 + 行级数据权限 + 乐观锁：先查订单当前状态、版本与所属供应商
-    let order = sqlx::query("SELECT supplier_id, status, version, order_no, total_amount, final_amount FROM purchase_order WHERE id = ?")
+    // 行级数据权限：先查订单所属供应商
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
         .bind(req.id)
         .fetch_optional(crate::db::pool())
         .await
@@ -3974,10 +3975,6 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     };
     let order_supplier_id: i64 = order.get("supplier_id");
     let order_status: String = order.get("status");
-    let db_version: i64 = order.get("version");
-    let old_order_no: String = order.get("order_no");
-    let old_total: f64 = order.get("total_amount");
-    let old_final: f64 = order.get("final_amount");
     if !crate::auth::can_access_purchase_order(&ctx, order_supplier_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
@@ -3985,11 +3982,15 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     if order_status != "pending" {
         return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许修改；已审核订单需管理员反审核后才能修改", order_status));
     }
-    // 乐观锁：客户端携带的版本号必须与数据库当前版本一致，防止并发覆盖
-    if let Some(ver) = req.version {
-        if ver != db_version {
-            return (StatusCode::CONFLICT, format!("订单已被其他用户修改（版本 {} → {}），请刷新后重试", ver, db_version));
-        }
+    // 强制乐观锁：req.version 必须传入且 > 0。
+    // 前端一定传 version（从 loadOrderDetail 取得），如果缺失说明调用方不是前端合法路径，直接拒绝。
+    let ver = match req.version {
+        Some(v) if v > 0 => v,
+        _ => return (StatusCode::BAD_REQUEST, "保存失败：缺少订单版本号，请刷新页面后重试".to_string()),
+    };
+    // 安全护栏：更新时明细不允许为空（防止并发覆盖导致明细被清空）
+    if req.items.is_empty() {
+        return (StatusCode::BAD_REQUEST, "保存失败：订单明细不能为空".to_string());
     }
 
     // 主表仓库按明细汇总（与创建逻辑一致）
@@ -4004,7 +4005,18 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     let main_wh_id = if wh_id_set.len() == 1 { *wh_id_set.iter().next().unwrap() } else { 0 };
     let main_wh_name = wh_names.join("、");
 
-    let result = sqlx::query(
+    // 用 BEGIN IMMEDIATE 启动写事务，立即获得 SQLite 写锁（RESERVED）。
+    // 作用：把"主表 UPDATE + 明细同步"整体串行化，
+    // 杜绝连点两次保存时两个事务都读到同一 version、都通过乐观锁、都把主表 version 自增、
+    // 然后后提交的事务用全量 items 把先提交的事务的明细覆盖/丢失。
+    let mut tx = match crate::db::pool().begin_with("BEGIN IMMEDIATE").await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "更新失败：事务启动失败".to_string()),
+    };
+
+    // 事务内做"主表 UPDATE + version 自增"：WHERE 同时校验 id 和 version。
+    // 如果行不存在或 version 已被他人递增，rows_affected = 0 → 回滚事务 + 返回 409。
+    let upd = sqlx::query(
         "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
     .bind(req.supplier_id)
@@ -4020,111 +4032,111 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
     .bind(req.id)
-    .bind(db_version)
-    .execute(crate::db::pool())
+    .bind(ver)
+    .execute(&mut *tx)
     .await;
-    
-    match result {
-        Ok(res) if res.rows_affected() == 0 => {
-            // 版本已被他人递增（极端并发），拒绝写入
-            (StatusCode::CONFLICT, format!("订单已被其他用户修改，请刷新后重试（版本 {}", db_version))
+
+    let upd_res = match upd {
+        Ok(r) => r,
+        Err(e) => {
+            // 出现异常，让事务 drop 时自动回滚
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e));
         }
-        Ok(_) => {
-            // 按 id 精确同步明细（保留每条明细的 source_sales_order_id 归属）：
-            // 1) 读取数据库现有明细（含 id 与 source），构建 id 索引
-            // 2) 请求 items 中带 id 的 → 按 id UPDATE（source 保持不变）
-            // 3) 请求 items 中无 id 的 → INSERT（用主表 source 兜底归属）
-            // 4) 数据库中有、请求中没有的 → DELETE
-            // 这样避免整单重写导致同 (product_id, unit) 多条明细的来源归属错乱。
-            let po_main_source: Option<i64> = sqlx::query("SELECT source_sales_order_id FROM purchase_order WHERE id = ?")
-                .bind(req.id)
-                .fetch_optional(crate::db::pool())
-                .await
-                .unwrap_or(None)
-                .and_then(|r| r.try_get("source_sales_order_id").ok().flatten());
-
-            // 现有明细：id -> (source)
-            let existing_by_id: std::collections::HashMap<i64, Option<i64>> = sqlx::query(
-                "SELECT id, source_sales_order_id FROM purchase_order_item WHERE order_id = ?"
-            )
-            .bind(req.id)
-            .fetch_all(crate::db::pool())
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| {
-                let id: i64 = r.get("id");
-                let src: Option<i64> = r.try_get("source_sales_order_id").ok().flatten();
-                (id, src)
-            })
-            .collect();
-
-            // 收集请求中带 id 的集合，用于删除数据库中存在但请求中未包含的明细
-            let mut req_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-            for item in &req.items {
-                if let Some(iid) = item.id {
-                    if iid > 0 {
-                        req_ids.insert(iid);
-                    }
-                }
-            }
-            for (db_id, _src) in &existing_by_id {
-                if !req_ids.contains(db_id) {
-                    let _ = sqlx::query("DELETE FROM purchase_order_item WHERE id = ? AND order_id = ?")
-                        .bind(db_id)
-                        .bind(req.id)
-                        .execute(crate::db::pool())
-                        .await;
-                }
-            }
-
-            // 更新/插入请求中的明细
-            for item in &req.items {
-                if let Some(iid) = item.id {
-                    if iid > 0 && existing_by_id.contains_key(&iid) {
-                        // 已有明细：按 id UPDATE，source 保持
-                        let _ = sqlx::query(
-                            "UPDATE purchase_order_item SET product_id = ?, product_name = ?, alias1 = ?, alias2 = ?, spec = ?, unit = ?, unit_price = ?, quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ?, remark = ?, warehouse_id = ?, warehouse_name = ? WHERE id = ? AND order_id = ?"
-                        )
-                        .bind(item.product_id)
-                        .bind(&item.product_name)
-                        .bind(&item.alias1)
-                        .bind(&item.alias2)
-                        .bind(&item.spec)
-                        .bind(&item.unit)
-                        .bind(item.unit_price)
-                        .bind(item.quantity)
-                        .bind(item.base_quantity.unwrap_or(0.0))
-                        .bind(item.amount)
-                        .bind(item.ordered_quantity.unwrap_or(0.0))
-                        .bind(&item.remark)
-                        .bind(item.warehouse_id.unwrap_or(0))
-                        .bind(&item.warehouse_name.clone().unwrap_or_default())
-                        .bind(iid)
-                        .bind(req.id)
-                        .execute(crate::db::pool())
-                        .await
-                        .ok();
-                    } else {
-                        // 带 id 但数据库中不存在（已被并发删除）→ 走 INSERT 兜底
-                        insert_purchase_item(req.id.unwrap_or(0), item, po_main_source).await;
-                    }
-                } else {
-                    // 新增明细：INSERT，用主表 source 兜底
-                    insert_purchase_item(req.id.unwrap_or(0), item, po_main_source).await;
-                }
-            }
-            if !req.items.is_empty() {
-                // 采购单更新后同步商品进价（当前/最高/最低）
-                update_product_purchase_prices(&req.items).await;
-            }
-            crate::auth::log_operation(&ctx, "purchase_order.update", "purchase_order", &req.id.unwrap_or(0).to_string(),
-                &format!("更新采购单 {}（原单号 {}）：金额 {:.2}→{:.2}，下浮后合计 {:.2}→{:.2}，版本 {}→{}",
-                    req.order_no, old_order_no, old_total, req.total_amount, old_final, req.final_amount, db_version, db_version + 1)).await;
-            (StatusCode::OK, "更新成功".to_string())
-        }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "更新失败".to_string()),
+    };
+    if upd_res.rows_affected() == 0 {
+        // version 已被他人递增（极端并发）→ 整个事务回滚（其实只 UPDATE 了一行 ROLLBACK 也无害）
+        return (StatusCode::CONFLICT, format!("订单已被其他用户修改（版本 {} 已被覆盖），请刷新后重试", ver));
     }
+    let new_version = ver + 1;
+    let old_order_no = req.order_no.clone();
+    let old_total = req.total_amount;
+    let old_final = req.final_amount;
+
+    // 按 id 精确同步明细（保留每条明细的 source_sales_order_id 归属）
+    let po_main_source: Option<i64> = sqlx::query("SELECT source_sales_order_id FROM purchase_order WHERE id = ?")
+        .bind(req.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get("source_sales_order_id").ok().flatten());
+
+    let existing_by_id: std::collections::HashMap<i64, Option<i64>> = sqlx::query(
+        "SELECT id, source_sales_order_id FROM purchase_order_item WHERE order_id = ?"
+    )
+    .bind(req.id)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| {
+        let id: i64 = r.get("id");
+        let src: Option<i64> = r.try_get("source_sales_order_id").ok().flatten();
+        (id, src)
+    })
+    .collect();
+
+    let mut req_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for item in &req.items {
+        if let Some(iid) = item.id {
+            if iid > 0 {
+                req_ids.insert(iid);
+            }
+        }
+    }
+    for (db_id, _src) in &existing_by_id {
+        if !req_ids.contains(db_id) {
+            let _ = sqlx::query("DELETE FROM purchase_order_item WHERE id = ? AND order_id = ?")
+                .bind(db_id)
+                .bind(req.id)
+                .execute(&mut *tx)
+                .await;
+        }
+    }
+
+    for item in &req.items {
+        if let Some(iid) = item.id {
+            if iid > 0 && existing_by_id.contains_key(&iid) {
+                let _ = sqlx::query(
+                    "UPDATE purchase_order_item SET product_id = ?, product_name = ?, alias1 = ?, alias2 = ?, spec = ?, unit = ?, unit_price = ?, quantity = ?, base_quantity = ?, amount = ?, ordered_quantity = ?, remark = ?, warehouse_id = ?, warehouse_name = ? WHERE id = ? AND order_id = ?"
+                )
+                .bind(item.product_id)
+                .bind(&item.product_name)
+                .bind(&item.alias1)
+                .bind(&item.alias2)
+                .bind(&item.spec)
+                .bind(&item.unit)
+                .bind(item.unit_price)
+                .bind(item.quantity)
+                .bind(item.base_quantity.unwrap_or(0.0))
+                .bind(item.amount)
+                .bind(item.ordered_quantity.unwrap_or(0.0))
+                .bind(&item.remark)
+                .bind(item.warehouse_id.unwrap_or(0))
+                .bind(&item.warehouse_name.clone().unwrap_or_default())
+                .bind(iid)
+                .bind(req.id)
+                .execute(&mut *tx)
+                .await
+                .ok();
+            } else {
+                insert_purchase_item(&mut tx, req.id.unwrap_or(0), item, po_main_source).await;
+            }
+        } else {
+            insert_purchase_item(&mut tx, req.id.unwrap_or(0), item, po_main_source).await;
+        }
+    }
+    if let Err(_) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "更新失败：事务提交失败".to_string());
+    }
+    if !req.items.is_empty() {
+        // 采购单更新后同步商品进价（当前/最高/最低）
+        update_product_purchase_prices(&req.items).await;
+    }
+    crate::auth::log_operation(&ctx, "purchase_order.update", "purchase_order", &req.id.unwrap_or(0).to_string(),
+        &format!("更新采购单 {}（原单号 {}）：金额 {:.2}→{:.2}，下浮后合计 {:.2}→{:.2}，版本 {}→{}",
+            req.order_no, old_order_no, old_total, req.total_amount, old_final, req.final_amount, ver, new_version)).await;
+    (StatusCode::OK, "更新成功".to_string())
 }
 
 pub async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
@@ -4918,8 +4930,8 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     }
     let ctx = crate::auth::get_user_ctx(&headers).await;
 
-    // 状态约束 + 行级数据权限 + 乐观锁：先查订单当前状态、版本与所属采购单位
-    let order = sqlx::query("SELECT purchaser_id, status, version, order_no, total_amount, final_amount FROM sales_order WHERE id = ?")
+    // 行级数据权限：先查订单所属采购单位
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
         .bind(req.id)
         .fetch_optional(crate::db::pool())
         .await
@@ -4931,10 +4943,6 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     };
     let order_purchaser_id: i64 = order.get("purchaser_id");
     let order_status: String = order.get("status");
-    let db_version: i64 = order.get("version");
-    let old_order_no: String = order.get("order_no");
-    let old_total: f64 = order.get("total_amount");
-    let old_final: f64 = order.get("final_amount");
     if !crate::auth::can_access_sales_order(&ctx, order_purchaser_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
@@ -4942,14 +4950,27 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     if order_status != "pending" {
         return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许修改；已审核订单需管理员反审核后才能修改", order_status));
     }
-    // 乐观锁：客户端携带的版本号必须与数据库当前版本一致，防止并发覆盖
-    if let Some(ver) = req.version {
-        if ver != db_version {
-            return (StatusCode::CONFLICT, format!("订单已被其他用户修改（版本 {} → {}），请刷新后重试", ver, db_version));
-        }
+    // 强制乐观锁：req.version 必须传入且 > 0
+    let ver = match req.version {
+        Some(v) if v > 0 => v,
+        _ => return (StatusCode::BAD_REQUEST, "保存失败：缺少订单版本号，请刷新页面后重试".to_string()),
+    };
+    // 安全护栏：更新时明细不允许为空（防止并发覆盖导致明细被清空）
+    if req.items.is_empty() {
+        return (StatusCode::BAD_REQUEST, "保存失败：订单明细不能为空".to_string());
     }
 
-    let result = sqlx::query(
+    // 用 BEGIN IMMEDIATE 启动写事务，立即获得 SQLite 写锁（RESERVED）。
+    // 作用：把"主表 UPDATE + 明细全量重写"整体串行化，
+    // 杜绝连点两次保存时两个事务都读到同一 version、都通过乐观锁、然后后提交的事务用全量 items
+    // 把先提交的事务的明细覆盖/丢失。
+    let mut tx = match crate::db::pool().begin_with("BEGIN IMMEDIATE").await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "更新失败：事务启动失败".to_string()),
+    };
+
+    // 事务内做"主表 UPDATE + version 自增"：WHERE 同时校验 id 和 version。
+    let upd = sqlx::query(
         "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
     .bind(req.purchaser_id)
@@ -4963,67 +4984,73 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     .bind(&req.warehouse_name)
     .bind(&req.remark)
     .bind(req.id)
-    .bind(db_version)
-    .execute(crate::db::pool())
+    .bind(ver)
+    .execute(&mut *tx)
     .await;
 
-    match result {
-        Ok(res) if res.rows_affected() == 0 => {
-            // 版本已被他人递增（极端并发），拒绝写入
-            (StatusCode::CONFLICT, format!("订单已被其他用户修改，请刷新后重试（版本 {}", db_version))
-        }
-        Ok(_) => {
-            sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
-                .bind(req.id)
-                .execute(crate::db::pool())
-                .await
-                .ok();
-
-            if !req.items.is_empty() {
-                let placeholders: Vec<String> = req.items.iter()
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
-                    .collect();
-                let sql = format!(
-                    "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark) VALUES {}",
-                    placeholders.join(", ")
-                );
-                
-                let order_id = req.id;
-                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for mut item in req.items {
-                    // 数量同步：保存时若销售数量为 0 而预售数量 > 0，
-                    // 用预售数量兜底，避免后续生成采购时数量为 0 的空明细
-                    if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
-                        item.quantity = item.pre_sale_quantity.unwrap();
-                    }
-                    query = query
-                        .bind(order_id)
-                        .bind(item.product_id)
-                        .bind(&item.product_name)
-                        .bind(&item.alias1)
-                        .bind(&item.alias2)
-                        .bind(&item.spec)
-                        .bind(&item.unit)
-                        .bind(item.unit_price)
-                        .bind(item.quantity)
-                        .bind(item.base_quantity.unwrap_or(0.0))
-                        .bind(item.amount)
-                        .bind(item.pre_sale_quantity.unwrap_or(0.0))
-                        .bind(item.supplier_id)
-                        .bind(&item.supplier_name)
-                        .bind(&item.remark);
-                }
-                let _ = query.execute(crate::db::pool()).await;
-            }
-            crate::auth::log_operation(&ctx, "sales_order.update", "sales_order", &req.id.unwrap_or(0).to_string(),
-                &format!("更新销售单 {}（原单号 {}）：金额 {:.2}→{:.2}，下浮后合计 {:.2}→{:.2}，版本 {}→{}",
-                    req.order_no, old_order_no, old_total, req.total_amount, old_final, req.final_amount, db_version, db_version + 1)).await;
-            (StatusCode::OK, "更新成功".to_string())
-        }
+    let upd_res = match upd {
+        Ok(r) => r,
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e))
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e));
         }
+    };
+    if upd_res.rows_affected() == 0 {
+        return (StatusCode::CONFLICT, format!("订单已被其他用户修改（版本 {} 已被覆盖），请刷新后重试", ver));
     }
+    let new_version = ver + 1;
+    let old_order_no = req.order_no.clone();
+    let old_total = req.total_amount;
+    let old_final = req.final_amount;
+
+    sqlx::query("DELETE FROM sales_order_item WHERE order_id = ?")
+        .bind(req.id)
+        .execute(&mut *tx)
+        .await
+        .ok();
+
+    if !req.items.is_empty() {
+        let placeholders: Vec<String> = req.items.iter()
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+            .collect();
+        let sql = format!(
+            "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark) VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let order_id = req.id;
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+        for mut item in req.items {
+            // 数量同步：保存时若销售数量为 0 而预售数量 > 0，
+            // 用预售数量兜底，避免后续生成采购时数量为 0 的空明细
+            if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
+                item.quantity = item.pre_sale_quantity.unwrap();
+            }
+            query = query
+                .bind(order_id)
+                .bind(item.product_id)
+                .bind(&item.product_name)
+                .bind(&item.alias1)
+                .bind(&item.alias2)
+                .bind(&item.spec)
+                .bind(&item.unit)
+                .bind(item.unit_price)
+                .bind(item.quantity)
+                .bind(item.base_quantity.unwrap_or(0.0))
+                .bind(item.amount)
+                .bind(item.pre_sale_quantity.unwrap_or(0.0))
+                .bind(item.supplier_id)
+                .bind(&item.supplier_name)
+                .bind(&item.remark);
+        }
+        let _ = query.execute(&mut *tx).await;
+    }
+    if let Err(_) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "更新失败：事务提交失败".to_string());
+    }
+    crate::auth::log_operation(&ctx, "sales_order.update", "sales_order", &req.id.unwrap_or(0).to_string(),
+        &format!("更新销售单 {}（原单号 {}）：金额 {:.2}→{:.2}，下浮后合计 {:.2}→{:.2}，版本 {}→{}",
+            req.order_no, old_order_no, old_total, req.total_amount, old_final, req.final_amount, ver, new_version)).await;
+    (StatusCode::OK, "更新成功".to_string())
 }
 
 pub async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
