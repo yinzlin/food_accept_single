@@ -104,6 +104,8 @@ pub struct PurchaseOrderReq {
     pub remark: Option<String>,
     /// 乐观锁版本号：编辑时从详情接口取得，提交时校验，防止覆盖他人修改
     pub version: Option<i64>,
+    /// 是否已结算（0=未结 1=已结），用于财务查询
+    pub is_settled: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -141,8 +143,14 @@ pub struct SalesOrderReq {
     pub warehouse_name: String,
     pub items: Vec<SalesOrderItemReq>,
     pub remark: Option<String>,
+    /// 验收单/报销单导出时使用的供应商名称；可空，前端新建时默认填充"湖南食全味美餐饮管理有限公司"。
+    pub supplier_company: Option<String>,
+    /// 验收单/报销单导出时使用的供货车牌号；可空，前端新建时默认填充"湘A·BE9312"。
+    pub truck_plate: Option<String>,
     /// 乐观锁版本号：编辑时从详情接口取得，提交时校验，防止覆盖他人修改
     pub version: Option<i64>,
+    /// 是否已结算（0=未结 1=已结），用于财务查询
+    pub is_settled: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize)]

@@ -2090,6 +2090,11 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     <option value="">全部供应商</option>
                 </select>
             </div>
+            <select id="isSettledSelect" class="form-control" onchange="searchOrders()" style="width: 130px; display: inline-block;">
+                <option value="">是否结算:全部</option>
+                <option value="0">是否结算:未结</option>
+                <option value="1">是否结算:已结</option>
+            </select>
             <button onclick="searchOrders()" class="btn btn-primary ml-2">搜索</button>
             <button onclick="resetSearch()" class="btn btn-secondary ml-2">重置</button>
             <button onclick="cancelOrder()" class="btn btn-warning ml-2">取消</button>
@@ -2098,7 +2103,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             <input type="file" id="purchaseOrderFileInput" style="display:none" accept=".csv" onchange="handlePurchaseOrderFile(this)">
         </div>
         <table class="table table-bordered">
-            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">供应商<span id="sortIndicator_unit_name"></span></th><th>入库仓库</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
+            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">供应商<span id="sortIndicator_unit_name"></span></th><th>入库仓库</th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>是否结算</th><th>操作</th></tr></thead>
             <tbody id="orderListBody"></tbody>
         </table>
 
@@ -2320,6 +2325,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             function resetSearch() {{
                 document.getElementById('searchInput').value = '';
                 document.getElementById('supplierSelect').value = '';
+                document.getElementById('isSettledSelect').value = '';
                 currentKeyword = '';
                 currentPage = 1;
                 loadOrders();
@@ -2356,6 +2362,10 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 if (supplierId) {{
                     url += '&supplier_id=' + supplierId;
                 }}
+                const isSettledVal = document.getElementById('isSettledSelect').value;
+                if (isSettledVal === '0' || isSettledVal === '1') {{
+                    url += '&is_settled=' + isSettledVal;
+                }}
                 if (sortField) {{
                     url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
                 }}
@@ -2374,6 +2384,14 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     sumDiscounted += discounted;
                     sumReduction += reduction;
                     sumFinal += finalAmt;
+                    const settledBadge = order.is_settled === 1
+                        ? '<span class="badge bg-success">已结</span>'
+                        : '<span class="badge bg-warning text-dark">未结</span>';
+                    const toggleSettleBtn = order.status !== 'pending'
+                        ? (order.is_settled === 1
+                            ? '<button onclick="event.stopPropagation(); toggleSettlePurchaseOrder(' + order.id + ', 0)" class="btn btn-outline-warning btn-sm me-1">设为未结</button>'
+                            : '<button onclick="event.stopPropagation(); toggleSettlePurchaseOrder(' + order.id + ', 1)" class="btn btn-outline-success btn-sm me-1">设为已结</button>')
+                        : '';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')" style="cursor: pointer;">' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
@@ -2385,7 +2403,9 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + reduction.toFixed(2) + '</td>' +
                         '<td>' + finalAmt.toFixed(2) + '</td>' +
                         '<td>' + orderStatusLabel(order.status) + '</td>' +
+                        '<td>' + settledBadge + '</td>' +
                         '<td>' +
+                        toggleSettleBtn +
                         (order.status === 'pending' ? '<button onclick="event.stopPropagation(); approveOrder(' + order.id + ')" class="btn btn-success btn-sm me-1">审核</button>' : '') +
                         ((order.status === 'confirmed' || isSuperAdmin) ? '<button onclick="event.stopPropagation(); unapproveOrder(' + order.id + ')" class="btn btn-warning btn-sm me-1">反审核</button>' : '') +
                         '<button onclick="event.stopPropagation(); exportPurchaseOrder(' + order.id + ')" class="btn btn-info btn-sm me-1">导出采购单</button>' +
@@ -2393,7 +2413,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         '</td></tr>';
                 }});
                 if (orders.length > 0) {{
-                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="5" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td></td><td colspan="2"></td></tr>';
                 }}
                 renderPagination(result.page, result.total_pages, result.total);
             }}
@@ -3032,6 +3052,22 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 renderItems();
             }}
 
+            async function toggleSettlePurchaseOrder(id, isSettled) {{
+                const label = isSettled === 1 ? '已结' : '未结';
+                if (!confirm('确定将该订单设为「' + label + '」？')) return;
+                const res = await fetch('/api/purchase_order/settle/' + id, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ is_settled: isSettled }})
+                }});
+                if (res.ok) {{
+                    loadOrders();
+                }} else {{
+                    const err = await res.text();
+                    alert('操作失败：' + err);
+                }}
+            }}
+
             async function deleteOrder(id) {{
                 if (!confirm('确定删除该订单？')) return;
                 const res = await fetch('/api/purchase_order/delete/' + id, {{ method: 'DELETE' }});
@@ -3119,6 +3155,18 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     <div class="col-md-3">
                         <label>订单日期：</label>
                         <input type="date" id="orderDateInput" class="form-control" value="{}" onchange="generateOrderNo('sales')">
+                    </div>
+                    <div class="col-md-3">
+                        <label>供应商（验收单/报销单用）：</label>
+                        <input type="text" id="supplierCompanyInput" class="form-control" value="湖南食全味美餐饮管理有限公司" placeholder="请输入供应商名称">
+                    </div>
+                    <div class="col-md-3">
+                        <label>供货车牌号（验收单/报销单用）：</label>
+                        <input type="text" id="truckPlateInput" class="form-control" value="湘A·BE9312" placeholder="请输入供货车牌号">
+                    </div>
+                    <div class="col-md-3">
+                        <label>联系方式（验收单/报销单用）：</label>
+                        <input type="text" id="contactPhoneInput" class="form-control" value="" placeholder="请输入联系方式">
                     </div>
                     <div class="col-md-3">
                         <label>备注：</label>
@@ -3217,6 +3265,11 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     <option value="">全部采购单位</option>
                 </select>
             </div>
+            <select id="isSettledSelect" class="form-control" onchange="searchOrders()" style="width: 130px; display: inline-block;">
+                <option value="">是否结算:全部</option>
+                <option value="0">是否结算:未结</option>
+                <option value="1">是否结算:已结</option>
+            </select>
             <button onclick="searchOrders()" class="btn btn-primary ml-2">搜索</button>
             <button onclick="resetSearch()" class="btn btn-secondary ml-2">重置</button>
             <button onclick="cancelOrder()" class="btn btn-warning ml-2">取消</button>
@@ -3225,7 +3278,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             <input type="file" id="salesOrderFileInput" style="display:none" accept=".csv" onchange="handleSalesOrderFile(this)">
         </div>
         <table class="table table-bordered">
-            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">采购单位<span id="sortIndicator_unit_name"></span></th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>操作</th></tr></thead>
+            <thead><tr><th>ID</th><th onclick="sortOrders('order_no')" style="cursor:pointer">订单号<span id="sortIndicator_order_no"></span></th><th onclick="sortOrders('order_date')" style="cursor:pointer">日期<span id="sortIndicator_order_date"></span></th><th onclick="sortOrders('unit_name')" style="cursor:pointer">采购单位<span id="sortIndicator_unit_name"></span></th><th>金额</th><th>下浮后</th><th>折减</th><th>最终金额</th><th onclick="sortOrders('status')" style="cursor:pointer">状态<span id="sortIndicator_status"></span></th><th>是否结算</th><th>操作</th></tr></thead>
             <tbody id="orderListBody"></tbody>
         </table>
 
@@ -3288,8 +3341,24 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     document.getElementById('purchaserId').value = id;
                     document.getElementById('purchaserInput').value = name;
                     this.style.display = 'none';
+                    // 采购单位确定后：自动在出库仓库文本框录入同名的仓库（若有）
+                    autoFillWarehouseByPurchaser(name);
                 }}
             }});
+
+            // 采购单位确定时，自动把同名仓库填到出库仓库
+            function autoFillWarehouseByPurchaser(purchaserName) {{
+                if (!purchaserName) return;
+                const matched = warehouses.find(w => w.name === purchaserName);
+                if (matched) {{
+                    document.getElementById('warehouseId').value = matched.id;
+                    const input = document.getElementById('warehouseInput');
+                    input.value = matched.name;
+                    input.readOnly = true;
+                    const dropdown = document.getElementById('warehouseDropdown');
+                    if (dropdown) dropdown.style.display = 'none';
+                }}
+            }}
 
             document.getElementById('purchaserInput').addEventListener('click', function() {{
                 this.readOnly = true;
@@ -3889,6 +3958,22 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             let currentVersion = 1;
 
             // 反审核：confirmed → pending，解锁订单（仅管理员，强制原因）
+            async function toggleSettleSalesOrder(id, isSettled) {{
+                const label = isSettled === 1 ? '已结' : '未结';
+                if (!confirm('确定将该销售单设为「' + label + '」？')) return;
+                const res = await fetch('/api/sales_order/settle/' + id, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ is_settled: isSettled }})
+                }});
+                if (res.ok) {{
+                    loadOrders();
+                }} else {{
+                    const err = await res.text();
+                    alert('操作失败：' + err);
+                }}
+            }}
+
             async function unapproveSalesOrder(id) {{
                 const reason = prompt('请输入反审核原因（必填）：');
                 if (reason === null) return;
@@ -3955,9 +4040,13 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     warehouse_name: document.getElementById('warehouseInput').value || '',
                     items: validItems,
                     remark: document.getElementById('remarkInput').value || null,
+                    supplier_company: document.getElementById('supplierCompanyInput').value.trim() || null,
+                    truck_plate: document.getElementById('truckPlateInput').value.trim() || null,
                     version: currentVersion
                 }};
                 const url = isNew ? '/api/sales_order/create' : '/api/sales_order/update';
+                // 保存时把"联系方式"持久化到当前用户（下次打开页面时作为默认值回填）
+                const contactPhone = document.getElementById('contactPhoneInput').value.trim();
                 try {{
                     const res = await fetch(url, {{
                         method: 'POST',
@@ -3965,6 +4054,14 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         body: JSON.stringify(data)
                     }});
                     if (res.ok) {{
+                        // 非空才更新"上次输入"，避免误清空用户已保存的联系方式
+                        if (contactPhone) {{
+                            await fetch('/api/user/contact_phone', {{
+                                method: 'POST',
+                                headers: {{ 'Content-Type': 'application/json' }},
+                                body: JSON.stringify({{ contact_phone: contactPhone }})
+                            }});
+                        }}
                         if (isNew) {{
                             resetForm();
                             restoreBtn();
@@ -4053,6 +4150,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             function resetSearch() {{
                 document.getElementById('searchInput').value = '';
                 document.getElementById('purchaserSelect').value = '';
+                document.getElementById('isSettledSelect').value = '';
                 currentKeyword = '';
                 currentPage = 1;
                 loadOrders();
@@ -4088,6 +4186,10 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 const purchaserId = document.getElementById('purchaserSelect').value;
                 if (purchaserId) {{
                     url += '&purchaser_id=' + purchaserId;
+                }}
+                const isSettledVal = document.getElementById('isSettledSelect').value;
+                if (isSettledVal === '0' || isSettledVal === '1') {{
+                    url += '&is_settled=' + isSettledVal;
                 }}
                 if (sortField) {{
                     url += '&sort_field=' + sortField + '&sort_order=' + sortOrder;
@@ -4126,14 +4228,20 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         'sorting': '{{"text":"完成分拣","status":"sorted"}}',
                         'sorted': '{{"text":"开始配送","status":"delivering"}}',
                         'delivering': '{{"text":"确认送达","status":"delivered"}}',
-                        'delivered': '{{"text":"确认验收","status":"accepted"}}',
-                        'accepted': '{{"text":"确认结算","status":"settled"}}',
-                        'settled': '{{"text":"","status":""}}'
+                        'delivered': '{{"text":"确认验收","status":"accepted"}}'
                     }};
                     const nextInfo = JSON.parse(nextStatusMap[order.status] || '{{"text":"","status":""}}');
                     const nextBtn = nextInfo.text ? '<button onclick="event.stopPropagation(); updateOrderStatus(' + order.id + ', \'' + nextInfo.status + '\')" class="btn btn-primary btn-sm">' + nextInfo.text + '</button> ' : '';
                     const unapproveBtn = (order.status === 'confirmed' || isSuperAdmin) ? '<button onclick="event.stopPropagation(); unapproveSalesOrder(' + order.id + ')" class="btn btn-warning btn-sm">反审核</button> ' : '';
                     const reimburseBtn = order.is_reimburse ? '<button onclick="event.stopPropagation(); exportAcceptExcel(' + order.id + ')" class="btn btn-warning btn-sm">导出报销单</button> ' : '';
+                    const settledBadge = order.is_settled === 1
+                        ? '<span class="badge bg-success">已结</span>'
+                        : '<span class="badge bg-warning text-dark">未结</span>';
+                    const toggleSettleBtn = order.status !== 'pending'
+                        ? (order.is_settled === 1
+                            ? '<button onclick="event.stopPropagation(); toggleSettleSalesOrder(' + order.id + ', 0)" class="btn btn-outline-warning btn-sm me-1">设为未结</button>'
+                            : '<button onclick="event.stopPropagation(); toggleSettleSalesOrder(' + order.id + ', 1)" class="btn btn-outline-success btn-sm me-1">设为已结</button>')
+                        : '';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')"' + selected + '>' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
@@ -4144,7 +4252,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         '<td>' + reduction.toFixed(2) + '</td>' +
                         '<td>' + finalAmt.toFixed(2) + '</td>' +
                         '<td>' + statusBadge + '</td>' +
+                        '<td>' + settledBadge + '</td>' +
                         '<td>' +
+                        toggleSettleBtn +
                         nextBtn +
                         unapproveBtn +
                         '<button onclick="event.stopPropagation(); exportRealExcel(' + order.id + ')" class="btn btn-success btn-sm">导出验收单</button> ' +
@@ -4154,7 +4264,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         '</td></tr>';
                 }});
                 if (orders.length > 0) {{
-                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="4" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td colspan="2"></td></tr>';
+                    tbody.innerHTML += '<tr class="table-active fw-bold"><td colspan="4" class="text-end">合计</td><td>' + sumAmount.toFixed(2) + '</td><td>' + sumDiscounted.toFixed(2) + '</td><td>' + sumReduction.toFixed(2) + '</td><td>' + sumFinal.toFixed(2) + '</td><td></td><td colspan="2"></td></tr>';
                 }}
                 renderPagination(result.page, result.total_pages, result.total);
             }}
@@ -4196,6 +4306,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderNoInput').value = order.order_no;
                 document.getElementById('orderDateInput').value = order.order_date;
                 document.getElementById('remarkInput').value = order.remark || '';
+                // 供应商与供货车牌号：主表字段为空时回退到默认占位文本，与新建时一致
+                document.getElementById('supplierCompanyInput').value = order.supplier_company || '湖南食全味美餐饮管理有限公司';
+                document.getElementById('truckPlateInput').value = order.truck_plate || '湘A·BE9312';
                 document.getElementById('discountRateInput').value = order.discount_rate || 0;
                 document.getElementById('amountReductionInput').value = order.amount_reduction || 0;
                 setSalesOrderImage('customer', order.customer_order_image || null);
@@ -4444,6 +4557,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderDateInput').value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
                 document.getElementById('remarkInput').value = '';
                 document.getElementById('discountRateInput').value = '20';
+                // 供应商与供货车牌号：新建时填入默认占位文本
+                document.getElementById('supplierCompanyInput').value = '湖南食全味美餐饮管理有限公司';
+                document.getElementById('truckPlateInput').value = '湘A·BE9312';
                 setSalesOrderImage('customer', null);
                 setSalesOrderImage('signed', null);
                 items = [];
@@ -4454,6 +4570,20 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
             loadPurchasers();
             loadOrders();
+            loadContactPhone();
+
+            // 拉取当前登录用户最近保存的联系方式（销售订单主表单"联系方式"输入框的默认值）
+            async function loadContactPhone() {{
+                try {{
+                    const res = await fetch('/api/user/contact_phone');
+                    const data = await res.json();
+                    if (data.success) {{
+                        document.getElementById('contactPhoneInput').value = data.contact_phone || '';
+                    }}
+                }} catch (e) {{
+                    // 拉取失败静默，输入框保持为空
+                }}
+            }}
 
             async function loadPurchasers() {{
                 const res = await fetch('/api/purchaser/list');
@@ -9455,6 +9585,8 @@ pub async fn page_mobile_today_price(headers: axum::http::HeaderMap) -> Html<Str
         <button class="btn-export" onclick="exportExcel(true)">导出XLSX</button>
         <button class="btn-export-plain" onclick="exportExcel(false)">导出(手写价)</button>
         <button class="btn-export" onclick="exportExcelByCategory(true)">导出(按分类)</button>
+        <button class="btn-export" onclick="exportExcelA4(true)">导出(A4)</button>
+        <button class="btn-export-plain" onclick="exportExcelA4(false)">导出A4(手写价)</button>
     </div>
 
     <script>
@@ -9620,6 +9752,16 @@ pub async fn page_mobile_today_price(headers: axum::http::HeaderMap) -> Html<Str
         function exportExcelByCategory(withValues) {
             const date = document.getElementById('historyDate').value;
             let url = '/api/product/today_price_excel_by_category';
+            let params = [];
+            if (date) params.push('date=' + encodeURIComponent(date));
+            if (withValues) params.push('print_values=1');
+            if (params.length) url += '?' + params.join('&');
+            window.location.href = url;
+        }
+
+        function exportExcelA4(withValues) {
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/product/today_price_a4';
             let params = [];
             if (date) params.push('date=' + encodeURIComponent(date));
             if (withValues) params.push('print_values=1');
@@ -11665,5 +11807,132 @@ pub async fn page_supplement() -> Html<String> {
         </script>
     "#;
     Html(crate::layout_html("耗材分摊管理", "supplement", content))
+}
+
+// === 财务查询：采购/销售 未结/已结 列表 ===
+// 数据在页面加载时从 DB 取出（管理用汇总页，非高频），按订单日期倒序。
+// 显示：合计（笔数 + 金额）+ 表格（订单号 / 供应商或采购单位 / 订单日期 / 订单金额 / 结算状态）。
+
+pub async fn page_query_finance_settlement(headers: axum::http::HeaderMap) -> Html<String> {
+    let _ = headers;
+    let title = "财务结算查询";
+    let path = "/query/finance_settlement";
+    let content = r#"<div class="card p-4">
+        <h3>财务结算查询</h3>
+        <div class="row mt-3">
+            <div class="col-md-2">
+                <label class="form-label">开始日期</label>
+                <input type="date" id="startDate" class="form-control" onchange="searchFinance()">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">结束日期</label>
+                <input type="date" id="endDate" class="form-control" onchange="searchFinance()">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">类型</label>
+                <select id="typeSelect" class="form-control" onchange="searchFinance()">
+                    <option value="">全部</option>
+                    <option value="purchase">采购</option>
+                    <option value="sales">销售</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">结算状态</label>
+                <select id="settledSelect" class="form-control" onchange="searchFinance()">
+                    <option value="">全部</option>
+                    <option value="0">未结</option>
+                    <option value="1">已结</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">关键字（订单号/对方名称）</label>
+                <input type="text" id="keywordInput" class="form-control" placeholder="搜索..." onkeyup="if(event.key==='Enter')searchFinance()">
+            </div>
+            <div class="col-md-1 d-flex align-items-end">
+                <button onclick="searchFinance()" class="btn btn-primary w-100">查询</button>
+            </div>
+        </div>
+    </div>
+    <div id="summaryCards" class="row mt-3 g-2"></div>
+    <div class="card p-4 mt-3">
+        <table class="table table-bordered table-hover" id="financeTable">
+            <thead><tr>
+                <th>订单号</th><th>日期</th><th>类型</th><th>对方名称</th>
+                <th>应付金额</th><th>下浮</th><th>扣减</th><th>最终金额</th>
+                <th>已付金额</th><th>未付金额</th><th>结算状态</th>
+            </tr></thead>
+            <tbody id="financeBody"></tbody>
+        </table>
+        <div id="pagination" class="mt-3"></div>
+    </div>
+    <script>
+        async function searchFinance(page) {
+            page = page || 1;
+            const params = new URLSearchParams();
+            const sd = document.getElementById('startDate').value;
+            const ed = document.getElementById('endDate').value;
+            if (sd) params.set('start_date', sd);
+            if (ed) params.set('end_date', ed);
+            const t = document.getElementById('typeSelect').value;
+            if (t) params.set('type', t);
+            const s = document.getElementById('settledSelect').value;
+            if (s) params.set('is_settled', s);
+            const kw = document.getElementById('keywordInput').value.trim();
+            if (kw) params.set('keyword', kw);
+            params.set('page', page);
+            params.set('page_size', '20');
+            const res = await fetch('/api/query/finance_settlement?' + params.toString());
+            const result = await res.json();
+            const orders = result.data || [];
+            const summary = result.summary || {};
+            const tbody = document.getElementById('financeBody');
+            tbody.innerHTML = '';
+            // 汇总卡片
+            const cards = document.getElementById('summaryCards');
+            cards.innerHTML = [
+                { label: '应付合计', value: summary.total_amount || 0, cls: 'text-primary' },
+                { label: '下浮合计', value: summary.discount_amount || 0, cls: 'text-warning' },
+                { label: '扣减合计', value: summary.reduction_amount || 0, cls: 'text-danger' },
+                { label: '已付合计', value: summary.paid_amount || 0, cls: 'text-success' },
+                { label: '未付合计', value: summary.unpaid_amount || 0, cls: 'text-danger' },
+            ].map(c => '<div class="col-md-2"><div class="card bg-light p-3 text-center"><div class="text-muted small">' + c.label + '</div><div class="h5 mb-0 ' + c.cls + '">¥' + c.value.toFixed(2) + '</div></div></div>').join('');
+            // 明细行
+            orders.forEach(o => {
+                const typeLabel = o.order_type === 'purchase' ? '<span class="badge bg-info">采购</span>' : '<span class="badge bg-primary">销售</span>';
+                const settledBadge = o.is_settled === 1
+                    ? '<span class="badge bg-success">已结</span>'
+                    : '<span class="badge bg-warning text-dark">未结</span>';
+                tbody.innerHTML += '<tr>' +
+                    '<td>' + o.order_no + '</td>' +
+                    '<td>' + o.order_date + '</td>' +
+                    '<td>' + typeLabel + '</td>' +
+                    '<td>' + o.party_name + '</td>' +
+                    '<td>¥' + o.total_amount.toFixed(2) + '</td>' +
+                    '<td>¥' + o.discount_amount.toFixed(2) + '</td>' +
+                    '<td>¥' + o.amount_reduction.toFixed(2) + '</td>' +
+                    '<td>¥' + o.final_amount.toFixed(2) + '</td>' +
+                    '<td>¥' + o.paid_amount.toFixed(2) + '</td>' +
+                    '<td>¥' + o.unpaid_amount.toFixed(2) + '</td>' +
+                    '<td>' + settledBadge + '</td></tr>';
+            });
+            if (orders.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无数据</td></tr>';
+            }
+            // 分页
+            const totalPages = result.total_pages || 1;
+            const currentPage = result.page || 1;
+            const total = result.total || 0;
+            let pgHtml = '<div class="d-flex justify-content-between align-items-center"><span>共 ' + total + ' 条，' + totalPages + ' 页</span><div>';
+            if (currentPage > 1) pgHtml += '<button class="btn btn-sm btn-outline-primary me-1" onclick="searchFinance(' + (currentPage - 1) + ')">上一页</button>';
+            for (let i = Math.max(1, currentPage - 2); i <= Math.min(totalPages, currentPage + 2); i++) {
+                pgHtml += '<button class="btn btn-sm ' + (i === currentPage ? 'btn-primary' : 'btn-outline-primary') + ' me-1" onclick="searchFinance(' + i + ')">' + i + '</button>';
+            }
+            if (currentPage < totalPages) pgHtml += '<button class="btn btn-sm btn-outline-primary" onclick="searchFinance(' + (currentPage + 1) + ')">下一页</button>';
+            pgHtml += '</div></div>';
+            document.getElementById('pagination').innerHTML = pgHtml;
+        }
+        searchFinance();
+    </script>"#;
+    Html(crate::layout_html(title, path, content))
 }
 

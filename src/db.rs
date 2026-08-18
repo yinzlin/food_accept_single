@@ -494,6 +494,11 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 采购订单：是否已结算（0=未结 1=已结），幂等迁移
+    let _ = sqlx::query("ALTER TABLE purchase_order ADD COLUMN is_settled INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS sales_order (
@@ -537,6 +542,11 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     )
     .execute(pool)
     .await?;
+
+    // 销售订单：是否已结算（0=未结 1=已结），幂等迁移
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN is_settled INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
 
     sqlx::query(
         r#"
@@ -684,6 +694,12 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 联系方式：销售订单主表单上"联系方式"输入框的最近一次输入值，用于导出验收单/报销单时填入 xlsx。
+    // 跨设备共享，按当前登录用户更新。
+    let _ = sqlx::query("ALTER TABLE user_account ADD COLUMN contact_phone TEXT")
+        .execute(pool)
+        .await;
+
     // 操作审计日志表：记录所有关键写操作（谁、何时、做了什么）
     sqlx::query(
         r#"
@@ -730,6 +746,15 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN version INTEGER DEFAULT 1")
+        .execute(pool)
+        .await;
+
+    // 销售订单"供应商名称"与"供货车牌号"：验收单/报销单导出时使用，替代原代码中硬编码的"湖南食全味美..."和"湘A·NY360"。
+    // 前端在新建销售订单时默认填入占位文本，保存时写入主表；编辑/回显时从主表读出。
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN supplier_company TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE sales_order ADD COLUMN truck_plate TEXT")
         .execute(pool)
         .await;
 

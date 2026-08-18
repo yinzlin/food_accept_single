@@ -1415,9 +1415,22 @@ pub(crate) async fn check_sales_order_access(
 }
 
 // reimburse=true 报销口径（合并分摊增项）；false 真实口径（真实账套）
-pub(crate) async fn build_accept_excel(id: i64, reimburse: bool, force: bool) -> impl IntoResponse {
+pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64, reimburse: bool, force: bool) -> impl IntoResponse {
+    // 食材供应人员① 的联系方式：取当前登录用户最近一次保存的"联系方式"（user_account.contact_phone）。
+    // 用户未保存过联系方式时为空白，xlsx 中该 cell 保持空。
+    let ctx = crate::auth::get_user_ctx(headers).await;
+    let contact_phone: String = sqlx::query("SELECT COALESCE(contact_phone, '') as cp FROM user_account WHERE id = ?")
+        .bind(ctx.user_id)
+        .fetch_optional(pool())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get("cp").ok())
+        .unwrap_or_default();
+
     let order_row = sqlx::query(
         "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.final_amount, so.remark,
+                so.supplier_company, so.truck_plate,
                 p.name as purchaser_name, p.address as purchaser_address
          FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
     )
@@ -1438,8 +1451,19 @@ pub(crate) async fn build_accept_excel(id: i64, reimburse: bool, force: bool) ->
     let _final_amount = row.get::<f64, _>("final_amount");
     let purchaser_name = row.get::<String, _>("purchaser_name");
 
-    let supplier_name = "湖南食全味美餐饮管理有限公司".to_string();
-    let car_no = "湘A·NY360".to_string();
+    // 供应商名称与供货车牌号：取自主表字段（前端在新建时默认填充），
+    // 主表为空时回退到与前端默认填充完全一致的文本，避免历史数据导出为空白
+    // 或与前端显示不一致。
+    let supplier_name_raw: Option<String> = row.try_get("supplier_company").ok().flatten();
+    let car_no_raw: Option<String> = row.try_get("truck_plate").ok().flatten();
+    let supplier_name = supplier_name_raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "湖南食全味美餐饮管理有限公司".to_string());
+    let car_no = car_no_raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "湘A·BE9312".to_string());
 
     let item_rows = sqlx::query(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
@@ -1852,7 +1876,8 @@ pub(crate) async fn build_accept_excel(id: i64, reimburse: bool, force: bool) ->
                 if sig_row == 0 {
                     worksheet.merge_range(row, 0, row, 1, "食材供应人员①：", &label_fmt)?;
                     worksheet.merge_range(row, 2, row, 3, "联系方式：", &contact_fmt)?;
-                    worksheet.merge_range(row, 4, row, 5, "", &cell_fmt)?;
+                    // 食材供应人员①的联系方式：填入当前登录用户最近一次保存的联系方式
+                    worksheet.merge_range(row, 4, row, 5, &contact_phone, &cell_fmt)?;
                     worksheet.merge_range(row, 6, row, 7, "公安验收人员①：", &supplier_fmt)?;
                     worksheet.merge_range(row, 8, row, 9, "联系方式：", &contact_fmt)?;
                     worksheet.merge_range(row, 10, row, 12, "", &last_cell_fmt)?;
@@ -1959,6 +1984,7 @@ fn build_router() -> Router {
         .route("/query/slow_stock", get(page_query_slow_stock))
         .route("/query/income_expense", get(page_query_income_expense))
         .route("/query/profit_detail", get(page_query_profit_detail))
+        .route("/query/finance_settlement", get(page_query_finance_settlement))
         .route("/query/overview", get(page_query_overview))
         .route("/query/category_stats", get(page_query_category_stats))
         .route("/query/document_summary", get(page_query_document_summary))
@@ -1971,6 +1997,8 @@ fn build_router() -> Router {
         .route("/api/system/operation_log", get(api_operation_log_list))
         .route("/api/system/operation_log/export", get(api_operation_log_export))
         .route("/api/user/list", get(api_user_list))
+        .route("/api/user/contact_phone", get(api_user_get_contact_phone))
+        .route("/api/user/contact_phone", post(api_user_set_contact_phone))
         .route("/api/user/{id}", get(api_user_get))
         .route("/api/user", post(api_user_create))
         .route("/api/user/{id}", put(api_user_update))
@@ -2032,6 +2060,7 @@ fn build_router() -> Router {
         .route("/api/product/today_price_items", get(api_product_today_price_items))
         .route("/api/product/today_price_save", post(api_product_today_price_save))
         .route("/api/product/today_price_excel", get(api_product_today_price_excel))
+        .route("/api/product/today_price_a4", get(api_product_today_price_a4))
         .route("/api/product/today_price_excel_by_category", get(api_product_today_price_excel_by_category))
         .route("/api/product/batch_set_auto_update_price", post(api_product_batch_set_auto_update_price))
         .route("/api/category/list", get(api_category_list))
@@ -2051,6 +2080,7 @@ fn build_router() -> Router {
         .route("/api/purchase_order/detail/{id}", get(api_purchase_order_detail))
         .route("/api/purchase_order/update", post(api_purchase_order_update))
         .route("/api/purchase_order/approve/{id}", post(api_purchase_order_approve))
+        .route("/api/purchase_order/settle/{id}", post(api_purchase_order_settle))
         .route("/api/purchase_order/unapprove/{id}", post(api_purchase_order_unapprove))
         .route("/api/purchase_order/delete/{id}", delete(api_purchase_order_delete))
         .route("/api/purchase_order/export", get(api_purchase_order_export))
@@ -2062,6 +2092,7 @@ fn build_router() -> Router {
         .route("/api/sales_order/detail/{id}", get(api_sales_order_detail))
         .route("/api/sales_order/update", post(api_sales_order_update))
         .route("/api/sales_order/approve/{id}", post(api_sales_order_approve))
+        .route("/api/sales_order/settle/{id}", post(api_sales_order_settle))
         .route("/api/sales_order/unapprove/{id}", post(api_sales_order_unapprove))
         .route("/api/sales_order/update_prices/{id}", post(api_sales_order_update_prices))
         .route("/api/sales_order/upload_image", post(api_sales_order_upload_image))
@@ -2146,6 +2177,7 @@ fn build_router() -> Router {
         .route("/api/query/income_expense/export", get(api_query_income_expense_export))
         .route("/api/query/profit_detail", get(api_query_profit_detail))
         .route("/api/query/profit_detail/export", get(api_query_profit_detail_export))
+        .route("/api/query/finance_settlement", get(api_query_finance_settlement))
         .route("/api/query/overview", get(api_query_overview))
         .route("/api/query/overview/export", get(api_query_overview_export))
         .route("/api/query/category_stats", get(api_query_category_stats))

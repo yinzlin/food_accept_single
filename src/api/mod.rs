@@ -255,6 +255,49 @@ pub async fn api_user_get(Path(id): Path<i64>) -> impl IntoResponse {
     })).unwrap())
 }
 
+// 获取当前登录用户最近保存的"联系方式"（销售订单主表单输入框的回填值）
+pub async fn api_user_get_contact_phone(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+    let user_id = ctx.user_id;
+    let row = sqlx::query("SELECT COALESCE(contact_phone, '') as contact_phone FROM user_account WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .unwrap_or(None);
+    let phone: String = match row {
+        Some(r) => r.try_get("contact_phone").unwrap_or_default(),
+        None => String::new(),
+    };
+    (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+        "success": true,
+        "contact_phone": phone
+    })).unwrap())
+}
+
+// 更新当前登录用户最近保存的"联系方式"。
+// 销售订单保存时同步调用：把用户在主表单输入框填的联系方式持久化，
+// 下次打开销售订单页 / 新建时由前端 GET 拉回作为默认值。
+pub async fn api_user_set_contact_phone(headers: axum::http::HeaderMap, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+    let user_id = ctx.user_id;
+    if user_id <= 0 {
+        return (StatusCode::UNAUTHORIZED, serde_json::to_string(&serde_json::json!({
+            "success": false,
+            "message": "未登录"
+        })).unwrap());
+    }
+    let phone = data["contact_phone"].as_str().unwrap_or("").trim().to_string();
+    let _ = sqlx::query("UPDATE user_account SET contact_phone = ? WHERE id = ?")
+        .bind(&phone)
+        .bind(user_id)
+        .execute(crate::db::pool())
+        .await;
+    (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+        "success": true,
+        "contact_phone": phone
+    })).unwrap())
+}
+
 pub async fn api_user_create(Json(data): Json<serde_json::Value>) -> impl IntoResponse {
     let username = data["username"].as_str().unwrap_or("");
     let password = data["password"].as_str().unwrap_or("");
@@ -3653,7 +3696,7 @@ pub async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req)
     let main_wh_name = wh_names.join("、");
 
     let result = sqlx::query(
-        "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, user_id, handler_phone, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO purchase_order(supplier_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, user_id, handler_phone, remark, is_settled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -3667,6 +3710,7 @@ pub async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req)
     .bind(req.user_id.unwrap_or(0))
     .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
+    .bind(req.is_settled.unwrap_or(0))
     .execute(crate::db::pool())
     .await;
     
@@ -3739,31 +3783,61 @@ pub async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extra
         _ => format!("po.id {}", sort_order),
     };
     
-    let (total_sql, total_params) = if let Some(sid) = supplier_id {
-        (
-            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+    let is_settled_filter: Option<String> = match params.get("is_settled").map(|s| s.as_str()) {
+        Some("0") | Some("1") => params.get("is_settled").cloned(),
+        _ => None,
+    };
+
+    let (total_sql, total_params) = match (supplier_id, is_settled_filter.as_ref()) {
+        (Some(sid), Some(isf)) => (
+            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
+             WHERE po.supplier_id = ? AND po.is_settled = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)",
+            vec![sid.to_string(), isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (Some(sid), None) => (
+            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
              WHERE po.supplier_id = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)",
             vec![sid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
-    } else {
-        (
-            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id 
+        ),
+        (None, Some(isf)) => (
+            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
+             WHERE po.is_settled = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)",
+            vec![isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (None, None) => (
+            "SELECT COUNT(*) as count FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
              WHERE po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?",
             vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
+        ),
     };
-    
+
     let mut total_query = sqlx::query(total_sql);
     for p in &total_params {
         total_query = total_query.bind(p);
     }
     let total_rows = total_query.fetch_one(crate::db::pool()).await.unwrap();
     let total: i64 = total_rows.get("count");
-    
-    let (sql, query_params) = if let Some(sid) = supplier_id {
-        (
+
+    let (sql, query_params) = match (supplier_id, is_settled_filter.as_ref()) {
+        (Some(sid), Some(isf)) => (
             format!(
-                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name,
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.is_settled, s.name as supplier_name,
+                        (SELECT GROUP_CONCAT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_names,
+                        (SELECT COUNT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_count
+                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
+                 WHERE po.supplier_id = ? AND po.is_settled = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![sid.to_string(), isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (Some(sid), None) => (
+            format!(
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.is_settled, s.name as supplier_name,
                         (SELECT GROUP_CONCAT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
                          FROM purchase_order_item poi
                          WHERE poi.order_id = po.id) as item_warehouse_names,
@@ -3776,11 +3850,26 @@ pub async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extra
                 order_clause
             ),
             vec![sid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
-    } else {
-        (
+        ),
+        (None, Some(isf)) => (
             format!(
-                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, s.name as supplier_name,
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.is_settled, s.name as supplier_name,
+                        (SELECT GROUP_CONCAT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_names,
+                        (SELECT COUNT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
+                         FROM purchase_order_item poi
+                         WHERE poi.order_id = po.id) as item_warehouse_count
+                 FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
+                 WHERE po.is_settled = ? AND (po.order_no LIKE ? OR s.name LIKE ? OR po.order_date LIKE ?)
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (None, None) => (
+            format!(
+                "SELECT po.id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.is_settled, s.name as supplier_name,
                         (SELECT GROUP_CONCAT(DISTINCT NULLIF(TRIM(poi.warehouse_name), ''))
                          FROM purchase_order_item poi
                          WHERE poi.order_id = po.id) as item_warehouse_names,
@@ -3793,7 +3882,7 @@ pub async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extra
                 order_clause
             ),
             vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
+        ),
     };
 
     let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -3835,6 +3924,7 @@ pub async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extra
                 "status": row.get::<String, _>("status"),
                 "remark": row.get::<Option<String>, _>("remark"),
                 "supplier_name": row.get::<String, _>("supplier_name"),
+                "is_settled": row.get::<i64, _>("is_settled"),
             })
         })
         .collect();
@@ -3853,7 +3943,7 @@ pub async fn api_purchase_order_list(headers: axum::http::HeaderMap, axum::extra
 pub async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id): Path<i64>) -> impl IntoResponse {
     let ctx = crate::auth::get_user_ctx(&headers).await;
     let order_row = sqlx::query(
-        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, po.version, s.name as supplier_name
+        "SELECT po.id, po.supplier_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.status, po.remark, po.warehouse_id, po.warehouse_name, po.user_id, po.version, po.is_settled, s.name as supplier_name
          FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id WHERE po.id = ?"
     )
     .bind(id)
@@ -3914,6 +4004,7 @@ pub async fn api_purchase_order_detail(headers: axum::http::HeaderMap, Path(id):
         "warehouse_name": row.get::<Option<String>, _>("warehouse_name"),
         "status": row.get::<String, _>("status"),
         "version": row.get::<i64, _>("version"),
+        "is_settled": row.get::<i64, _>("is_settled"),
         "remark": row.get::<Option<String>, _>("remark"),
         "supplier_name": row.get::<String, _>("supplier_name"),
         "items": items,
@@ -4017,7 +4108,7 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     // 事务内做"主表 UPDATE + version 自增"：WHERE 同时校验 id 和 version。
     // 如果行不存在或 version 已被他人递增，rows_affected = 0 → 回滚事务 + 返回 409。
     let upd = sqlx::query(
-        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
+        "UPDATE purchase_order SET supplier_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, user_id = ?, handler_phone = ?, remark = ?, is_settled = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
     .bind(req.supplier_id)
     .bind(&req.order_no)
@@ -4031,6 +4122,7 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
     .bind(req.user_id.unwrap_or(0))
     .bind(&req.handler_phone.clone().unwrap_or_default())
     .bind(&req.remark)
+    .bind(req.is_settled.unwrap_or(0))
     .bind(req.id)
     .bind(ver)
     .execute(&mut *tx)
@@ -4205,6 +4297,51 @@ pub async fn api_purchase_order_delete(headers: axum::http::HeaderMap, Path(id):
     }
 }
 
+/// 设置采购订单结算状态（0=未结 1=已结），无需版本号，操作列直接调用
+pub async fn api_purchase_order_settle(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    match crate::auth::check_api_permission(&headers, "/api/purchase_order/settle").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+
+    let order = sqlx::query("SELECT supplier_id FROM purchase_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_supplier_id: i64 = order.get("supplier_id");
+    if !crate::auth::can_access_purchase_order(&ctx, order_supplier_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+
+    let is_settled: i64 = data["is_settled"].as_i64().unwrap_or(0);
+    if is_settled != 0 && is_settled != 1 {
+        return (StatusCode::BAD_REQUEST, "参数无效".to_string());
+    }
+
+    let result = sqlx::query("UPDATE purchase_order SET is_settled = ? WHERE id = ?")
+        .bind(is_settled)
+        .bind(id)
+        .execute(crate::db::pool())
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            let label = if is_settled == 1 { "已结" } else { "未结" };
+            crate::auth::log_operation(&ctx, "purchase_order.settle", "purchase_order", &id.to_string(),
+                &format!("设置采购单结算状态为「{}」", label)).await;
+            (StatusCode::OK, "操作成功".to_string())
+        }
+        _ => (StatusCode::CONFLICT, "订单不存在或状态已变化".to_string()),
+    }
+}
+
 pub async fn api_purchase_order_approve(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
     match crate::auth::check_api_permission(&headers, "/api/purchase_order/approve").await {
         Err(e) => return e,
@@ -4235,7 +4372,7 @@ pub async fn api_purchase_order_approve(headers: axum::http::HeaderMap, Path(id)
     }
 
     let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
-    let result = sqlx::query("UPDATE purchase_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
+    let result = sqlx::query("UPDATE purchase_order SET status = 'confirmed', is_settled = 1, version = version + 1 WHERE id = ? AND status = 'pending'")
         .bind(id)
         .execute(crate::db::pool())
         .await;
@@ -4284,9 +4421,9 @@ pub async fn api_purchase_order_unapprove(headers: axum::http::HeaderMap, Path(i
     }
 
     let update_sql = if is_super_admin {
-        "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ?"
+        "UPDATE purchase_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ?"
     } else {
-        "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
+        "UPDATE purchase_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ? AND status = 'confirmed'"
     };
     let result = sqlx::query(update_sql)
         .bind(id)
@@ -4847,7 +4984,7 @@ pub async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Pa
     }
 
     let order_row = sqlx::query(
-        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.version, so.remark, so.warehouse_id, so.warehouse_name, so.customer_order_image, so.signed_order_image, COALESCE(p.name, '') as purchaser_name
+        "SELECT so.id, so.purchaser_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.version, so.remark, so.warehouse_id, so.warehouse_name, so.customer_order_image, so.signed_order_image, so.supplier_company, so.truck_plate, so.is_settled, COALESCE(p.name, '') as purchaser_name
          FROM sales_order so LEFT JOIN purchaser p ON so.purchaser_id = p.id WHERE so.id = ?"
     )
     .bind(id)
@@ -4913,6 +5050,9 @@ pub async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Pa
         "remark": row.get::<Option<String>, _>("remark"),
         "customer_order_image": row.get::<Option<String>, _>("customer_order_image"),
         "signed_order_image": row.get::<Option<String>, _>("signed_order_image"),
+        "supplier_company": row.get::<Option<String>, _>("supplier_company"),
+        "truck_plate": row.get::<Option<String>, _>("truck_plate"),
+        "is_settled": row.get::<i64, _>("is_settled"),
         "purchaser_name": row.get::<String, _>("purchaser_name"),
         "items": items,
     });
@@ -4971,7 +5111,7 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
 
     // 事务内做"主表 UPDATE + version 自增"：WHERE 同时校验 id 和 version。
     let upd = sqlx::query(
-        "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ?, version = version + 1 WHERE id = ? AND version = ?"
+        "UPDATE sales_order SET purchaser_id = ?, order_no = ?, order_date = ?, total_amount = ?, discount_rate = ?, amount_reduction = ?, final_amount = ?, warehouse_id = ?, warehouse_name = ?, remark = ?, supplier_company = ?, truck_plate = ?, is_settled = ?, version = version + 1 WHERE id = ? AND version = ?"
     )
     .bind(req.purchaser_id)
     .bind(&req.order_no)
@@ -4983,6 +5123,9 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     .bind(req.warehouse_id)
     .bind(&req.warehouse_name)
     .bind(&req.remark)
+    .bind(req.supplier_company.as_deref().unwrap_or(""))
+    .bind(req.truck_plate.as_deref().unwrap_or(""))
+    .bind(req.is_settled.unwrap_or(0))
     .bind(req.id)
     .bind(ver)
     .execute(&mut *tx)
@@ -8600,6 +8743,158 @@ pub async fn api_query_profit_detail_export(axum::extract::Query(params): axum::
     xlsx_response(workbook.save_to_buffer().unwrap(), "毛利明细查询.xlsx")
 }
 
+/// 财务结算查询 API：合并采购/销售订单，返回应付/已付/未付/下浮/扣减统计
+pub async fn api_query_finance_settlement(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    let keyword = params.get("keyword").map(|s| s.as_str()).unwrap_or("");
+    let order_type = params.get("type").map(|s| s.as_str()).unwrap_or(""); // ""=全部, purchase=采购, sales=销售
+    let is_settled = params.get("is_settled").map(|s| s.as_str()).unwrap_or(""); // ""=全部, 0=未结, 1=已结
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let offset = (page - 1) * page_size;
+    let kw = format!("%{}%", keyword);
+
+    // 用 UNION ALL 合并采购/销售订单，统一字段名
+    // 应付 = total_amount, 下浮 = total_amount * discount_rate / 100, 扣减 = amount_reduction
+    let mut where_clauses = Vec::new();
+
+    // 日期筛选
+    if !start_date.is_empty() {
+        where_clauses.push(format!("order_date >= '{}'", start_date.replace('\'', "''")));
+    }
+    if !end_date.is_empty() {
+        where_clauses.push(format!("order_date <= '{}'", end_date.replace('\'', "''")));
+    }
+    // 关键字筛选
+    if !keyword.is_empty() {
+        where_clauses.push(format!("(order_no LIKE '{}' OR party_name LIKE '{}')", kw.replace('\'', "''"), kw.replace('\'', "''")));
+    }
+    // 结算状态筛选
+    if is_settled == "0" || is_settled == "1" {
+        where_clauses.push(format!("is_settled = {}", is_settled));
+    }
+
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
+
+    // 类型筛选：当 where_sql 为空时加 WHERE，否则用 AND
+    let type_filter = if order_type == "purchase" {
+        if where_sql.is_empty() { "WHERE order_type = 'purchase'".to_string() } else { "AND order_type = 'purchase'".to_string() }
+    } else if order_type == "sales" {
+        if where_sql.is_empty() { "WHERE order_type = 'sales'".to_string() } else { "AND order_type = 'sales'".to_string() }
+    } else {
+        String::new()
+    };
+
+    // 统计总数
+    let mut count_query = String::from(
+        "SELECT COUNT(*) as cnt FROM (
+            SELECT 'purchase' as order_type, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.is_settled, s.name as party_name
+            FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
+            UNION ALL
+            SELECT 'sales' as order_type, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.is_settled, p.name as party_name
+            FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
+        ) combined"
+    );
+    if !where_sql.is_empty() {
+        count_query.push(' ');
+        count_query.push_str(&where_sql);
+    }
+    if !type_filter.is_empty() {
+        count_query.push(' ');
+        count_query.push_str(&type_filter);
+    }
+    let total_rows: i64 = sqlx::query_scalar(AssertSqlSafe(count_query.as_str()))
+        .fetch_one(crate::db::pool())
+        .await
+        .unwrap_or(0);
+
+    // 查询数据
+    let mut data_query = String::from(
+        "SELECT * FROM (
+            SELECT 'purchase' as order_type, po.id as source_id, po.order_no, po.order_date, po.total_amount, po.discount_rate, po.amount_reduction, po.final_amount, po.is_settled, s.name as party_name, s.id as party_id
+            FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id
+            UNION ALL
+            SELECT 'sales' as order_type, so.id as source_id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.is_settled, p.name as party_name, p.id as party_id
+            FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
+        ) combined"
+    );
+    if !where_sql.is_empty() {
+        data_query.push(' ');
+        data_query.push_str(&where_sql);
+    }
+    if !type_filter.is_empty() {
+        data_query.push(' ');
+        data_query.push_str(&type_filter);
+    }
+    data_query.push_str(&format!(" ORDER BY order_date DESC, order_no DESC LIMIT {} OFFSET {}", page_size, offset));
+    let rows = sqlx::query(AssertSqlSafe(data_query.as_str()))
+        .fetch_all(crate::db::pool())
+        .await
+        .unwrap_or_default();
+
+    let mut orders: Vec<serde_json::Value> = Vec::new();
+    let mut sum_total = 0.0f64;
+    let mut sum_discount = 0.0f64;
+    let mut sum_reduction = 0.0f64;
+    let mut sum_paid = 0.0f64;
+    let mut sum_unpaid = 0.0f64;
+
+    for row in &rows {
+        let total_amount: f64 = row.get("total_amount");
+        let discount_rate: f64 = row.get("discount_rate");
+        let amount_reduction: f64 = row.get("amount_reduction");
+        let final_amount: f64 = row.get("final_amount");
+        let settled: i64 = row.get("is_settled");
+        let discount_amount = total_amount * discount_rate / 100.0;
+
+        let paid = if settled == 1 { final_amount } else { 0.0 };
+        let unpaid = if settled == 0 { final_amount } else { 0.0 };
+
+        sum_total += total_amount;
+        sum_discount += discount_amount;
+        sum_reduction += amount_reduction;
+        sum_paid += paid;
+        sum_unpaid += unpaid;
+
+        orders.push(serde_json::json!({
+            "order_type": row.get::<String, _>("order_type"),
+            "source_id": row.get::<i64, _>("source_id"),
+            "order_no": row.get::<String, _>("order_no"),
+            "order_date": row.get::<String, _>("order_date"),
+            "party_name": row.get::<String, _>("party_name"),
+            "total_amount": total_amount,
+            "discount_rate": discount_rate,
+            "discount_amount": (discount_amount * 100.0).round() / 100.0,
+            "amount_reduction": amount_reduction,
+            "final_amount": final_amount,
+            "is_settled": settled,
+            "paid_amount": (paid * 100.0).round() / 100.0,
+            "unpaid_amount": (unpaid * 100.0).round() / 100.0,
+        }));
+    }
+
+    let result = serde_json::json!({
+        "data": orders,
+        "page": page,
+        "page_size": page_size,
+        "total": total_rows,
+        "total_pages": (total_rows + page_size - 1) / page_size,
+        "summary": {
+            "total_amount": (sum_total * 100.0).round() / 100.0,
+            "discount_amount": (sum_discount * 100.0).round() / 100.0,
+            "reduction_amount": (sum_reduction * 100.0).round() / 100.0,
+            "paid_amount": (sum_paid * 100.0).round() / 100.0,
+            "unpaid_amount": (sum_unpaid * 100.0).round() / 100.0,
+        }
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
 pub async fn api_query_category_stats_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");
     let rows=sqlx::query("SELECT pc.id,pc.name as category_name,COALESCE((SELECT SUM(poi.quantity) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product pr ON poi.product_id=pr.id WHERE pr.category_id=pc.id AND po.order_date>=? AND po.order_date<=?),0) as purchase_quantity,COALESCE((SELECT SUM(poi.amount) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id=po.id JOIN product pr ON poi.product_id=pr.id WHERE pr.category_id=pc.id AND po.order_date>=? AND po.order_date<=?),0) as purchase_amount,COALESCE((SELECT SUM(soi.quantity) FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product pr ON soi.product_id=pr.id WHERE pr.category_id=pc.id AND so.order_date>=? AND so.order_date<=?),0) as sales_quantity,COALESCE((SELECT SUM(soi.amount) FROM sales_order_item soi JOIN sales_order so ON soi.order_id=so.id JOIN product pr ON soi.product_id=pr.id WHERE pr.category_id=pc.id AND so.order_date>=? AND so.order_date<=?),0) as sales_amount,COALESCE((SELECT SUM(i.quantity) FROM inventory i JOIN product pr ON i.product_id=pr.id WHERE pr.category_id=pc.id),0) as stock_quantity,COALESCE((SELECT SUM(i.quantity*pr.selling_price) FROM inventory i JOIN product pr ON i.product_id=pr.id WHERE pr.category_id=pc.id),0) as stock_amount FROM category pc WHERE pc.entity_type='product' AND pc.parent_id IS NULL ORDER BY pc.id")
@@ -8667,7 +8962,7 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
     }
 
     let result = sqlx::query(
-        "INSERT INTO sales_order(purchaser_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO sales_order(purchaser_id, order_no, order_date, total_amount, discount_rate, amount_reduction, final_amount, warehouse_id, warehouse_name, remark, supplier_company, truck_plate, is_settled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(req.purchaser_id)
     .bind(&req.order_no)
@@ -8679,6 +8974,9 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
     .bind(req.warehouse_id)
     .bind(&req.warehouse_name)
     .bind(&req.remark)
+    .bind(req.supplier_company.as_deref().unwrap_or(""))
+    .bind(req.truck_plate.as_deref().unwrap_or(""))
+    .bind(req.is_settled.unwrap_or(0))
     .execute(crate::db::pool())
     .await;
     
@@ -8756,51 +9054,86 @@ pub async fn api_sales_order_list(headers: axum::http::HeaderMap, axum::extract:
         _ => format!("so.id {}", sort_order),
     };
     
-    let (total_sql, total_params) = if let Some(pid) = purchaser_id {
-        (
-            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+    let is_settled_filter: Option<String> = match params.get("is_settled").map(|s| s.as_str()) {
+        Some("0") | Some("1") => params.get("is_settled").cloned(),
+        _ => None,
+    };
+
+    let (total_sql, total_params) = match (purchaser_id, is_settled_filter.as_ref()) {
+        (Some(pid), Some(isf)) => (
+            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
+             WHERE so.purchaser_id = ? AND so.is_settled = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)",
+            vec![pid.to_string(), isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (Some(pid), None) => (
+            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
              WHERE so.purchaser_id = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)",
             vec![pid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
-    } else {
-        (
-            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+        ),
+        (None, Some(isf)) => (
+            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
+             WHERE so.is_settled = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)",
+            vec![isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (None, None) => (
+            "SELECT COUNT(*) as count FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
              WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?",
             vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
+        ),
     };
-    
+
     let mut total_query = sqlx::query(total_sql);
     for p in &total_params {
         total_query = total_query.bind(p);
     }
     let total_rows = total_query.fetch_one(crate::db::pool()).await.unwrap();
     let total: i64 = total_rows.get("count");
-    
-    let (sql, query_params) = if let Some(pid) = purchaser_id {
-        (
+
+    let (sql, query_params) = match (purchaser_id, is_settled_filter.as_ref()) {
+        (Some(pid), Some(isf)) => (
             format!(
-                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name,
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.is_settled, p.name as purchaser_name,
                         (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
-                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
+                 WHERE so.purchaser_id = ? AND so.is_settled = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![pid.to_string(), isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (Some(pid), None) => (
+            format!(
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.is_settled, p.name as purchaser_name,
+                        (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
+                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
                  WHERE so.purchaser_id = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)
                  ORDER BY {} LIMIT ? OFFSET ?",
                 order_clause
             ),
             vec![pid.to_string(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
-    } else {
-        (
+        ),
+        (None, Some(isf)) => (
             format!(
-                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, p.name as purchaser_name,
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.is_settled, p.name as purchaser_name,
                         (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
-                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id 
+                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
+                 WHERE so.is_settled = ? AND (so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?)
+                 ORDER BY {} LIMIT ? OFFSET ?",
+                order_clause
+            ),
+            vec![isf.clone(), keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
+        ),
+        (None, None) => (
+            format!(
+                "SELECT so.id, so.order_no, so.order_date, so.total_amount, so.discount_rate, so.amount_reduction, so.final_amount, so.status, so.remark, so.warehouse_id, so.warehouse_name, so.is_settled, p.name as purchaser_name,
+                        (SELECT COUNT(*) FROM order_supplement_item osi WHERE osi.target_order_id = so.id) as supplement_count
+                 FROM sales_order so JOIN purchaser p ON so.purchaser_id = p.id
                  WHERE so.order_no LIKE ? OR p.name LIKE ? OR so.order_date LIKE ?
                  ORDER BY {} LIMIT ? OFFSET ?",
                 order_clause
             ),
             vec![keyword_pattern.clone(), keyword_pattern.clone(), keyword_pattern.clone()]
-        )
+        ),
     };
     
     let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
@@ -8826,6 +9159,7 @@ pub async fn api_sales_order_list(headers: axum::http::HeaderMap, axum::extract:
             "remark": row.get::<Option<String>, _>("remark"),
             "purchaser_name": row.get::<String, _>("purchaser_name"),
             "is_reimburse": row.get::<i64, _>("supplement_count") > 0,
+            "is_settled": row.get::<i64, _>("is_settled"),
         }))
         .collect();
     
@@ -9848,7 +10182,7 @@ pub async fn api_sales_order_accept_excel(
         Err(e) => return e.into_response(),
         Ok(_) => {}
     }
-    build_accept_excel(id, true, force).await.into_response()
+    build_accept_excel(&headers, id, true, force).await.into_response()
 }
 
 pub async fn api_sales_order_real_excel(
@@ -9861,7 +10195,7 @@ pub async fn api_sales_order_real_excel(
         Err(e) => return e.into_response(),
         Ok(_) => {}
     }
-    build_accept_excel(id, false, force).await.into_response()
+    build_accept_excel(&headers, id, false, force).await.into_response()
 }
 
 pub async fn api_sales_order_sort_items(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
@@ -11234,6 +11568,310 @@ pub async fn api_product_today_price_excel(
     }
 }
 
+// ===== 今日进价采集·A4 打印页 =====
+// 按供应商分组，A4 纵向三栏排版（每栏四列：序号/品名规格/单位/今日价，栏间空一列，共 14 列），左边距 1cm
+pub async fn api_product_today_price_a4(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 今日进价采集仅超级管理员可用
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+    if ctx.role != "super_admin" {
+        return (StatusCode::FORBIDDEN, serde_json::json!({ "success": false, "message": "只有超级管理员可以使用今日进价采集" }).to_string()).into_response();
+    }
+    let date = params.get("date").cloned().unwrap_or_default().trim().to_string();
+    let has_date = !date.is_empty();
+    // print_values=1：今日价列显示最近价（purchase_price）；=0：留空手写
+    let print_values = matches!(
+        params.get("print_values").map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    let where_sql = if has_date {
+        "WHERE so.order_date = ?"
+    } else {
+        "WHERE so.status IN ('pending', 'sorting')"
+    };
+    let sql = format!(
+        "SELECT soi.product_id, MAX(soi.product_name) as product_name, MAX(COALESCE(soi.spec,'')) as spec,
+                MAX(soi.supplier_id) as supplier_id, MAX(s.name) as supplier_name,
+                MAX(p.base_unit) as base_unit,
+                MAX(p.purchase_price) as purchase_price,
+                MAX(p.max_purchase_price) as max_purchase_price,
+                MAX(p.min_purchase_price) as min_purchase_price,
+                SUM(soi.quantity) as total_qty
+         FROM sales_order_item soi
+         LEFT JOIN sales_order so ON soi.order_id = so.id
+         LEFT JOIN supplier s ON soi.supplier_id = s.id
+         LEFT JOIN product p ON soi.product_id = p.id
+         {} AND soi.product_id > 0
+         GROUP BY soi.supplier_id, soi.product_id
+         ORDER BY MAX(s.name), MAX(soi.product_name)", where_sql
+    );
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+    if has_date {
+        q = q.bind(&date);
+    }
+    let rows = q.fetch_all(crate::db::pool()).await.unwrap_or_default();
+
+    // 供应商 → 商品去重结果（与采集页数据一致）
+    let mut supplier_map: std::collections::HashMap<i64, (String, Vec<serde_json::Value>)> = std::collections::HashMap::new();
+    for r in &rows {
+        let supplier_id = r.get::<i64, _>("supplier_id");
+        let supplier_name = r.get::<Option<String>, _>("supplier_name").unwrap_or_else(|| {
+            if supplier_id == 0 { "未分配供应商".to_string() } else { format!("供应商{}", supplier_id) }
+        });
+        let item = serde_json::json!({
+            "product_id": r.get::<i64, _>("product_id"),
+            "product_name": r.get::<Option<String>, _>("product_name").unwrap_or_default(),
+            "spec": r.get::<Option<String>, _>("spec").unwrap_or_default(),
+            "base_unit": r.get::<Option<String>, _>("base_unit").unwrap_or_default(),
+            "total_qty": r.get::<Option<f64>, _>("total_qty").unwrap_or(0.0),
+            "purchase_price": r.get::<Option<f64>, _>("purchase_price").unwrap_or(0.0),
+            "max_purchase_price": r.get::<Option<f64>, _>("max_purchase_price").unwrap_or(0.0),
+            "min_purchase_price": r.get::<Option<f64>, _>("min_purchase_price").unwrap_or(0.0),
+        });
+        let entry = supplier_map.entry(supplier_id).or_insert_with(|| (supplier_name.clone(), Vec::new()));
+        entry.1.push(item);
+    }
+
+    // 供应商按名称排序
+    let mut supplier_list: Vec<(i64, String, Vec<serde_json::Value>)> = supplier_map
+        .into_iter()
+        .map(|(sid, (sname, sitems))| (sid, sname, sitems))
+        .collect();
+    supplier_list.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let display_date = if has_date { date.clone() } else { Local::now().format("%Y-%m-%d").to_string() };
+
+    // A4 三栏排版：14 列 = 3 个大栏（每栏 4 列：序号/品名规格/单位/今日价）+ 2 个间隔列。
+    // 供应商分组排列，每栏可容纳多家供应商（按名称排序依次填充），序号按栏竖向从 1 递增。
+    // 每栏有固定行容量，放不下时切到下一栏；超过 3 栏则分 sheet（每 sheet 一页 A4）。
+    // 每栏行容量：A4 纵向一页（标题28+日期16+表头22≈66pt，内容行18pt）
+    // 可打印高度 ≈ 799pt，40 行内容可完整落在一页内
+    const MAX_ROWS_PER_COL: usize = 40;
+    const COL_BASE: [u16; 3] = [0, 5, 10];
+
+    let excel_result: Result<Vec<u8>, XlsxError> = (|| {
+        let mut workbook = Workbook::new();
+
+        let title_format = Format::new()
+            .set_bold()
+            .set_font_size(14)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter);
+
+        let date_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter);
+
+        let header_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+
+        let supplier_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin)
+            .set_background_color("#FDE68A");
+
+        let cell_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+
+        let cell_left_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+
+        let cell_right_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+
+        // 展平商品（保留供应商分组，供应商已按名称排序）
+        struct FlatItem {
+            supplier: String,
+            name_spec: String,
+            base_unit: String,
+            /// print_values=1 时为价格，否则为 None（今日价留空手写）
+            price: Option<f64>,
+        }
+        let mut flat: Vec<FlatItem> = Vec::new();
+        for (_sid, sname, items) in &supplier_list {
+            for it in items {
+                let name = it["product_name"].as_str().unwrap_or("");
+                let spec = it["spec"].as_str().unwrap_or("");
+                let name_spec = if spec.is_empty() { name.to_string() } else { format!("{} {}", name, spec) };
+                let price = if print_values {
+                    let raw = it["purchase_price"].as_f64().unwrap_or(0.0);
+                    Some((raw * 100.0).round() / 100.0)
+                } else {
+                    None
+                };
+                flat.push(FlatItem {
+                    supplier: sname.clone(),
+                    name_spec,
+                    base_unit: it["base_unit"].as_str().unwrap_or("").to_string(),
+                    price,
+                });
+            }
+        }
+
+        if flat.is_empty() {
+            let worksheet = workbook.add_worksheet();
+            worksheet.set_name("无数据")?;
+            worksheet.merge_range(0, 0, 0, 13, "暂无采购数据", &title_format)?;
+            let buf = workbook.save_to_buffer()?;
+            return Ok(buf);
+        }
+
+        // 按供应商分组切块（保持供应商名称排序）；单供应商超过栏容量时拆成多块，
+        // 每块最多 MAX_ROWS_PER_COL-1 个商品（留 1 行给供应商标题），避免单栏溢出分页
+        let mut blocks: Vec<(String, Vec<&FlatItem>)> = Vec::new();
+        for it in &flat {
+            if let Some(last) = blocks.last_mut() {
+                if last.0 == it.supplier {
+                    last.1.push(it);
+                    continue;
+                }
+            }
+            blocks.push((it.supplier.clone(), vec![it]));
+        }
+        let mut split_blocks: Vec<(String, Vec<&FlatItem>)> = Vec::new();
+        for (sname, items) in blocks {
+            for chunk in items.chunks(MAX_ROWS_PER_COL - 1) {
+                split_blocks.push((sname.clone(), chunk.to_vec()));
+            }
+        }
+
+        // 把供应商块分配到"栏"：每栏容量 MAX_ROWS_PER_COL（含供应商标题行），放不下切下一栏；满 3 栏则分页
+        let mut pages: Vec<Vec<(String, Vec<&FlatItem>, u16)>> = Vec::new(); // 每页一组块，元素 (供应商名, 商品, 栏起始列)
+        let mut cur_page: Vec<(String, Vec<&FlatItem>, u16)> = Vec::new();
+        let mut col_index = 0usize;
+        let mut rows_used = 0usize;
+
+        for (sname, items) in split_blocks {
+            let need = 1 + items.len(); // 供应商标题行 + 商品行
+            if rows_used > 0 && rows_used + need > MAX_ROWS_PER_COL {
+                col_index += 1;
+                rows_used = 0;
+                if col_index >= 3 {
+                    pages.push(std::mem::take(&mut cur_page));
+                    col_index = 0;
+                }
+            }
+            cur_page.push((sname.clone(), items, COL_BASE[col_index]));
+            rows_used += need;
+            if rows_used >= MAX_ROWS_PER_COL {
+                col_index += 1;
+                rows_used = 0;
+                if col_index >= 3 {
+                    pages.push(std::mem::take(&mut cur_page));
+                    col_index = 0;
+                }
+            }
+        }
+        if !cur_page.is_empty() {
+            pages.push(cur_page);
+        }
+
+        for (page_idx, blocks_in_sheet) in pages.iter().enumerate() {
+            let worksheet = workbook.add_worksheet();
+            worksheet.set_name(format!("第{}页", page_idx + 1).as_str())?;
+
+            // A4 纵向、左边距 1cm（约 0.394 英寸），其余边距 0.5cm
+            worksheet.set_portrait();
+            worksheet.set_paper_size(9); // A4 paper size
+            worksheet.set_margins(0.394, 0.2, 0.2, 0.2, 0.2, 0.2);
+            worksheet.set_print_center_horizontally(false);
+            worksheet.set_header("");
+            worksheet.set_footer("&C第 &P 页，共 &N 页");
+
+            // 列宽：每栏 [序号2.5, 品名规格13, 单位4.5, 今日价6.5]，间隔列1.2，总计 14 列
+            let col_widths = [2.5, 13.0, 4.5, 6.5, 1.2, 2.5, 13.0, 4.5, 6.5, 1.2, 2.5, 13.0, 4.5, 6.5];
+            for (i, w) in col_widths.iter().enumerate() {
+                worksheet.set_column_width(i as u16, *w)?;
+            }
+
+            // 标题 + 日期
+            worksheet.merge_range(0, 0, 0, 13, "今日进价采集清单", &title_format)?;
+            worksheet.set_row_height(0, 28)?;
+            worksheet.merge_range(1, 0, 1, 13, display_date.as_str(), &date_format)?;
+            worksheet.set_row_height(1, 16)?;
+
+            // 表头（3 组，组间空一列）
+            let headers = ["序号", "品名规格", "单位", "今日价"];
+            for base in COL_BASE.iter() {
+                for (hi, h) in headers.iter().enumerate() {
+                    worksheet.write_with_format(2, base + hi as u16, *h, &header_format)?;
+                }
+            }
+            worksheet.set_row_height(2, 22)?;
+
+            // 每栏从第 3 行开始独立向下填充，栏内序号连续递增
+            for col_idx in 0..3usize {
+                let base = COL_BASE[col_idx];
+                let col_blocks: Vec<&(String, Vec<&FlatItem>, u16)> = blocks_in_sheet.iter().filter(|b| b.2 == base).collect();
+                if col_blocks.is_empty() {
+                    continue;
+                }
+                let mut row = 3u32;
+                for (sname, items, _b) in col_blocks {
+                    worksheet.merge_range(row, base, row, base + 3, sname.as_str(), &supplier_format)?;
+                    worksheet.set_row_height(row, 18)?;
+                    row += 1;
+                    // 序号按供应商分组重新从 1 编号
+                    let mut seq = 1i64;
+                    for it in items {
+                        worksheet.write_with_format(row, base, seq as f64, &cell_format)?;
+                        worksheet.write_with_format(row, base + 1, it.name_spec.as_str(), &cell_left_format)?;
+                        worksheet.write_with_format(row, base + 2, it.base_unit.as_str(), &cell_format)?;
+                        match it.price {
+                            Some(p) => { worksheet.write_with_format(row, base + 3, p, &cell_right_format)?; }
+                            None => { worksheet.write_with_format(row, base + 3, "", &cell_right_format)?; }
+                        }
+                        worksheet.set_row_height(row, 18)?;
+                        row += 1;
+                        seq += 1;
+                    }
+                }
+            }
+        }
+
+        let buf = workbook.save_to_buffer()?;
+        Ok(buf)
+    })();
+
+    match excel_result {
+        Ok(buf) => {
+            let filename = if has_date {
+                format!("今日进价采集清单_A4_{}.xlsx", date)
+            } else {
+                "今日进价采集清单_A4.xlsx".to_string()
+            };
+            let headers = [
+                ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                ("Content-Disposition", &format!("attachment; filename=\"{}\"", filename)),
+            ];
+            (StatusCode::OK, headers, buf).into_response()
+        }
+        Err(e) => {
+            eprintln!("今日进价采集A4导出失败: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "导出失败").into_response()
+        }
+    }
+}
+
 // ===== 今日进价采集·按商品分类导出 =====
 // 去除采购单位/仓库/供应商分组，按商品分类排序，便于整体采集当日进价
 pub async fn api_product_today_price_excel_by_category(
@@ -12166,6 +12804,51 @@ pub async fn api_sales_order_sort_comprehensive_excel(
     }
 }
 
+/// 设置销售订单结算状态（0=未结 1=已结），操作列直接调用
+pub async fn api_sales_order_settle(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
+    match crate::auth::check_api_permission(&headers, "/api/sales_order/settle").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+
+    let order = sqlx::query("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .ok()
+        .flatten();
+    let order = match order {
+        Some(o) => o,
+        None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
+    };
+    let order_purchaser_id: i64 = order.get("purchaser_id");
+    if !crate::auth::can_access_sales_order(&ctx, order_purchaser_id) {
+        return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+
+    let is_settled: i64 = data["is_settled"].as_i64().unwrap_or(0);
+    if is_settled != 0 && is_settled != 1 {
+        return (StatusCode::BAD_REQUEST, "参数无效".to_string());
+    }
+
+    let result = sqlx::query("UPDATE sales_order SET is_settled = ? WHERE id = ?")
+        .bind(is_settled)
+        .bind(id)
+        .execute(crate::db::pool())
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            let label = if is_settled == 1 { "已结" } else { "未结" };
+            crate::auth::log_operation(&ctx, "sales_order.settle", "sales_order", &id.to_string(),
+                &format!("设置销售单结算状态为「{}」", label)).await;
+            (StatusCode::OK, "操作成功".to_string())
+        }
+        _ => (StatusCode::CONFLICT, "订单不存在或状态已变化".to_string()),
+    }
+}
+
 pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(req): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     match crate::auth::check_api_permission(&headers, "/api/sales_order/update_status").await {
         Err(e) => return e,
@@ -12183,7 +12866,7 @@ pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(
     let id = id.unwrap();
     let new_status = new_status.unwrap();
     
-    let valid_statuses = vec!["pending", "confirmed", "sorting", "sorted", "delivering", "delivered", "accepted", "settled"];
+    let valid_statuses = vec!["pending", "confirmed", "sorting", "sorted", "delivering", "delivered", "accepted"];
     if !valid_statuses.contains(&new_status.as_str()) {
         return (StatusCode::BAD_REQUEST, "无效状态".to_string());
     }
@@ -12215,8 +12898,7 @@ pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(
         "sorted" => vec!["sorting", "delivering"],
         "delivering" => vec!["sorted", "delivered"],
         "delivered" => vec!["delivering", "accepted"],
-        "accepted" => vec!["delivered", "settled"],
-        "settled" => vec!["accepted"],
+        "accepted" => vec!["delivered"],
         _ => vec![],
     };
     
@@ -12275,7 +12957,7 @@ pub async fn api_sales_order_approve(headers: axum::http::HeaderMap, Path(id): P
     }
 
     let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
-    let result = sqlx::query("UPDATE sales_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
+    let result = sqlx::query("UPDATE sales_order SET status = 'confirmed', is_settled = 1, version = version + 1 WHERE id = ? AND status = 'pending'")
         .bind(id)
         .execute(crate::db::pool())
         .await;
@@ -12324,9 +13006,9 @@ pub async fn api_sales_order_unapprove(headers: axum::http::HeaderMap, Path(id):
     }
 
     let update_sql = if is_super_admin {
-        "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ?"
+        "UPDATE sales_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ?"
     } else {
-        "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
+        "UPDATE sales_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ? AND status = 'confirmed'"
     };
     let result = sqlx::query(update_sql)
         .bind(id)

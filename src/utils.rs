@@ -233,6 +233,9 @@ pub fn sidebar_html() -> String {
                                 <li class="tree-node leaf" data-path="/query/profit_detail">
                                     <a href="/query/profit_detail"><span class="node-icon">📊</span><span class="node-label">毛利明细查询</span></a>
                                 </li>
+                                <li class="tree-node leaf" data-path="/query/finance_settlement">
+                                    <a href="/query/finance_settlement"><span class="node-icon">💰</span><span class="node-label">财务结算查询</span></a>
+                                </li>
                             </ul>
                         </li>
                         <li class="tree-node folder" data-path="query-report" data-role="admin">
