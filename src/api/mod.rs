@@ -21,6 +21,28 @@ use crate::check_sales_order_access;
 use crate::build_accept_excel;
 use serde_json;
 use sqlx::{AssertSqlSafe, Row};
+
+/// 清理写入 Excel 的字符串：去除 NUL/控制字符（rust_xlsxwriter 内部以 C 字符串写入，
+/// 含 NUL 或异常控制字符会导致进程级 panic）。同时将超长名称截断到合理长度。
+pub fn sanitize_xlsx_string(s: String) -> String {
+    const MAX_LEN: usize = 200;
+    let cleaned: String = s
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            // 保留可打印 ASCII、常见中文/Unicode 范围；过滤 NUL 与其他控制字符
+            code >= 0x20 || code == 0x09 // 允许 tab
+        })
+        .collect();
+    if cleaned.chars().count() > MAX_LEN {
+        let mut out: String = cleaned.chars().take(MAX_LEN).collect();
+        out.push('…');
+        out
+    } else {
+        cleaned
+    }
+}
+
 pub async fn api_system_config(Json(data): Json<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     for (key, value) in data {
         sqlx::query("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)")
@@ -4305,7 +4327,7 @@ pub async fn api_purchase_order_settle(headers: axum::http::HeaderMap, Path(id):
     }
     let ctx = crate::auth::get_user_ctx(&headers).await;
 
-    let order = sqlx::query("SELECT supplier_id FROM purchase_order WHERE id = ?")
+    let order = sqlx::query("SELECT supplier_id, status FROM purchase_order WHERE id = ?")
         .bind(id)
         .fetch_optional(crate::db::pool())
         .await
@@ -4316,8 +4338,13 @@ pub async fn api_purchase_order_settle(headers: axum::http::HeaderMap, Path(id):
         None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
     };
     let order_supplier_id: i64 = order.get("supplier_id");
+    let order_status: String = order.get("status");
     if !crate::auth::can_access_purchase_order(&ctx, order_supplier_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    // 审核后需先反审核
+    if order_status != "pending" {
+        return (StatusCode::CONFLICT, "该单据已审核，需先反审核后才能修改结算状态".to_string());
     }
 
     let is_settled: i64 = data["is_settled"].as_i64().unwrap_or(0);
@@ -4372,7 +4399,7 @@ pub async fn api_purchase_order_approve(headers: axum::http::HeaderMap, Path(id)
     }
 
     let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
-    let result = sqlx::query("UPDATE purchase_order SET status = 'confirmed', is_settled = 1, version = version + 1 WHERE id = ? AND status = 'pending'")
+    let result = sqlx::query("UPDATE purchase_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
         .bind(id)
         .execute(crate::db::pool())
         .await;
@@ -4421,9 +4448,9 @@ pub async fn api_purchase_order_unapprove(headers: axum::http::HeaderMap, Path(i
     }
 
     let update_sql = if is_super_admin {
-        "UPDATE purchase_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ?"
+        "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ?"
     } else {
-        "UPDATE purchase_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ? AND status = 'confirmed'"
+        "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
     };
     let result = sqlx::query(update_sql)
         .bind(id)
@@ -10221,7 +10248,7 @@ pub async fn api_sales_order_sort_items(axum::extract::Query(params): axum::extr
     let rows = q.fetch_all(crate::db::pool())
     .await
     .unwrap_or_default();
-    
+
     let mut items_map: std::collections::HashMap<i64, serde_json::Value> = std::collections::HashMap::new();
     
     for r in &rows {
@@ -10508,12 +10535,13 @@ pub async fn api_sales_order_sort_items_by_category(
     let rows = q.fetch_all(crate::db::pool())
     .await
     .unwrap_or_default();
-    
+    eprintln!("sort_by_category_excel rows={}, date='{}', has_date={}", rows.len(), date, has_date);
+
     let mut category_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
     
     for r in &rows {
-        let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_else(|| "未分类".to_string());
-        let purchaser_name = r.get::<String, _>("purchaser_name");
+        let category_name = sanitize_xlsx_string(r.get::<Option<String>, _>("category_name").unwrap_or_else(|| "未分类".to_string()));
+        let purchaser_name = sanitize_xlsx_string(r.get::<String, _>("purchaser_name"));
         
         let purchaser_map = category_map.entry(category_name).or_insert_with(std::collections::HashMap::new);
         let purchaser_items = purchaser_map.entry(purchaser_name).or_insert_with(Vec::new);
@@ -10568,7 +10596,7 @@ pub async fn api_sales_order_sort_items_by_category_excel(
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
+        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
@@ -10584,25 +10612,25 @@ pub async fn api_sales_order_sort_items_by_category_excel(
     let rows = q.fetch_all(crate::db::pool())
     .await
     .unwrap_or_default();
-    
+
     let mut category_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
-    
+
     for r in &rows {
-        let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_else(|| "未分类".to_string());
-        let purchaser_name = r.get::<String, _>("purchaser_name");
-        
+        let category_name = sanitize_xlsx_string(r.get::<Option<String>, _>("category_name").unwrap_or_else(|| "未分类".to_string()));
+        let purchaser_name = sanitize_xlsx_string(r.get::<String, _>("purchaser_name"));
+
         let purchaser_map = category_map.entry(category_name).or_insert_with(std::collections::HashMap::new);
         let purchaser_items = purchaser_map.entry(purchaser_name).or_insert_with(Vec::new);
-        
+
         purchaser_items.push(serde_json::json!({
             "product_id": r.get::<i64, _>("product_id"),
-            "product_name": r.get::<String, _>("product_name"),
-            "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
+            "product_name": sanitize_xlsx_string(r.get::<String, _>("product_name")),
+            "unit": sanitize_xlsx_string(r.get::<Option<String>, _>("unit").unwrap_or_default()),
             "quantity": r.get::<f64, _>("quantity"),
             "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
             "amount": r.get::<Option<f64>, _>("amount").unwrap_or(0.0),
-            "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
-            "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
+            "remark": sanitize_xlsx_string(r.get::<Option<String>, _>("remark").unwrap_or_default()),
+            "order_no": sanitize_xlsx_string(r.get::<Option<String>, _>("order_no").unwrap_or_default()),
         }));
     }
     
@@ -10629,7 +10657,8 @@ pub async fn api_sales_order_sort_items_by_category_excel(
     
     result.sort_by(|a, b| a["category_name"].as_str().unwrap_or("").cmp(b["category_name"].as_str().unwrap_or("")));
 
-    let excel_result: Result<Vec<u8>, XlsxError> = (|| {
+    // 用 catch_unwind 包裹 Excel 构建过程，避免单个坏数据导致整个进程 panic 崩溃
+    let build_excel = || -> Result<Vec<u8>, XlsxError> {
         let mut workbook = Workbook::new();
         let worksheet = workbook.add_worksheet();
 
@@ -10796,21 +10825,28 @@ pub async fn api_sales_order_sort_items_by_category_excel(
 
         let buf = workbook.save_to_buffer()?;
         Ok(buf)
-    })();
+    };
+    let excel_result: Result<Vec<u8>, String> = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_excel)) {
+        Ok(r) => r.map_err(|e| format!("{:?}", e)),
+        Err(p) => Err(format!("Excel 构建 panic: {:?}", p)),
+    };
 
-    match excel_result {
-        Ok(buf) => {
-            let headers = [
-                ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-                ("Content-Disposition", "attachment; filename=\"采购分拣清单_按分类.xlsx\""),
-            ];
-            (StatusCode::OK, headers, buf).into_response()
-        }
+    let buf: Vec<u8> = match excel_result {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("Excel export error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "导出失败").into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "导出失败").into_response();
         }
+    };
+    if buf.is_empty() {
+        eprintln!("Excel export empty buffer (rows likely empty)");
+        return (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], "{\"ok\":true,\"empty\":true,\"msg\":\"当日暂无分拣数据\"}").into_response();
     }
+    let headers = [
+        ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("Content-Disposition", "attachment; filename=\"purchase_sort_by_category.xlsx\""),
+    ];
+    (StatusCode::OK, headers, buf).into_response()
 }
 
 pub async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
@@ -10903,11 +10939,13 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
     };
     let sql = format!(
         "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
-                soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
-         FROM sales_order_item soi 
+                soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no,
+                COALESCE(pr.purchase_price, 0.0) as purchase_price
+         FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
+         LEFT JOIN product pr ON soi.product_id = pr.id
          {}
          ORDER BY s.name, p.name, soi.product_name, so.id, soi.id", where_sql
     );
@@ -10918,24 +10956,25 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
     let mut supplier_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
     
     for r in &rows {
-        let supplier_name = r.get::<Option<String>, _>("supplier_name").unwrap_or_else(|| {
+        let supplier_name = sanitize_xlsx_string(r.get::<Option<String>, _>("supplier_name").unwrap_or_else(|| {
             let supplier_id = r.get::<i64, _>("supplier_id");
             if supplier_id == 0 { "未分配供应商".to_string() } else { format!("供应商{}", supplier_id) }
-        });
-        let purchaser_name = r.get::<String, _>("purchaser_name");
-        
+        }));
+        let purchaser_name = sanitize_xlsx_string(r.get::<String, _>("purchaser_name"));
+
         let purchaser_map = supplier_map.entry(supplier_name).or_insert_with(std::collections::HashMap::new);
         let purchaser_items = purchaser_map.entry(purchaser_name).or_insert_with(Vec::new);
-        
+
         purchaser_items.push(serde_json::json!({
             "product_id": r.get::<i64, _>("product_id"),
-            "product_name": r.get::<String, _>("product_name"),
-            "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
+            "product_name": sanitize_xlsx_string(r.get::<String, _>("product_name")),
+            "unit": sanitize_xlsx_string(r.get::<Option<String>, _>("unit").unwrap_or_default()),
             "quantity": r.get::<f64, _>("quantity"),
             "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
             "amount": r.get::<Option<f64>, _>("amount").unwrap_or(0.0),
-            "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
-            "order_no": r.get::<Option<String>, _>("order_no").unwrap_or_default(),
+            "unit_price": r.get::<Option<f64>, _>("purchase_price").unwrap_or(0.0),
+            "remark": sanitize_xlsx_string(r.get::<Option<String>, _>("remark").unwrap_or_default()),
+            "order_no": sanitize_xlsx_string(r.get::<Option<String>, _>("order_no").unwrap_or_default()),
         }));
     }
     
@@ -10962,7 +11001,8 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
     
     result.sort_by(|a, b| a["supplier_name"].as_str().unwrap_or("").cmp(b["supplier_name"].as_str().unwrap_or("")));
 
-    let excel_result: Result<Vec<u8>, XlsxError> = (|| {
+    // 用 catch_unwind 包裹 Excel 构建过程，避免单个坏数据导致整个进程 panic 崩溃
+    let build_excel = || -> Result<Vec<u8>, XlsxError> {
         let mut workbook = Workbook::new();
 
         let title_format = Format::new()
@@ -11138,7 +11178,8 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
                                     worksheet.write_with_format(current_row, 3, pre_sale_quantity, &cell_format)?;
                                     if print_values {
                                         worksheet.write_with_format(current_row, 4, quantity, &cell_format)?;
-                                        let unit_price = if quantity != 0.0 { amount / quantity } else { 0.0 };
+                                        // 单价列：使用基础单位的进价（来自 product.purchase_price），而不是售价
+                                        let unit_price = item["unit_price"].as_f64().unwrap_or(0.0);
                                         worksheet.write_with_format(current_row, 5, unit_price, &cell_format)?;
                                         worksheet.write_with_format(current_row, 6, amount, &cell_right_format)?;
                                     } else {
@@ -11187,7 +11228,11 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
 
         let buf = workbook.save_to_buffer()?;
         Ok(buf)
-    })();
+    };
+    let excel_result: Result<Vec<u8>, String> = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_excel)) {
+        Ok(r) => r.map_err(|e| format!("{:?}", e)),
+        Err(p) => Err(format!("Excel 构建 panic: {:?}", p)),
+    };
 
     match excel_result {
         Ok(buf) => {
@@ -12812,7 +12857,7 @@ pub async fn api_sales_order_settle(headers: axum::http::HeaderMap, Path(id): Pa
     }
     let ctx = crate::auth::get_user_ctx(&headers).await;
 
-    let order = sqlx::query("SELECT purchaser_id FROM sales_order WHERE id = ?")
+    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
         .bind(id)
         .fetch_optional(crate::db::pool())
         .await
@@ -12823,8 +12868,13 @@ pub async fn api_sales_order_settle(headers: axum::http::HeaderMap, Path(id): Pa
         None => return (StatusCode::NOT_FOUND, "订单不存在".to_string()),
     };
     let order_purchaser_id: i64 = order.get("purchaser_id");
+    let order_status: String = order.get("status");
     if !crate::auth::can_access_sales_order(&ctx, order_purchaser_id) {
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
+    }
+    // 审核后需先反审核
+    if order_status != "pending" {
+        return (StatusCode::CONFLICT, "该单据已审核，需先反审核后才能修改结算状态".to_string());
     }
 
     let is_settled: i64 = data["is_settled"].as_i64().unwrap_or(0);
@@ -12889,11 +12939,10 @@ pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(
         return (StatusCode::FORBIDDEN, "您没有权限操作此订单".to_string());
     }
     
-    // 状态机：待审核 → 已审核 → 分拣中 → 已分拣 → 配送中 → 已送达 → 已验收 → 已结算
-    // confirmed（已审核）为锁定态，允许反审核回 pending 或进入分拣
+    // 状态机：待审核 → 已审核 → 已验收（审核后直接确认验收，分拣/配送/送达节点合并）
     let allowed_transitions = match current_status.as_str() {
         "pending" => vec!["confirmed", "sorting"],
-        "confirmed" => vec!["pending", "sorting"],
+        "confirmed" => vec!["pending", "accepted"],
         "sorting" => vec!["pending", "sorted"],
         "sorted" => vec!["sorting", "delivering"],
         "delivering" => vec!["sorted", "delivered"],
@@ -12957,7 +13006,7 @@ pub async fn api_sales_order_approve(headers: axum::http::HeaderMap, Path(id): P
     }
 
     let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
-    let result = sqlx::query("UPDATE sales_order SET status = 'confirmed', is_settled = 1, version = version + 1 WHERE id = ? AND status = 'pending'")
+    let result = sqlx::query("UPDATE sales_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
         .bind(id)
         .execute(crate::db::pool())
         .await;
@@ -13006,9 +13055,9 @@ pub async fn api_sales_order_unapprove(headers: axum::http::HeaderMap, Path(id):
     }
 
     let update_sql = if is_super_admin {
-        "UPDATE sales_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ?"
+        "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ?"
     } else {
-        "UPDATE sales_order SET status = 'pending', is_settled = 0, version = version + 1 WHERE id = ? AND status = 'confirmed'"
+        "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
     };
     let result = sqlx::query(update_sql)
         .bind(id)

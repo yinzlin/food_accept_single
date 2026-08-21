@@ -2241,8 +2241,9 @@ fn main() {
         }
 
         if let Ok(tray_event) = tray_channel.try_recv() {
-            if let TrayIconEvent::Click { button_state, .. } = tray_event {
-                if button_state == tray_icon::MouseButtonState::Up {
+            if let TrayIconEvent::Click { button, button_state, .. } = tray_event {
+                // 仅响应左键单击：右键不打开 web（会弹出托盘菜单）
+                if button == tray_icon::MouseButton::Left && button_state == tray_icon::MouseButtonState::Up {
                     open_browser();
                 }
             }

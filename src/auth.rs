@@ -249,6 +249,8 @@ pub fn check_api_route_permission(path: &str) -> Option<&str> {
             Some("sales_order.create")
         } else if path.ends_with("/update") || path.ends_with("/correction") || path.ends_with("/upload_image") || path.ends_with("/delete_image") {
             Some("sales_order.update")
+        } else if path.ends_with("/settle") {
+            Some("sales_order.update")
         } else if path.ends_with("/approve") {
             Some("sales_order.approve")
         } else if path.ends_with("/unapprove") {

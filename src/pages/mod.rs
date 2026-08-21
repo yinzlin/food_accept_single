@@ -2387,11 +2387,11 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     const settledBadge = order.is_settled === 1
                         ? '<span class="badge bg-success">已结</span>'
                         : '<span class="badge bg-warning text-dark">未结</span>';
-                    const toggleSettleBtn = order.status !== 'pending'
+                    const toggleSettleBtn = order.status === 'pending'
                         ? (order.is_settled === 1
                             ? '<button onclick="event.stopPropagation(); toggleSettlePurchaseOrder(' + order.id + ', 0)" class="btn btn-outline-warning btn-sm me-1">设为未结</button>'
                             : '<button onclick="event.stopPropagation(); toggleSettlePurchaseOrder(' + order.id + ', 1)" class="btn btn-outline-success btn-sm me-1">设为已结</button>')
-                        : '';
+                        : '<button onclick="event.stopPropagation(); alert(\'该单据已审核，需先反审核后才能修改结算状态\');" class="btn btn-outline-secondary btn-sm me-1" disabled>设为已结</button>';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')" style="cursor: pointer;">' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
@@ -4224,11 +4224,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const statusBadge = '<span class="badge ' + statusInfo.class + '">' + statusInfo.text + '</span>';
                     const nextStatusMap = {{
                         'pending': '{{"text":"审核","status":"confirmed"}}',
-                        'confirmed': '{{"text":"开始分拣","status":"sorting"}}',
-                        'sorting': '{{"text":"完成分拣","status":"sorted"}}',
-                        'sorted': '{{"text":"开始配送","status":"delivering"}}',
-                        'delivering': '{{"text":"确认送达","status":"delivered"}}',
-                        'delivered': '{{"text":"确认验收","status":"accepted"}}'
+                        'confirmed': '{{"text":"确认验收","status":"accepted"}}'
                     }};
                     const nextInfo = JSON.parse(nextStatusMap[order.status] || '{{"text":"","status":""}}');
                     const nextBtn = nextInfo.text ? '<button onclick="event.stopPropagation(); updateOrderStatus(' + order.id + ', \'' + nextInfo.status + '\')" class="btn btn-primary btn-sm">' + nextInfo.text + '</button> ' : '';
@@ -4237,11 +4233,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const settledBadge = order.is_settled === 1
                         ? '<span class="badge bg-success">已结</span>'
                         : '<span class="badge bg-warning text-dark">未结</span>';
-                    const toggleSettleBtn = order.status !== 'pending'
-                        ? (order.is_settled === 1
-                            ? '<button onclick="event.stopPropagation(); toggleSettleSalesOrder(' + order.id + ', 0)" class="btn btn-outline-warning btn-sm me-1">设为未结</button>'
-                            : '<button onclick="event.stopPropagation(); toggleSettleSalesOrder(' + order.id + ', 1)" class="btn btn-outline-success btn-sm me-1">设为已结</button>')
-                        : '';
+                    const toggleSettleBtn = order.is_settled === 1
+                        ? '<button onclick="event.stopPropagation(); toggleSettleSalesOrder(' + order.id + ', 0)" class="btn btn-outline-secondary btn-sm me-1" ' + (order.status === 'pending' ? '' : 'disabled title="该单据已审核，需先反审核后才能修改"') + '>设为未结</button>'
+                        : '<button onclick="event.stopPropagation(); toggleSettleSalesOrder(' + order.id + ', 1)" class="btn btn-outline-secondary btn-sm me-1" ' + (order.status === 'pending' ? '' : 'disabled title="该单据已审核，需先反审核后才能修改"') + '>设为已结</button>';
                     tbody.innerHTML += '<tr onclick="loadOrderDetail(' + order.id + ')"' + selected + '>' +
                         '<td>' + order.id + '</td>' +
                         '<td>' + order.order_no + '</td>' +
