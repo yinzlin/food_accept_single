@@ -377,6 +377,153 @@ mod price_rounding_tests {
     }
 }
 
+// ===== 价格策略时段（product_price_schedule） =====
+// 政采价 / 超市比价按生效日期段管理，支持补录历史销售单时按 order_date 自动匹配
+// 时段连续性由数据库 UNIQUE(product_id, price_type, effective_date) 与
+// 业务层维护 end_date 字段保证。
+
+/// 校验日期字符串是否为合法 'YYYY-MM-DD'
+pub(crate) fn is_valid_date_str(s: &str) -> bool {
+    if s.len() != 10 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    bytes[4] == b'-' && bytes[7] == b'-'
+        && bytes[..4].iter().all(|c| c.is_ascii_digit())
+        && bytes[5..7].iter().all(|c| c.is_ascii_digit())
+        && bytes[8..10].iter().all(|c| c.is_ascii_digit())
+}
+
+/// 维护 product_price_schedule 时段连续性：
+/// 在 (product_id, price_type) 分组下，重新计算 end_date 字段：
+///   - 按 effective_date 升序排列
+///   - 每条记录的 end_date = 下一条 effective_date（不含）；最后一条 end_date = NULL（至今有效）
+/// 新增/修改/删除时调用，确保查询时无需再做范围扫描判断。
+pub(crate) async fn rebuild_price_schedule_end_dates(
+    product_id: i64,
+    price_type: &str,
+) -> Result<(), String> {
+    // 拉取该 (product, price_type) 下所有时段
+    let rows = sqlx::query(
+        "SELECT id, effective_date FROM product_price_schedule
+         WHERE product_id = ? AND price_type = ?
+         ORDER BY effective_date ASC, id ASC"
+    )
+    .bind(product_id)
+    .bind(price_type)
+    .fetch_all(crate::db::pool())
+    .await
+    .map_err(|e| format!("查询时段失败: {}", e))?;
+
+    let dates: Vec<(i64, String)> = rows
+        .into_iter()
+        .map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("effective_date")))
+        .collect();
+
+    // 逐条重写 end_date
+    for (i, (id, _)) in dates.iter().enumerate() {
+        let next_date: Option<String> = if i + 1 < dates.len() {
+            Some(dates[i + 1].1.clone())
+        } else {
+            None
+        };
+        // 计算当前记录应填的 end_date：= 下一条 effective_date
+        // 注意：end_date 在 SQL 语义上为"不含"，但本系统对用户输入时表示"含"
+        // （详见 PriceScheduleReq.end_date 文档）。这里我们存的是"下一条 effective_date"，
+        // 匹配时使用 "effective_date <= query_date AND (end_date IS NULL OR query_date < end_date)"
+        // 这样 end_date 是"开区间上界"——避免相邻时段重叠。
+        let _ = sqlx::query("UPDATE product_price_schedule SET end_date = ? WHERE id = ?")
+            .bind(&next_date)
+            .bind(id)
+            .execute(crate::db::pool())
+            .await;
+    }
+    Ok(())
+}
+
+/// 根据 (product_id, price_type, query_date) 查找当日生效的价格。
+/// - 若查询日期 < 最早 effective_date：返回 None（该日还没有任何价）
+/// - 若查询日期 >= 最早 effective_date 且 < 下一条 effective_date：返回前一条 price
+/// - 若查询日期 >= 最后一条 effective_date：返回最后一条 price（end_date IS NULL）
+///
+/// 返回 (price, matched_schedule_id, matched_effective_date)：
+///   - price = 0.0 表示该商品尚未录入任何价（前端应回退到 base_price）
+///   - matched_schedule_id 用于审计追溯
+pub(crate) async fn lookup_effective_price(
+    product_id: i64,
+    price_type: &str,
+    query_date: &str,
+) -> Option<(f64, i64, String)> {
+    // query_date 形如 'YYYY-MM-DD'，按字符串比较（YYYY-MM-DD 字典序 == 时间顺序）即可
+    let row = sqlx::query(
+        "SELECT id, price, effective_date FROM product_price_schedule
+         WHERE product_id = ? AND price_type = ?
+           AND effective_date <= ?
+           AND (end_date IS NULL OR end_date > ?)
+         ORDER BY effective_date DESC, id DESC
+         LIMIT 1"
+    )
+    .bind(product_id)
+    .bind(price_type)
+    .bind(query_date)
+    .bind(query_date)
+    .fetch_optional(crate::db::pool())
+    .await
+    .ok()
+    .flatten()?;
+
+    Some((
+        row.get::<f64, _>("price"),
+        row.get::<i64, _>("id"),
+        row.get::<String, _>("effective_date"),
+    ))
+}
+
+/// 批量查询指定 (order_date) 多个商品在某 price_type 下的生效价。
+/// 返回 HashMap<product_id, price>（含 price > 0 的记录；缺失的 key 表示该商品无价）。
+pub(crate) async fn batch_lookup_effective_prices(
+    product_ids: &[i64],
+    price_type: &str,
+    query_date: &str,
+) -> std::collections::HashMap<i64, f64> {
+    if product_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    // IN (?) 动态占位
+    let placeholders = vec!["?"; product_ids.len()].join(",");
+    // 取每个 product_id 在 query_date 当日生效的那一条（effective_date 最大且 <= query_date）。
+    // 用窗口函数 ROW_NUMBER 而非 GROUP BY + HAVING MAX()，避免依赖 SQLite bare column 行为。
+    let sql = format!(
+        "SELECT product_id, price FROM (
+             SELECT product_id, price, effective_date,
+                    ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY effective_date DESC, id DESC) AS rn
+             FROM product_price_schedule
+             WHERE price_type = ?
+               AND product_id IN ({})
+               AND effective_date <= ?
+               AND (end_date IS NULL OR end_date > ?)
+         ) WHERE rn = 1",
+        placeholders
+    );
+    // 绑定顺序必须与 SQL 中占位符出现顺序一致：
+    // price_type -> product_ids... -> query_date(effective_date <=) -> query_date(end_date >)
+    let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(price_type);
+    for pid in product_ids {
+        q = q.bind(pid);
+    }
+    q = q.bind(query_date).bind(query_date);
+    let rows = q.fetch_all(crate::db::pool()).await.unwrap_or_default();
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let pid = r.get::<i64, _>("product_id");
+        let price = r.get::<f64, _>("price");
+        if price > 0.0 {
+            map.insert(pid, price);
+        }
+    }
+    map
+}
+
 // 记录价格变更日志（price_type: purchase_price / base_price）
 pub(crate) async fn log_price_change(
     product_id: i64,
@@ -1968,6 +2115,7 @@ fn build_router() -> Router {
         .route("/query/purchase_price", get(page_query_purchase_price))
         .route("/query/purchase_summary", get(page_query_purchase_summary))
         .route("/query/supplier_balance", get(page_query_supplier_balance))
+        .route("/query/price_schedule", get(page_query_price_schedule))
         .route("/query/sales_order", get(page_query_sales_order))
         .route("/query/sales_summary", get(page_query_sales_summary))
         .route("/query/sales_price", get(page_query_sales_price))
@@ -2126,6 +2274,21 @@ fn build_router() -> Router {
         .route("/api/sales_order/update_status", post(api_sales_order_update_status))
         .route("/api/sales_order/correction", post(api_sales_order_correction))
         .route("/api/sales_order/generate_purchase/{id}", post(api_sales_order_generate_purchase))
+        // 价格策略时段管理（政采价/超市比价按日期段）
+        .route("/api/price_schedule/create", post(api_price_schedule_create))
+        .route("/api/price_schedule/update", post(api_price_schedule_update))
+        .route("/api/price_schedule/delete", post(api_price_schedule_delete))
+        .route("/api/price_schedule/list", get(api_price_schedule_list))
+        .route("/api/price_schedule/history", get(api_price_schedule_history))
+        .route("/api/price_schedule/lookup", get(api_price_schedule_lookup))
+        .route("/api/price_schedule/lookup_batch", post(api_price_schedule_lookup_batch))
+        .route("/api/price_schedule/get", get(api_price_schedule_get))
+        .route("/api/price_schedule/diagnose", get(api_price_schedule_diagnose))
+        .route("/api/price_schedule/batch_import", post(api_price_schedule_batch_import))
+        .route("/api/price_schedule/export", get(api_price_schedule_export))
+        .route("/api/price_schedule/export_template", get(api_price_schedule_export_template))
+        .route("/api/price_schedule/backfill_sales_order", get(api_price_schedule_backfill_sales_order))
+        .route("/api/price_schedule/batch_import_excel", post(api_price_schedule_batch_import_excel))
         .route("/mobile/sort", get(page_mobile_sort))
         .route("/mobile/sort_by_purchaser", get(page_mobile_sort_by_purchaser))
         .route("/mobile/sort_by_category", get(page_mobile_sort_by_category))

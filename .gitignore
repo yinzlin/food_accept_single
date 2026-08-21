@@ -13,4 +13,5 @@ uploads/
 server_*.log
 debug-*.log
 debug-*.md
+build.log
 

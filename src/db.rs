@@ -124,7 +124,12 @@ pub async fn init_pool() {
     // 写并发：让 BEGIN IMMEDIATE 拿不到写锁时自动等待 5s 再报错（默认是立即 SQLITE_BUSY），
     // 配合 order update 中使用 BEGIN IMMEDIATE 事务，可消除连点保存时的并发丢明细问题。
     let _ = sqlx::query("PRAGMA busy_timeout = 5000").execute(&pool).await;
-    
+
+    // 先把连接池注册到 OnceLock，再执行 init_tables / 数据修复等可能通过 crate::db::pool()
+    // 取池的代码。放在此处确保后续 init_tables 中的「user_version 修复段」以及 init_db
+    // 中的「end_date 重建」都能拿到池。
+    let _ = DB_POOL.set(pool.clone());
+
     // 使用 integrity_check 检测数据库损坏
     let integrity_check: String = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_one(&pool)
@@ -147,8 +152,29 @@ pub async fn init_pool() {
     } else {
         eprintln!("数据库完整性检查通过");
     }
-    
+
     init_tables(&pool).await.expect("初始化数据表失败");
+
+    // 一次性修复：清理 legacy_migration 记录后，重算剩余记录的 end_date 连续性。
+    // init_tables 阶段不能调 rebuild_price_schedule_end_dates（那时 DB_POOL 未注册），
+    // 所以放在这里：init_tables 已把 legacy_migration 数据删除（user_version=5），此处统一重建。
+    let needs_rebuild: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+    if needs_rebuild == 5 {
+        let affected: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT DISTINCT product_id, price_type FROM product_price_schedule"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for (pid, pt) in affected {
+            let _ = crate::rebuild_price_schedule_end_dates(pid, &pt).await;
+        }
+        // 重建完成后升到 6，下次启动不再跑
+        let _ = sqlx::query("PRAGMA user_version = 6").execute(&pool).await;
+    }
 
     // 一次性修复：重算所有耗材分摊方案的 allocated_amount 与 remaining_balance
     // 修复历史 bug（replace_remove 冲减负数未计入分摊金额）导致的数据偏差
@@ -175,8 +201,8 @@ pub async fn init_pool() {
     let _ = sqlx::query("DELETE FROM product_unit WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
     let _ = sqlx::query("DELETE FROM product_price WHERE product_id NOT IN (SELECT id FROM product)").execute(&pool).await;
     let _ = sqlx::query("VACUUM").execute(&pool).await;
-    
-    DB_POOL.set(pool).expect("数据库连接池已初始化");
+
+    // 连接池在 init_db 顶部已注册，此处不再重复 set。
 }
 
 pub fn pool() -> &'static SqlitePool {
@@ -1037,6 +1063,61 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_food_item_accept_id ON food_item(accept_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_product_unit_product_id ON product_unit(product_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_product_price_product_id ON product_price(product_id)").execute(pool).await;
+
+    // 政采平台价 / 超市比价 时间段表
+    // 解决原 product_price 表 UNIQUE(product_id, price_type) 只能存"最新价"的问题：
+    // 现在按 (product_id, price_type, effective_date) 维护多条历史记录，
+    // 任意 order_date 可通过查找当日生效的记录得到当时使用的价格，
+    // 支持补录历史销售单时按 order_date 自动匹配对应时段价。
+    //
+    // 时段连续性约束：
+    //   - 同一 (product_id, price_type) 下，多条记录的 effective_date 不可重复
+    //   - 同一 (product_id, price_type) 下，后一条 effective_date 之前的所有日期都按前一条价格生效
+    //     （end_date 由下一条记录的 effective_date 推得；最后一条 end_date = NULL 表示至今有效）
+    //
+    // 字段说明：
+    //   price_type: gov_procurement / supermarket_1 / supermarket_2 / supermarket_3 / ai_realtime
+    //   effective_date: 该价格从该日期（含）开始生效；时间戳存 DATE 字符串 'YYYY-MM-DD'
+    //   source: 录入来源（manual / excel_import / ...）
+    //   remark: 备注
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS product_price_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            price_type TEXT NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
+            effective_date TEXT NOT NULL,
+            end_date TEXT,
+            source TEXT,
+            remark TEXT,
+            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(product_id) REFERENCES product(id),
+            UNIQUE(product_id, price_type, effective_date)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_pps_product_type ON product_price_schedule(product_id, price_type, effective_date)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_pps_effective ON product_price_schedule(effective_date)").execute(pool).await;
+
+    // 价格策略表初始化为空表：不再从 product_price 自动迁移。
+    // 由用户按实际情况在【价格策略】页面手动录入各商品各时段的价格。
+    // 一次性清理：清空早期版本自动迁移/试录入的全部记录，从零开始。
+    // 幂等：用 PRAGMA user_version >= 5 作为闸门。
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if version < 5 {
+        let _ = sqlx::query("DELETE FROM product_price_schedule")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("PRAGMA user_version = 5").execute(pool).await;
+    }
+
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_supplier_category_id ON supplier(category_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchaser_category_id ON purchaser(category_id)").execute(pool).await;
 

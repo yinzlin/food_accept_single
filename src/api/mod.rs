@@ -5098,7 +5098,7 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     let ctx = crate::auth::get_user_ctx(&headers).await;
 
     // 行级数据权限：先查订单所属采购单位
-    let order = sqlx::query("SELECT purchaser_id, status FROM sales_order WHERE id = ?")
+    let order = sqlx::query("SELECT purchaser_id, status, order_date FROM sales_order WHERE id = ?")
         .bind(req.id)
         .fetch_optional(crate::db::pool())
         .await
@@ -5116,6 +5116,48 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
     // 仅待审核（pending）状态允许修改；已审核/已流转的订单必须反审核后才能修改（防篡改）
     if order_status != "pending" {
         return (StatusCode::BAD_REQUEST, format!("当前订单状态为「{}」，仅待审核状态的订单允许修改；已审核订单需管理员反审核后才能修改", order_status));
+    }
+    // 价格策略时段补价：编辑时若修改了 order_date 为历史日期，对 unit_price=0 的明细
+    // 仍按当前 req.order_date 自动补价。
+    let mut req = req; // shadow mutable for补价
+    if !req.items.is_empty() {
+        let order_date_short = if req.order_date.len() >= 10 { req.order_date[..10].to_string() } else { req.order_date.clone() };
+        if !order_date_short.is_empty() && crate::is_valid_date_str(&order_date_short) {
+            let mut product_ids: Vec<i64> = Vec::new();
+            for it in &req.items {
+                if it.product_id > 0 && it.unit_price <= 0.0 {
+                    product_ids.push(it.product_id);
+                }
+            }
+            if !product_ids.is_empty() {
+                let gov_map = crate::batch_lookup_effective_prices(&product_ids, "gov_procurement", &order_date_short).await;
+                let sup1_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_1", &order_date_short).await;
+                let sup2_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_2", &order_date_short).await;
+                let sup3_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_3", &order_date_short).await;
+                let mut auto_filled = 0;
+                for it in req.items.iter_mut() {
+                    if it.product_id > 0 && it.unit_price <= 0.0 {
+                        let new_price = gov_map.get(&it.product_id).copied()
+                            .filter(|p| *p > 0.0)
+                            .or_else(|| sup1_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
+                            .or_else(|| sup2_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
+                            .or_else(|| sup3_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
+                            .unwrap_or(0.0);
+                        if new_price > 0.0 {
+                            it.unit_price = new_price;
+                            if it.quantity > 0.0 && it.amount <= 0.0 {
+                                it.amount = new_price * it.quantity;
+                            }
+                            auto_filled += 1;
+                        }
+                    }
+                }
+                if auto_filled > 0 {
+                    crate::auth::log_operation(&ctx, "价格策略自动补价", "sales_order", &req.id.unwrap_or(0).to_string(),
+                        &format!("销售单编辑按 order_date={} 自动补价 {} 条", order_date_short, auto_filled)).await;
+                }
+            }
+        }
     }
     // 强制乐观锁：req.version 必须传入且 > 0
     let ver = match req.version {
@@ -8985,6 +9027,55 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
         let effective_purchaser_id = if req.purchaser_id != 0 { req.purchaser_id } else { ctx.purchaser_id };
         if ctx.purchaser_id == 0 || effective_purchaser_id != ctx.purchaser_id {
             return (StatusCode::FORBIDDEN, "采购单位账号只能为自己创建销售单".to_string());
+        }
+    }
+
+    // 价格策略时段补价：补录历史销售单时，前端可能传 unit_price=0
+    // 此处按 req.order_date 自动从 product_price_schedule 查 (gov_procurement, supermarket_*) 价
+    // 仅补 unit_price <= 0 的明细；前端已手工填价的保留原值不被覆盖。
+    // 支持补录：order_date 为任意过去日期，自动匹配对应时段价。
+    let mut req = req; // shadow mutable
+    if !req.items.is_empty() {
+        let order_date_short = if req.order_date.len() >= 10 { req.order_date[..10].to_string() } else { req.order_date.clone() };
+        if !order_date_short.is_empty() && crate::is_valid_date_str(&order_date_short) {
+            let mut product_ids: Vec<i64> = Vec::new();
+            for it in &req.items {
+                if it.product_id > 0 && it.unit_price <= 0.0 {
+                    product_ids.push(it.product_id);
+                }
+            }
+            if !product_ids.is_empty() {
+                // 按 (gov_procurement, supermarket_*) 优先级查
+                // gov 优先，没有再回退到 supermarket_* 的 MAX
+                let gov_map = crate::batch_lookup_effective_prices(&product_ids, "gov_procurement", &order_date_short).await;
+                let sup1_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_1", &order_date_short).await;
+                let sup2_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_2", &order_date_short).await;
+                let sup3_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_3", &order_date_short).await;
+
+                let mut auto_filled = 0;
+                for it in req.items.iter_mut() {
+                    if it.product_id > 0 && it.unit_price <= 0.0 {
+                        let new_price = gov_map.get(&it.product_id).copied()
+                            .filter(|p| *p > 0.0)
+                            .or_else(|| sup1_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
+                            .or_else(|| sup2_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
+                            .or_else(|| sup3_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
+                            .unwrap_or(0.0);
+                        if new_price > 0.0 {
+                            it.unit_price = new_price;
+                            // amount 同步：使用现 quantity 重新计算（避免前端传的 0 金额）
+                            if it.quantity > 0.0 && it.amount <= 0.0 {
+                                it.amount = new_price * it.quantity;
+                            }
+                            auto_filled += 1;
+                        }
+                    }
+                }
+                if auto_filled > 0 {
+                    crate::auth::log_operation(&ctx, "价格策略自动补价", "sales_order", "0",
+                        &format!("销售单创建按 order_date={} 自动补价 {} 条", order_date_short, auto_filled)).await;
+                }
+            }
         }
     }
 
@@ -13208,6 +13299,1403 @@ pub async fn api_accept_list() -> impl IntoResponse {
             "purchaser_name": row.get::<String, _>("purchaser_name"),
         }))
         .collect();
-    
+
     (StatusCode::OK, serde_json::to_string(&accepts).unwrap())
+}
+
+// ====== 价格策略时段管理（政采价/超市比价按生效日期段录入） ======
+// 数据模型：product_price_schedule(product_id, price_type, price, effective_date, end_date, ...)
+// 工程化设计：
+//   1. UNIQUE(product_id, price_type, effective_date) 由 DB 强制约束
+//   2. 新增/删除/批量导入后调用 rebuild_price_schedule_end_dates 维护 end_date 连续性
+//   3. 查询使用 lookup_effective_price / batch_lookup_effective_prices（见 main.rs）
+//   4. 录入校验：effective_date 必须为 YYYY-MM-DD；price >= 0；price_type 白名单
+
+/// 价格类型白名单：与前端 PriceTypeSelect 选项保持一致
+const PRICE_SCHEDULE_TYPES: &[&str] = &[
+    "gov_procurement",
+    "supermarket_1",
+    "supermarket_2",
+    "supermarket_3",
+    "ai_realtime",
+];
+
+fn is_valid_price_type(price_type: &str) -> bool {
+    PRICE_SCHEDULE_TYPES.contains(&price_type)
+}
+
+/// 校验 price_schedule 录入请求的字段合法性，返回错误信息字符串（None 表示通过）
+fn validate_price_schedule_req(req: &PriceScheduleReq) -> Option<String> {
+    if req.product_id <= 0 {
+        return Some("product_id 必须大于 0".to_string());
+    }
+    if !is_valid_price_type(&req.price_type) {
+        return Some(format!(
+            "price_type 非法：{}（允许：{}）",
+            req.price_type,
+            PRICE_SCHEDULE_TYPES.join(", ")
+        ));
+    }
+    if !crate::is_valid_date_str(&req.effective_date) {
+        return Some(format!("effective_date 格式错误：{}", req.effective_date));
+    }
+    if let Some(end) = &req.end_date {
+        if !end.is_empty() && !crate::is_valid_date_str(end) {
+            return Some(format!("end_date 格式错误：{}", end));
+        }
+        if !end.is_empty() && end.as_str() < req.effective_date.as_str() {
+            return Some("end_date 不能早于 effective_date".to_string());
+        }
+    }
+    if req.price < 0.0 {
+        return Some("price 不能为负数".to_string());
+    }
+    None
+}
+
+/// 新增价格策略时段
+pub async fn api_price_schedule_create(
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PriceScheduleReq>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/create").await {
+        return (code, msg).into_response();
+    }
+    if let Err(e) = check_basic_not_confirmed("product", req.product_id).await {
+        return e.into_response();
+    }
+    if let Some(err) = validate_price_schedule_req(&req) {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
+    // 录入时 end_date 强制 NULL；由 rebuild_price_schedule_end_dates 维护
+    let result = sqlx::query(
+        "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
+         VALUES (?, ?, ?, ?, NULL, ?, ?)"
+    )
+    .bind(req.product_id)
+    .bind(&req.price_type)
+    .bind(req.price)
+    .bind(&req.effective_date)
+    .bind(&req.source)
+    .bind(&req.remark)
+    .execute(crate::db::pool())
+    .await;
+    match result {
+        Ok(res) => {
+            // 维护同 (product, price_type) 下的 end_date 连续性
+            if let Err(e) = crate::rebuild_price_schedule_end_dates(req.product_id, &req.price_type).await {
+                eprintln!("[price_schedule] 维护 end_date 失败: {}", e);
+            }
+            // 同步更新 product_price 快照（兼容旧逻辑：取当前最后一条 effective 的价）
+            let _ = sqlx::query(
+                "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source)
+                 SELECT product_id, price_type, price, effective_date, source
+                 FROM product_price_schedule
+                 WHERE product_id = ? AND price_type = ?
+                 ORDER BY effective_date DESC, id DESC LIMIT 1"
+            )
+            .bind(req.product_id)
+            .bind(&req.price_type)
+            .execute(crate::db::pool())
+            .await;
+
+            // 记录操作审计日志
+            let ctx = crate::auth::get_user_ctx(&headers).await;
+            let detail = format!(
+                "录入价格策略：product_id={}, price_type={}, price={}, effective_date={}",
+                req.product_id, req.price_type, req.price, req.effective_date
+            );
+            crate::auth::log_operation(&ctx, "录入价格策略", "price_schedule", &res.last_insert_rowid().to_string(), &detail).await;
+
+            (StatusCode::OK, format!("{{\"id\":{}, \"success\":true}}", res.last_insert_rowid())).into_response()
+        }
+        Err(e) => {
+            // UNIQUE 冲突：返回友好提示
+            let msg = e.to_string();
+            if msg.contains("UNIQUE") {
+                return (StatusCode::CONFLICT, format!(
+                    "{{\"success\":false, \"message\":\"已存在相同 (商品, 价格类型, 生效日期={}) 的策略，请改用编辑或先删除\"}}",
+                    req.effective_date
+                )).into_response();
+            }
+            eprintln!("[price_schedule] 录入失败: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"success\":false, \"message\":\"录入失败：{}\"}}", msg)).into_response()
+        }
+    }
+}
+
+/// 更新价格策略时段（允许改 price/remark/source/price_type/effective_date；product_id 由 id 锁定）
+/// 修改 (price_type, effective_date) 后，时段连续性由 rebuild_price_schedule_end_dates 重新维护。
+pub async fn api_price_schedule_update(
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PriceScheduleReq>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/update").await {
+        return (code, msg).into_response();
+    }
+    let id = match req.id {
+        Some(i) if i > 0 => i,
+        _ => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"id 必填\"}".to_string()).into_response(),
+    };
+    if req.price < 0.0 {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"price 不能为负数\"}".to_string()).into_response();
+    }
+    if !is_valid_price_type(&req.price_type) {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"price_type 非法\"}".to_string()).into_response();
+    }
+    if req.effective_date.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"effective_date 必填\"}".to_string()).into_response();
+    }
+    // 先取出原记录，用于比较 (product_id, price_type) 是否有变化 → 需要重算 end_date 连续性
+    let old_row = sqlx::query(
+        "SELECT product_id, price_type FROM product_price_schedule WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_optional(crate::db::pool())
+    .await
+    .ok()
+    .flatten();
+    let (old_product_id, old_price_type) = match old_row {
+        Some(r) => (
+            r.get::<i64, _>("product_id"),
+            r.get::<String, _>("price_type"),
+        ),
+        None => {
+            return (StatusCode::NOT_FOUND, "{\"success\":false, \"message\":\"记录不存在\"}".to_string()).into_response();
+        }
+    };
+
+    let result = sqlx::query(
+        "UPDATE product_price_schedule
+         SET price = ?, remark = ?, source = ?, price_type = ?, effective_date = ?
+         WHERE id = ?"
+    )
+    .bind(req.price)
+    .bind(&req.remark)
+    .bind(&req.source)
+    .bind(&req.price_type)
+    .bind(&req.effective_date)
+    .bind(id)
+    .execute(crate::db::pool())
+    .await;
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            // 维护变更涉及的 (product, price_type) 端点的 end_date 连续性
+            // 旧组合 + 新组合各算一次（避免某条孤立时段残留）
+            let mut touched: Vec<(i64, String)> = Vec::new();
+            touched.push((old_product_id, old_price_type.clone()));
+            if old_price_type != req.price_type || old_product_id != req.product_id {
+                touched.push((req.product_id, req.price_type.clone()));
+            }
+            for (pid, pt) in &touched {
+                if let Err(e) = crate::rebuild_price_schedule_end_dates(*pid, pt).await {
+                    eprintln!("[price_schedule] 维护 end_date 失败: {}", e);
+                }
+            }
+            // 同步 product_price 快照（旧组合 + 新组合）
+            for (pid, pt) in &touched {
+                let _ = sqlx::query(
+                    "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source)
+                     SELECT product_id, price_type, price, effective_date, source
+                     FROM product_price_schedule
+                     WHERE product_id = ? AND price_type = ?
+                     ORDER BY effective_date DESC, id DESC LIMIT 1"
+                )
+                .bind(pid)
+                .bind(pt)
+                .execute(crate::db::pool())
+                .await;
+            }
+
+            let ctx = crate::auth::get_user_ctx(&headers).await;
+            let detail = format!(
+                "product_id={}, price_type={}({}->{}), price={}, effective_date={}",
+                req.product_id, req.price_type, old_price_type, req.price_type, req.price, req.effective_date
+            );
+            crate::auth::log_operation(&ctx, "更新价格策略", "price_schedule", &id.to_string(), &detail).await;
+
+            (StatusCode::OK, "{\"success\":true}".to_string()).into_response()
+        }
+        Ok(_) => (StatusCode::NOT_FOUND, "{\"success\":false, \"message\":\"价格策略不存在\"}".to_string()).into_response(),
+        Err(e) => {
+            eprintln!("[price_schedule] 更新失败: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"success\":false, \"message\":\"{}\"}}", e)).into_response()
+        }
+    }
+}
+
+/// 删除价格策略时段
+pub async fn api_price_schedule_delete(
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DeleteReq>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/delete").await {
+        return (code, msg).into_response();
+    }
+    // 先读取 (product_id, price_type) 后续重建 end_date
+    let row = sqlx::query("SELECT product_id, price_type FROM product_price_schedule WHERE id = ?")
+        .bind(req.id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .ok()
+        .flatten();
+    let result = sqlx::query("DELETE FROM product_price_schedule WHERE id = ?")
+        .bind(req.id)
+        .execute(crate::db::pool())
+        .await;
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Some(r) = row {
+                let pid: i64 = r.get("product_id");
+                let pt: String = r.get("price_type");
+                if let Err(e) = crate::rebuild_price_schedule_end_dates(pid, &pt).await {
+                    eprintln!("[price_schedule] 维护 end_date 失败: {}", e);
+                }
+                // 同步 product_price 快照：取剩余时段最后一条
+                let _ = sqlx::query(
+                    "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source)
+                     SELECT product_id, price_type, price, effective_date, source
+                     FROM product_price_schedule
+                     WHERE product_id = ? AND price_type = ?
+                     ORDER BY effective_date DESC, id DESC LIMIT 1"
+                )
+                .bind(pid)
+                .bind(&pt)
+                .execute(crate::db::pool())
+                .await;
+            }
+            let ctx = crate::auth::get_user_ctx(&headers).await;
+            crate::auth::log_operation(&ctx, "删除价格策略", "price_schedule", &req.id.to_string(), "").await;
+            (StatusCode::OK, "{\"success\":true}".to_string()).into_response()
+        }
+        Ok(_) => (StatusCode::NOT_FOUND, "{\"success\":false, \"message\":\"价格策略不存在\"}".to_string()).into_response(),
+        Err(e) => {
+            eprintln!("[price_schedule] 删除失败: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"success\":false, \"message\":\"{}\"}}", e)).into_response()
+        }
+    }
+}
+
+/// 查询价格策略列表（支持分页、商品过滤、价格类型过滤、生效日期段过滤）
+pub async fn api_price_schedule_list(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/list").await {
+        return (code, msg).into_response();
+    }
+
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20).min(200);
+    let offset = (page - 1) * page_size;
+    let product_id: i64 = params.get("product_id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let price_type = params.get("price_type").cloned().unwrap_or_default();
+    let effective_from = params.get("effective_from").cloned().unwrap_or_default();
+    let effective_to = params.get("effective_to").cloned().unwrap_or_default();
+    let keyword = params.get("keyword").cloned().unwrap_or_default();
+
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut simple_binds: Vec<String> = Vec::new();
+    if product_id > 0 {
+        where_sql.push_str(" AND pps.product_id = ?");
+        simple_binds.push(product_id.to_string());
+    }
+    if !price_type.is_empty() {
+        where_sql.push_str(" AND pps.price_type = ?");
+        simple_binds.push(price_type);
+    }
+    if !effective_from.is_empty() {
+        where_sql.push_str(" AND pps.effective_date >= ?");
+        simple_binds.push(effective_from);
+    }
+    if !effective_to.is_empty() {
+        where_sql.push_str(" AND pps.effective_date <= ?");
+        simple_binds.push(effective_to);
+    }
+    if !keyword.is_empty() {
+        where_sql.push_str(" AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)");
+        let k = format!("%{}%", keyword);
+        simple_binds.push(k.clone());
+        simple_binds.push(k.clone());
+        simple_binds.push(k);
+    }
+
+    // 总数
+    let count_sql = format!("SELECT COUNT(*) FROM product_price_schedule pps LEFT JOIN product p ON pps.product_id = p.id{}", where_sql);
+    let mut count_q = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()));
+    for b in &simple_binds {
+        count_q = count_q.bind(b);
+    }
+    let total: i64 = count_q.fetch_one(crate::db::pool()).await.unwrap_or(0);
+
+    // 列表：与 product JOIN 一次性带回商品名（前端展示需要）
+    let mut list_sql = format!(
+        "SELECT pps.id, pps.product_id, p.name as product_name, p.spec, p.unit, p.alias1, p.alias2,
+                pps.price_type, pps.price, pps.effective_date, pps.end_date, pps.source, pps.remark, pps.create_at
+         FROM product_price_schedule pps LEFT JOIN product p ON pps.product_id = p.id{}",
+        where_sql
+    );
+    list_sql.push_str(" ORDER BY pps.effective_date DESC, pps.id DESC LIMIT ? OFFSET ?");
+    let mut list_q = sqlx::query(AssertSqlSafe(list_sql.as_str()));
+    for b in &simple_binds {
+        list_q = list_q.bind(b);
+    }
+    list_q = list_q.bind(page_size).bind(offset);
+    let rows = list_q.fetch_all(crate::db::pool()).await.unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "product_id": r.get::<i64, _>("product_id"),
+            "product_name": r.get::<Option<String>, _>("product_name").unwrap_or_default(),
+            "spec": r.get::<Option<String>, _>("spec").unwrap_or_default(),
+            "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
+            "alias1": r.get::<Option<String>, _>("alias1").unwrap_or_default(),
+            "alias2": r.get::<Option<String>, _>("alias2").unwrap_or_default(),
+            "price_type": r.get::<String, _>("price_type"),
+            "price": r.get::<f64, _>("price"),
+            "effective_date": r.get::<String, _>("effective_date"),
+            "end_date": r.get::<Option<String>, _>("end_date"),
+            "source": r.get::<Option<String>, _>("source"),
+            "remark": r.get::<Option<String>, _>("remark"),
+            "create_at": r.get::<Option<String>, _>("create_at"),
+        })
+    }).collect();
+
+    let result = serde_json::json!({
+        "data": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": if page_size > 0 { (total + page_size - 1) / page_size } else { 0 },
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// 批量导入价格策略（用于 Excel 导入）
+/// conflict_policy: upsert=按 (product, price_type, effective_date) 覆盖；ignore=跳过已存在
+pub async fn api_price_schedule_batch_import(
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PriceScheduleBatchReq>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/batch_import").await {
+        return (code, msg).into_response();
+    }
+    let policy = req.conflict_policy.unwrap_or_else(|| "upsert".to_string());
+
+    // 预校验：相同 (product, price_type, effective_date) 在本次请求内去重
+    let mut seen: std::collections::HashSet<(i64, String, String)> = std::collections::HashSet::new();
+    let mut validated: Vec<PriceScheduleReq> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for it in req.items {
+        if let Some(e) = validate_price_schedule_req(&it) {
+            errors.push(format!("商品 {} / {} / {} : {}", it.product_id, it.price_type, it.effective_date, e));
+            continue;
+        }
+        let key = (it.product_id, it.price_type.clone(), it.effective_date.clone());
+        if !seen.insert(key) {
+            errors.push(format!("商品 {} / {} / {} : 同一批次内重复", it.product_id, it.price_type, it.effective_date));
+            continue;
+        }
+        validated.push(it);
+    }
+
+    let mut inserted = 0;
+    let mut skipped = 0;
+    let mut affected_keys: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+
+    for it in &validated {
+        if policy == "upsert" {
+            let result = sqlx::query(
+                "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
+                 VALUES (?, ?, ?, ?, NULL, ?, ?)
+                 ON CONFLICT(product_id, price_type, effective_date) DO UPDATE SET
+                   price = excluded.price, source = excluded.source, remark = excluded.remark"
+            )
+            .bind(it.product_id)
+            .bind(&it.price_type)
+            .bind(it.price)
+            .bind(&it.effective_date)
+            .bind(&it.source)
+            .bind(&it.remark)
+            .execute(crate::db::pool())
+            .await;
+            match result {
+                Ok(_) => {
+                    inserted += 1;
+                    affected_keys.insert((it.product_id, it.price_type.clone()));
+                }
+                Err(e) => {
+                    errors.push(format!("商品 {} / {} / {} : 写入失败 {}", it.product_id, it.price_type, it.effective_date, e));
+                }
+            }
+        } else {
+            // ignore 策略：先查存在
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM product_price_schedule WHERE product_id = ? AND price_type = ? AND effective_date = ?"
+            )
+            .bind(it.product_id)
+            .bind(&it.price_type)
+            .bind(&it.effective_date)
+            .fetch_one(crate::db::pool())
+            .await
+            .unwrap_or(0);
+            if exists > 0 {
+                skipped += 1;
+                continue;
+            }
+            let result = sqlx::query(
+                "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
+                 VALUES (?, ?, ?, ?, NULL, ?, ?)"
+            )
+            .bind(it.product_id)
+            .bind(&it.price_type)
+            .bind(it.price)
+            .bind(&it.effective_date)
+            .bind(&it.source)
+            .bind(&it.remark)
+            .execute(crate::db::pool())
+            .await;
+            match result {
+                Ok(_) => {
+                    inserted += 1;
+                    affected_keys.insert((it.product_id, it.price_type.clone()));
+                }
+                Err(e) => {
+                    errors.push(format!("商品 {} / {} / {} : 写入失败 {}", it.product_id, it.price_type, it.effective_date, e));
+                }
+            }
+        }
+    }
+
+    // 重建 end_date + 刷新 product_price 快照
+    for (pid, pt) in &affected_keys {
+        if let Err(e) = crate::rebuild_price_schedule_end_dates(*pid, pt).await {
+            eprintln!("[price_schedule batch] 维护 end_date 失败 pid={} pt={}: {}", pid, pt, e);
+        }
+        let _ = sqlx::query(
+            "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source)
+             SELECT product_id, price_type, price, effective_date, source
+             FROM product_price_schedule
+             WHERE product_id = ? AND price_type = ?
+             ORDER BY effective_date DESC, id DESC LIMIT 1"
+        )
+        .bind(pid)
+        .bind(pt)
+        .execute(crate::db::pool())
+        .await;
+    }
+
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+    let detail = format!(
+        "批量导入价格策略：inserted={}, skipped={}, errors={}",
+        inserted, skipped, errors.len()
+    );
+    crate::auth::log_operation(&ctx, "批量导入价格策略", "price_schedule", "0", &detail).await;
+
+    let result = serde_json::json!({
+        "success": true,
+        "inserted": inserted,
+        "skipped": skipped,
+        "errors": errors,
+        "total": validated.len(),
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// 查询某商品在某 price_type 下的全部历史时段（含起止日期）
+pub async fn api_price_schedule_history(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/history").await {
+        return (code, msg).into_response();
+    }
+    let product_id: i64 = params.get("product_id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let price_type = params.get("price_type").cloned().unwrap_or_default();
+    if product_id <= 0 || price_type.is_empty() {
+        let empty = serde_json::json!({ "data": [] });
+        return (StatusCode::OK, serde_json::to_string(&empty).unwrap()).into_response();
+    }
+    let rows = sqlx::query(
+        "SELECT id, price, effective_date, end_date, source, remark, create_at
+         FROM product_price_schedule
+         WHERE product_id = ? AND price_type = ?
+         ORDER BY effective_date ASC, id ASC"
+    )
+    .bind(product_id)
+    .bind(&price_type)
+    .fetch_all(crate::db::pool())
+    .await
+    .unwrap_or_default();
+    let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "price": r.get::<f64, _>("price"),
+            "effective_date": r.get::<String, _>("effective_date"),
+            "end_date": r.get::<Option<String>, _>("end_date"),
+            "source": r.get::<Option<String>, _>("source"),
+            "remark": r.get::<Option<String>, _>("remark"),
+            "create_at": r.get::<Option<String>, _>("create_at"),
+        })
+    }).collect();
+    let result = serde_json::json!({ "data": items });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// 按 id 查单条价格策略记录（编辑表单加载使用，不依赖分页/筛选）
+/// GET /api/price_schedule/get?id=xx
+/// 返回：单条记录的 JSON，找不到返回 success:false
+pub async fn api_price_schedule_get(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/lookup").await {
+        return (code, msg).into_response();
+    }
+    let id: i64 = params.get("id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if id <= 0 {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false,\"message\":\"id 必填\"}".to_string()).into_response();
+    }
+    let row_opt = sqlx::query(
+        "SELECT pps.id, pps.product_id, p.name as product_name, p.spec, p.unit, p.alias1, p.alias2,
+                pps.price_type, pps.price, pps.effective_date, pps.end_date, pps.source, pps.remark, pps.create_at
+         FROM product_price_schedule pps LEFT JOIN product p ON pps.product_id = p.id
+         WHERE pps.id = ?"
+    )
+    .bind(id)
+    .fetch_optional(crate::db::pool())
+    .await
+    .ok()
+    .flatten();
+    match row_opt {
+        Some(r) => {
+            let item = serde_json::json!({
+                "id": r.get::<i64, _>("id"),
+                "product_id": r.get::<i64, _>("product_id"),
+                "product_name": r.get::<Option<String>, _>("product_name").unwrap_or_default(),
+                "spec": r.get::<Option<String>, _>("spec").unwrap_or_default(),
+                "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
+                "alias1": r.get::<Option<String>, _>("alias1").unwrap_or_default(),
+                "alias2": r.get::<Option<String>, _>("alias2").unwrap_or_default(),
+                "price_type": r.get::<String, _>("price_type"),
+                "price": r.get::<f64, _>("price"),
+                "effective_date": r.get::<String, _>("effective_date"),
+                "end_date": r.get::<Option<String>, _>("end_date"),
+                "source": r.get::<Option<String>, _>("source"),
+                "remark": r.get::<Option<String>, _>("remark"),
+                "create_at": r.get::<Option<String>, _>("create_at"),
+            });
+            (StatusCode::OK, serde_json::json!({"success": true, "data": item}).to_string()).into_response()
+        }
+        None => (StatusCode::OK, "{\"success\":false,\"message\":\"记录不存在\"}".to_string()).into_response(),
+    }
+}
+
+/// 时段诊断：返回指定商品下所有价格类型的完整时段链（用于排查数据是否正确录入）
+/// GET /api/price_schedule/diagnose?product_id=xx
+/// 返回：{ success, product_id, product_name, types: { "gov_procurement": [{id, effective_date, end_date, price, source}, ...], ... } }
+pub async fn api_price_schedule_diagnose(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/lookup").await {
+        return (code, msg).into_response();
+    }
+    let product_id: i64 = params.get("product_id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if product_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false,\"message\":\"product_id 必填\"}".to_string()).into_response();
+    }
+    let product_name: String = sqlx::query_scalar("SELECT name FROM product WHERE id = ?")
+        .bind(product_id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let rows = sqlx::query(
+        "SELECT id, price_type, price, effective_date, end_date, source, remark
+         FROM product_price_schedule
+         WHERE product_id = ?
+         ORDER BY price_type ASC, effective_date ASC, id ASC"
+    )
+    .bind(product_id)
+    .fetch_all(crate::db::pool())
+    .await
+    .unwrap_or_default();
+    let mut types: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for r in rows {
+        let pt: String = r.get("price_type");
+        let item = serde_json::json!({
+            "id": r.get::<i64, _>("id"),
+            "price": r.get::<f64, _>("price"),
+            "effective_date": r.get::<String, _>("effective_date"),
+            "end_date": r.get::<Option<String>, _>("end_date"),
+            "source": r.get::<Option<String>, _>("source"),
+            "remark": r.get::<Option<String>, _>("remark"),
+        });
+        types
+            .entry(pt)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .map(|a| a.push(item));
+    }
+    let result = serde_json::json!({
+        "success": true,
+        "product_id": product_id,
+        "product_name": product_name,
+        "types": serde_json::Value::Object(types),
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// 批量按指定日期查询商品的 4 类价（gov_procurement / supermarket_1/2/3）
+/// POST /api/price_schedule/lookup_batch
+/// body: { date: "YYYY-MM-DD", product_ids: [1,2,3,...] }
+/// 返回: { success: true, date, prices: { "1": { gov_procurement: 3.2, supermarket_1: 3.5, supermarket_2, supermarket_3 }, ... } }
+/// 注意：JSON object key 必须是字符串，i64 序列化时会被 serde_json 转成字符串。
+/// 前端应使用 prices[String(pid)] 或 prices[pid]（JS 自动 toString）访问。
+pub async fn api_price_schedule_lookup_batch(
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/lookup").await {
+        return (code, msg).into_response();
+    }
+    #[derive(serde::Deserialize)]
+    struct Req {
+        date: String,
+        #[serde(default)]
+        product_ids: Vec<i64>,
+    }
+    let req: Req = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!(
+                "{{\"success\":false,\"message\":\"JSON 解析失败: {}\"}}", e
+            )).into_response();
+        }
+    };
+    if req.product_ids.is_empty() {
+        return (StatusCode::OK, serde_json::json!({"success": true, "date": req.date, "prices": {}}).to_string()).into_response();
+    }
+    let date = req.date.trim().to_string();
+    if date.is_empty() {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false,\"message\":\"date 不能为空\"}".to_string()).into_response();
+    }
+    let types = ["gov_procurement", "supermarket_1", "supermarket_2", "supermarket_3"];
+    // 用 serde_json::Map 显式以字符串为 key，避免 i64 数字 key 在不同 serde_json 版本下被当成 array index
+    let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for &pid in &req.product_ids {
+        let mut entry = serde_json::Map::new();
+        for t in types {
+            let m = crate::batch_lookup_effective_prices(&[pid], t, &date).await;
+            let v = m.get(&pid).copied().unwrap_or(0.0);
+            entry.insert(t.to_string(), serde_json::json!(v));
+        }
+        out.insert(pid.to_string(), serde_json::Value::Object(entry));
+    }
+    let result = serde_json::json!({
+        "success": true,
+        "date": date,
+        "prices": serde_json::Value::Object(out),
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// 按指定日期查询商品在某 price_type 下的生效价（用于销售单录入页"按日期加载价"）
+pub async fn api_price_schedule_lookup(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/lookup").await {
+        return (code, msg).into_response();
+    }
+    let product_id: i64 = params.get("product_id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let price_type = params.get("price_type").cloned().unwrap_or_default();
+    let query_date = params.get("query_date").cloned().unwrap_or_else(|| {
+        chrono::Local::now().format("%Y-%m-%d").to_string()
+    });
+    if product_id <= 0 || price_type.is_empty() {
+        return (StatusCode::OK, serde_json::to_string(&serde_json::json!({
+            "matched": false, "price": 0.0, "effective_date": null
+        })).unwrap()).into_response();
+    }
+    match crate::lookup_effective_price(product_id, &price_type, &query_date).await {
+        Some((price, schedule_id, eff_date)) => {
+            let result = serde_json::json!({
+                "matched": price > 0.0,
+                "price": price,
+                "schedule_id": schedule_id,
+                "effective_date": eff_date,
+                "query_date": query_date,
+            });
+            (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+        }
+        None => {
+            let result = serde_json::json!({
+                "matched": false, "price": 0.0, "effective_date": null, "query_date": query_date
+            });
+            (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+        }
+    }
+}
+
+/// 价格策略导入模板：导出 Excel 含"商品名称、商品编码、规格、别名1、别名2、单位、价格类型、生效日期、价格、备注"
+/// 供客户先填表再上传批量导入
+pub async fn api_price_schedule_export_template(
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/export_template").await {
+        return (code, msg).into_response();
+    }
+    let result: Result<Vec<u8>, XlsxError> = (|| {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+
+        let header_format = Format::new()
+            .set_bold()
+            .set_font_size(11)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin)
+            .set_background_color("#E5E7EB");
+        let note_format = Format::new()
+            .set_font_size(10)
+            .set_font_color("#6B7280");
+
+        // 顶部说明
+        worksheet.merge_range(0, 0, 0, 8,
+            "价格策略导入模板 - 政采价/超市比价按生效日期段录入", &note_format)?;
+        worksheet.merge_range(1, 0, 1, 8,
+            "说明：price_type 取值 gov_procurement / supermarket_1 / supermarket_2 / supermarket_3 / ai_realtime；effective_date 必填 YYYY-MM-DD；product_name 必须与商品表完全一致", &note_format)?;
+
+        let headers = ["商品名称*", "规格", "别名1", "别名2", "单位", "价格类型*", "生效日期*(YYYY-MM-DD)", "价格*", "备注"];
+        for (i, h) in headers.iter().enumerate() {
+            worksheet.write_with_format(3, i as u16, *h, &header_format)?;
+        }
+        worksheet.set_column_width(0, 20.0)?;
+        worksheet.set_column_width(1, 15.0)?;
+        worksheet.set_column_width(2, 15.0)?;
+        worksheet.set_column_width(3, 15.0)?;
+        worksheet.set_column_width(4, 8.0)?;
+        worksheet.set_column_width(5, 18.0)?;
+        worksheet.set_column_width(6, 22.0)?;
+        worksheet.set_column_width(7, 10.0)?;
+        worksheet.set_column_width(8, 25.0)?;
+
+        // 示例行：方便用户对格式
+        let examples: &[(&str, &str, &str, &str, &str, &str, &str, &str, &str)] = &[
+            ("示例:白萝卜", "", "", "", "斤", "gov_procurement", "2026-01-01", "2.50", "示例：可删除本行后填入实际数据"),
+            ("示例:白萝卜", "", "", "", "斤", "gov_procurement", "2026-08-15", "3.20", "示例：价调整时段2"),
+        ];
+        for (i, row) in examples.iter().enumerate() {
+            // row 是 &(&str,...) 9 元组；解构成单个 val 数组
+            let vals: [&str; 9] = [
+                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8,
+            ];
+            for (j, val) in vals.iter().enumerate() {
+                worksheet.write_string((4 + i) as u32, j as u16, *val)?;
+            }
+        }
+
+        workbook.save_to_buffer()
+    })();
+
+    match result {
+        Ok(buf) => crate::utils::xlsx_response(buf, "价格策略导入模板.xlsx"),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("生成失败: {}", e)).into_response(),
+    }
+}
+
+/// 导出当前已录入的价格策略列表（按筛选条件）
+pub async fn api_price_schedule_export(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/export").await {
+        return (code, msg).into_response();
+    }
+    let product_id: i64 = params.get("product_id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let price_type = params.get("price_type").cloned().unwrap_or_default();
+    let effective_from = params.get("effective_from").cloned().unwrap_or_default();
+    let effective_to = params.get("effective_to").cloned().unwrap_or_default();
+    let keyword = params.get("keyword").cloned().unwrap_or_default();
+
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut simple_binds: Vec<String> = Vec::new();
+    if product_id > 0 {
+        where_sql.push_str(" AND pps.product_id = ?");
+        simple_binds.push(product_id.to_string());
+    }
+    if !price_type.is_empty() {
+        where_sql.push_str(" AND pps.price_type = ?");
+        simple_binds.push(price_type);
+    }
+    if !effective_from.is_empty() {
+        where_sql.push_str(" AND pps.effective_date >= ?");
+        simple_binds.push(effective_from);
+    }
+    if !effective_to.is_empty() {
+        where_sql.push_str(" AND pps.effective_date <= ?");
+        simple_binds.push(effective_to);
+    }
+    if !keyword.is_empty() {
+        where_sql.push_str(" AND (p.name LIKE ? OR p.alias1 LIKE ? OR p.alias2 LIKE ?)");
+        let k = format!("%{}%", keyword);
+        simple_binds.push(k.clone());
+        simple_binds.push(k.clone());
+        simple_binds.push(k);
+    }
+
+    let mut list_sql = format!(
+        "SELECT pps.id, pps.product_id, p.name as product_name, p.spec, p.unit, p.alias1, p.alias2,
+                pps.price_type, pps.price, pps.effective_date, pps.end_date, pps.source, pps.remark
+         FROM product_price_schedule pps LEFT JOIN product p ON pps.product_id = p.id{}",
+        where_sql
+    );
+    list_sql.push_str(" ORDER BY pps.effective_date DESC, pps.id DESC");
+    let mut list_q = sqlx::query(AssertSqlSafe(list_sql.as_str()));
+    for b in &simple_binds {
+        list_q = list_q.bind(b);
+    }
+    let rows = list_q.fetch_all(crate::db::pool()).await.unwrap_or_default();
+
+    let result: Result<Vec<u8>, XlsxError> = (|| {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+        let header_format = Format::new()
+            .set_bold()
+            .set_font_size(10)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+        let cell_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Left)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin);
+        let price_format = Format::new()
+            .set_font_size(10)
+            .set_align(FormatAlign::Right)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_border(FormatBorder::Thin)
+            .set_num_format("0.00");
+
+        let headers = ["ID", "商品ID", "商品名称", "规格", "别名1", "别名2", "单位", "价格类型", "生效日期", "失效日期", "价格", "来源", "备注"];
+        for (i, h) in headers.iter().enumerate() {
+            worksheet.write_with_format(0, i as u16, *h, &header_format)?;
+        }
+        for (idx, r) in rows.iter().enumerate() {
+            let row = (idx + 1) as u32;
+            worksheet.write_with_format(row, 0, r.get::<i64, _>("id"), &cell_format)?;
+            worksheet.write_with_format(row, 1, r.get::<i64, _>("product_id"), &cell_format)?;
+            worksheet.write_with_format(row, 2, r.get::<Option<String>, _>("product_name").unwrap_or_default(), &cell_format)?;
+            worksheet.write_with_format(row, 3, r.get::<Option<String>, _>("spec").unwrap_or_default(), &cell_format)?;
+            worksheet.write_with_format(row, 4, r.get::<Option<String>, _>("alias1").unwrap_or_default(), &cell_format)?;
+            worksheet.write_with_format(row, 5, r.get::<Option<String>, _>("alias2").unwrap_or_default(), &cell_format)?;
+            worksheet.write_with_format(row, 6, r.get::<Option<String>, _>("unit").unwrap_or_default(), &cell_format)?;
+            worksheet.write_with_format(row, 7, r.get::<String, _>("price_type"), &cell_format)?;
+            worksheet.write_with_format(row, 8, r.get::<String, _>("effective_date"), &cell_format)?;
+            let end_date: Option<String> = r.try_get("end_date").ok().flatten();
+            worksheet.write_with_format(row, 9, end_date.unwrap_or_default(), &cell_format)?;
+            worksheet.write_with_format(row, 10, r.get::<f64, _>("price"), &price_format)?;
+            let source: Option<String> = r.try_get("source").ok().flatten();
+            worksheet.write_with_format(row, 11, source.unwrap_or_default(), &cell_format)?;
+            let remark: Option<String> = r.try_get("remark").ok().flatten();
+            worksheet.write_with_format(row, 12, remark.unwrap_or_default(), &cell_format)?;
+        }
+        for c in 0..13u16 {
+            worksheet.set_column_width(c, 14.0)?;
+        }
+        worksheet.set_column_width(2, 22.0)?;
+        workbook.save_to_buffer()
+    })();
+
+    match result {
+        Ok(buf) => crate::utils::xlsx_response(buf, "价格策略列表.xlsx"),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("生成失败: {}", e)).into_response(),
+    }
+}
+
+/// 销售单补单专用：按 (order_date, purchaser_id) 匹配历史时段政采价，
+/// 仅对那些明细行 unit_price = 0 或 flag 标记为"待补价"的行按当时价重算金额。
+/// 其他明细（已有非零价的行）保持不变。
+pub async fn api_price_schedule_backfill_sales_order(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/backfill_sales_order").await {
+        return (code, msg).into_response();
+    }
+    let sales_order_id: i64 = params.get("order_id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let force: bool = params.get("force").map(|s| s == "1" || s == "true").unwrap_or(false);
+    let price_type: String = params.get("price_type").cloned().unwrap_or_else(|| "gov_procurement".to_string());
+
+    if sales_order_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"order_id 必填\"}".to_string()).into_response();
+    }
+    if !is_valid_price_type(&price_type) {
+        return (StatusCode::BAD_REQUEST, format!("{{\"success\":false, \"message\":\"price_type 非法：{}\"}}", price_type)).into_response();
+    }
+
+    // 行级数据权限
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+    let purchaser_id: i64 = sqlx::query_scalar("SELECT purchaser_id FROM sales_order WHERE id = ?")
+        .bind(sales_order_id)
+        .fetch_optional(crate::db::pool())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    if purchaser_id == 0 {
+        return (StatusCode::NOT_FOUND, "{\"success\":false, \"message\":\"销售单不存在\"}".to_string()).into_response();
+    }
+    if !crate::auth::can_access_sales_order(&ctx, purchaser_id) {
+        return (StatusCode::FORBIDDEN, "{\"success\":false, \"message\":\"您没有权限操作此销售单\"}".to_string()).into_response();
+    }
+    let order_date: String = sqlx::query_scalar("SELECT order_date FROM sales_order WHERE id = ?")
+        .bind(sales_order_id)
+        .fetch_one(crate::db::pool())
+        .await
+        .unwrap_or_default();
+    // order_date 取前 10 位 'YYYY-MM-DD'
+    let order_date_short = if order_date.len() >= 10 { order_date[..10].to_string() } else { order_date.clone() };
+
+    // 拉取该订单所有明细
+    let items = sqlx::query(
+        "SELECT id, product_id, product_name, unit, quantity, unit_price, amount
+         FROM sales_order_item WHERE order_id = ?"
+    )
+    .bind(sales_order_id)
+    .fetch_all(crate::db::pool())
+    .await
+    .unwrap_or_default();
+
+    if items.is_empty() {
+        return (StatusCode::OK, "{\"success\":true, \"updated\":0, \"message\":\"订单无明细\"}".to_string()).into_response();
+    }
+
+    // 收集 product_id
+    let product_ids: Vec<i64> = items.iter().map(|r| r.get::<i64, _>("product_id")).filter(|p| *p > 0).collect();
+    let price_map = crate::batch_lookup_effective_prices(&product_ids, &price_type, &order_date_short).await;
+
+    let mut updated = 0;
+    let mut kept = 0;
+    let mut missing: Vec<String> = Vec::new();
+
+    for r in &items {
+        let item_id = r.get::<i64, _>("id");
+        let product_id = r.get::<i64, _>("product_id");
+        let product_name: String = r.get("product_name");
+        let unit: String = r.get::<Option<String>, _>("unit").unwrap_or_default();
+        let qty: f64 = r.get::<f64, _>("quantity");
+        let cur_price: f64 = r.get::<f64, _>("unit_price");
+
+        // force=true 时所有行都重算；否则仅 unit_price <= 0 的行重算
+        let need_update = force || cur_price <= 0.0;
+        if !need_update {
+            kept += 1;
+            continue;
+        }
+
+        let new_price = price_map.get(&product_id).copied().unwrap_or(0.0);
+        if new_price <= 0.0 {
+            missing.push(format!("{}({})", product_name, unit));
+            continue;
+        }
+        let new_amount = new_price * qty;
+        let _ = sqlx::query(
+            "UPDATE sales_order_item SET unit_price = ?, amount = ? WHERE id = ?"
+        )
+        .bind(new_price)
+        .bind(new_amount)
+        .bind(item_id)
+        .execute(crate::db::pool())
+        .await;
+        updated += 1;
+    }
+
+    // 重算主表 total_amount / amount_reduction / final_amount（按 discount_rate）
+    let discount_rate: f64 = sqlx::query_scalar("SELECT discount_rate FROM sales_order WHERE id = ?")
+        .bind(sales_order_id)
+        .fetch_one(crate::db::pool())
+        .await
+        .unwrap_or(0.0);
+    let total_amount: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount), 0) FROM sales_order_item WHERE order_id = ?"
+    )
+    .bind(sales_order_id)
+    .fetch_one(crate::db::pool())
+    .await
+    .unwrap_or(0.0);
+    let amount_reduction = total_amount * (discount_rate / 100.0);
+    let final_amount = total_amount - amount_reduction;
+    let _ = sqlx::query(
+        "UPDATE sales_order SET total_amount = ?, amount_reduction = ?, final_amount = ? WHERE id = ?"
+    )
+    .bind(total_amount)
+    .bind(amount_reduction)
+    .bind(final_amount)
+    .bind(sales_order_id)
+    .execute(crate::db::pool())
+    .await;
+
+    let detail = format!(
+        "补单按 order_date={} 应用 {} 价：updated={}, kept={}, missing={}",
+        order_date_short, price_type, updated, kept, missing.len()
+    );
+    crate::auth::log_operation(&ctx, "补单按价重算", "sales_order", &sales_order_id.to_string(), &detail).await;
+
+    let result = serde_json::json!({
+        "success": true,
+        "order_id": sales_order_id,
+        "order_date": order_date_short,
+        "price_type": price_type,
+        "updated": updated,
+        "kept": kept,
+        "missing": missing,
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// Excel 批量导入价格策略（multipart/form-data file 字段）
+/// 解析 xlsx 后调用 api_price_schedule_batch_import 等价逻辑
+/// Excel 列：商品名称、规格、别名1、别名2、单位、价格类型、生效日期、价格、备注
+pub async fn api_price_schedule_batch_import_excel(
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/batch_import").await {
+        return (code, msg).into_response();
+    }
+    // 收集上传的 xlsx 字节
+    let mut bytes: Option<Vec<u8>> = None;
+    while let Some(field) = match multipart.next_field().await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("解析上传失败: {}", e)).into_response(),
+    } {
+        if field.name() == Some("file") {
+            match field.bytes().await {
+                Ok(b) => bytes = Some(b.to_vec()),
+                Err(e) => return (StatusCode::BAD_REQUEST, format!("读取文件失败: {}", e)).into_response(),
+            }
+        }
+    }
+    let bytes = match bytes {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"未上传 file 字段\"}".to_string()).into_response(),
+    };
+
+    // 解析 xlsx
+    let cursor = std::io::Cursor::new(bytes);
+    let mut workbook = match open_workbook_auto_from_rs(cursor) {
+        Ok(wb) => wb,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("打开 Excel 失败: {}", e)).into_response(),
+    };
+    let sheet_names = workbook.sheet_names();
+    if sheet_names.is_empty() {
+        return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"Excel 中无 sheet\"}".to_string()).into_response();
+    }
+    let range = match workbook.worksheet_range(&sheet_names[0]) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("读取 sheet 失败: {}", e)).into_response(),
+    };
+
+    // 期望表头：商品名称*、规格、别名1、别名2、单位、价格类型*、生效日期*、价格*、备注
+    // 从 row 0 找列位置（兼容 "商品名称*" / "商品名称" 等）
+    let header_row = range.rows().next();
+    let col_idx_of = |row: &[calamine::Data], name: &str| -> Option<usize> {
+        for (i, cell) in row.iter().enumerate() {
+            let s = cell_to_string(cell);
+            if s.replace('*', "").trim() == name {
+                return Some(i);
+            }
+        }
+        None
+    };
+    let header = match header_row {
+        Some(r) => r,
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"Excel 为空\"}".to_string()).into_response(),
+    };
+    let idx_name = match col_idx_of(header, "商品名称") {
+        Some(i) => i,
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「商品名称」列\"}".to_string()).into_response(),
+    };
+    let idx_spec = col_idx_of(header, "规格");
+    let idx_alias1 = col_idx_of(header, "别名1");
+    let idx_alias2 = col_idx_of(header, "别名2");
+    let idx_unit = col_idx_of(header, "单位");
+    let idx_pt = match col_idx_of(header, "价格类型") {
+        Some(i) => i,
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「价格类型」列\"}".to_string()).into_response(),
+    };
+    let idx_eff = match col_idx_of(header, "生效日期") {
+        Some(i) => i,
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「生效日期」列\"}".to_string()).into_response(),
+    };
+    let idx_price = match col_idx_of(header, "价格") {
+        Some(i) => i,
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「价格」列\"}".to_string()).into_response(),
+    };
+    let idx_remark = col_idx_of(header, "备注");
+
+    // 解析行
+    let mut items: Vec<PriceScheduleReq> = Vec::new();
+    let mut parse_errors: Vec<String> = Vec::new();
+    for (row_idx, row) in range.rows().enumerate().skip(1) {
+        // 跳过全空行
+        if row.iter().all(|c| cell_to_string(c).trim().is_empty()) {
+            continue;
+        }
+        let get = |i: Option<usize>| -> String {
+            i.and_then(|j| row.get(j)).map(cell_to_string).unwrap_or_default().trim().to_string()
+        };
+        let product_name = get(Some(idx_name));
+        if product_name.is_empty() || product_name.starts_with("示例") {
+            continue;
+        }
+        let price_type = get(Some(idx_pt));
+        let eff_date_raw = get(Some(idx_eff));
+        let price_str = get(Some(idx_price));
+        let remark = get(idx_remark);
+        let spec = get(idx_spec);
+        let alias1 = get(idx_alias1);
+        let alias2 = get(idx_alias2);
+        let unit = get(idx_unit);
+
+        // 标准化生效日期：支持 "2026-01-01" / "2026/01/01" / Excel 序列号
+        let eff_date = normalize_date_string(&eff_date_raw);
+        // 价格：支持 "¥2.50" / "2.5" / "2,500.00" 等
+        let price_clean: String = price_str.chars().filter(|c| *c != '¥' && *c != ',' && *c != '￥' && *c != ' ').collect();
+        let price: f64 = price_clean.parse().unwrap_or(0.0);
+
+        // 用 product_name + spec + alias1 + alias2 匹配商品
+        // 优先 (name, spec)，无 spec 时回退 name + alias
+        let mut matched_pid: Option<i64> = None;
+        if !product_name.is_empty() {
+            // 1) name + spec
+            if !spec.is_empty() {
+                let row2 = sqlx::query("SELECT id FROM product WHERE name = ? AND COALESCE(spec,'') = ? LIMIT 1")
+                    .bind(&product_name).bind(&spec)
+                    .fetch_optional(crate::db::pool()).await.ok().flatten();
+                if let Some(r) = row2 {
+                    matched_pid = Some(r.get("id"));
+                }
+            }
+            // 2) name + alias1
+            if matched_pid.is_none() && !alias1.is_empty() {
+                let row2 = sqlx::query("SELECT id FROM product WHERE name = ? AND COALESCE(alias1,'') = ? LIMIT 1")
+                    .bind(&product_name).bind(&alias1)
+                    .fetch_optional(crate::db::pool()).await.ok().flatten();
+                if let Some(r) = row2 {
+                    matched_pid = Some(r.get("id"));
+                }
+            }
+            // 3) name + alias2
+            if matched_pid.is_none() && !alias2.is_empty() {
+                let row2 = sqlx::query("SELECT id FROM product WHERE name = ? AND COALESCE(alias2,'') = ? LIMIT 1")
+                    .bind(&product_name).bind(&alias2)
+                    .fetch_optional(crate::db::pool()).await.ok().flatten();
+                if let Some(r) = row2 {
+                    matched_pid = Some(r.get("id"));
+                }
+            }
+            // 4) name only
+            if matched_pid.is_none() {
+                let row2 = sqlx::query("SELECT id FROM product WHERE name = ? LIMIT 1")
+                    .bind(&product_name)
+                    .fetch_optional(crate::db::pool()).await.ok().flatten();
+                if let Some(r) = row2 {
+                    matched_pid = Some(r.get("id"));
+                }
+            }
+        }
+        let pid = match matched_pid {
+            Some(p) => p,
+            None => {
+                parse_errors.push(format!("第 {} 行：商品「{}」未找到", row_idx + 1, product_name));
+                continue;
+            }
+        };
+
+        items.push(PriceScheduleReq {
+            id: None,
+            product_id: pid,
+            price_type,
+            price,
+            effective_date: eff_date,
+            end_date: None,
+            source: Some("excel_import".to_string()),
+            remark: if remark.is_empty() { None } else { Some(remark) },
+        });
+        // 抑制未用 unit 警告：单位列仅用于辅助展示，不写入 schedule
+        let _ = unit;
+    }
+
+    if items.is_empty() && !parse_errors.is_empty() {
+        let result = serde_json::json!({
+            "success": false,
+            "inserted": 0,
+            "skipped": 0,
+            "errors": parse_errors,
+            "total": 0,
+        });
+        return (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response();
+    }
+
+    // 复用 batch_import 的核心逻辑
+    let mut seen: std::collections::HashSet<(i64, String, String)> = std::collections::HashSet::new();
+    let mut validated: Vec<PriceScheduleReq> = Vec::new();
+    let mut errors = parse_errors;
+    for it in items {
+        if let Some(e) = validate_price_schedule_req(&it) {
+            errors.push(format!("商品 {} / {} / {} : {}", it.product_id, it.price_type, it.effective_date, e));
+            continue;
+        }
+        let key = (it.product_id, it.price_type.clone(), it.effective_date.clone());
+        if !seen.insert(key) {
+            errors.push(format!("商品 {} / {} / {} : 同一批次内重复", it.product_id, it.price_type, it.effective_date));
+            continue;
+        }
+        validated.push(it);
+    }
+
+    let mut inserted = 0;
+    let mut skipped = 0;
+    let mut affected_keys: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+
+    for it in &validated {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_price_schedule WHERE product_id = ? AND price_type = ? AND effective_date = ?"
+        )
+        .bind(it.product_id)
+        .bind(&it.price_type)
+        .bind(&it.effective_date)
+        .fetch_one(crate::db::pool())
+        .await
+        .unwrap_or(0);
+        if exists > 0 {
+            // 存在则更新 price / source / remark（避免与手工录入冲突，采用 upsert 语义）
+            let upd = sqlx::query(
+                "UPDATE product_price_schedule SET price = ?, source = ?, remark = ? WHERE product_id = ? AND price_type = ? AND effective_date = ?"
+            )
+            .bind(it.price)
+            .bind(&it.source)
+            .bind(&it.remark)
+            .bind(it.product_id)
+            .bind(&it.price_type)
+            .bind(&it.effective_date)
+            .execute(crate::db::pool())
+            .await;
+            match upd {
+                Ok(r) if r.rows_affected() > 0 => {
+                    inserted += 1;
+                    affected_keys.insert((it.product_id, it.price_type.clone()));
+                }
+                Ok(_) => { skipped += 1; }
+                Err(e) => errors.push(format!("商品 {} / {} / {} : 更新失败 {}", it.product_id, it.price_type, it.effective_date, e)),
+            }
+        } else {
+            let ins = sqlx::query(
+                "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
+                 VALUES (?, ?, ?, ?, NULL, ?, ?)"
+            )
+            .bind(it.product_id).bind(&it.price_type).bind(it.price)
+            .bind(&it.effective_date).bind(&it.source).bind(&it.remark)
+            .execute(crate::db::pool()).await;
+            match ins {
+                Ok(_) => {
+                    inserted += 1;
+                    affected_keys.insert((it.product_id, it.price_type.clone()));
+                }
+                Err(e) => errors.push(format!("商品 {} / {} / {} : 写入失败 {}", it.product_id, it.price_type, it.effective_date, e)),
+            }
+        }
+    }
+
+    for (pid, pt) in &affected_keys {
+        if let Err(e) = crate::rebuild_price_schedule_end_dates(*pid, pt).await {
+            eprintln!("[price_schedule excel import] 维护 end_date 失败 pid={} pt={}: {}", pid, pt, e);
+        }
+        let _ = sqlx::query(
+            "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source)
+             SELECT product_id, price_type, price, effective_date, source
+             FROM product_price_schedule
+             WHERE product_id = ? AND price_type = ?
+             ORDER BY effective_date DESC, id DESC LIMIT 1"
+        )
+        .bind(pid).bind(pt)
+        .execute(crate::db::pool()).await;
+    }
+
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+    let detail = format!("Excel 批量导入价格策略：inserted={}, skipped={}, errors={}", inserted, skipped, errors.len());
+    crate::auth::log_operation(&ctx, "Excel批量导入价格策略", "price_schedule", "0", &detail).await;
+
+    let result = serde_json::json!({
+        "success": true,
+        "inserted": inserted,
+        "skipped": skipped,
+        "errors": errors,
+        "total": validated.len(),
+    });
+    (StatusCode::OK, serde_json::to_string(&result).unwrap()).into_response()
+}
+
+/// 将 calamine Data 单元格转字符串
+fn cell_to_string(cell: &calamine::Data) -> String {
+    match cell {
+        calamine::Data::String(s) => s.clone(),
+        calamine::Data::Float(f) => {
+            // 可能是 Excel 日期序列号（44000+）
+            if f.fract() == 0.0 && *f > 30000.0 && *f < 80000.0 {
+                // 转 YYYY-MM-DD
+                let serial = *f as i64;
+                if let Some(dt) = excel_serial_to_date(serial) {
+                    return dt;
+                }
+            }
+            f.to_string()
+        }
+        calamine::Data::Int(i) => i.to_string(),
+        calamine::Data::Bool(b) => b.to_string(),
+        calamine::Data::DateTime(dt) => dt.to_string(),
+        calamine::Data::DateTimeIso(s) => s.clone(),
+        calamine::Data::DurationIso(s) => s.clone(),
+        calamine::Data::Error(e) => format!("{:?}", e),
+        calamine::Data::Empty => String::new(),
+    }
+}
+
+/// Excel 日期序列号 → 'YYYY-MM-DD'
+/// 序列号 1 = 1900-01-01（注意 Excel 1900 闰年 bug，故 60 以下要 +1 修正）
+fn excel_serial_to_date(serial: i64) -> Option<String> {
+    // 简化算法：使用 chrono 偏移
+    use chrono::{Duration, NaiveDate};
+    let base = NaiveDate::from_ymd_opt(1899, 12, 30)?;
+    let dt = base + Duration::days(serial as i64);
+    Some(dt.format("%Y-%m-%d").to_string())
+}
+
+/// 标准化日期字符串：支持 "2026-01-01" / "2026/01/01" / Excel 序列号
+fn normalize_date_string(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() { return String::new(); }
+    if crate::is_valid_date_str(s) { return s.to_string(); }
+    // 替换 / 为 -
+    let normalized = s.replace('/', "-");
+    if crate::is_valid_date_str(&normalized) { return normalized; }
+    // 尝试纯数字序列号
+    if let Ok(serial) = s.parse::<i64>() {
+        if let Some(d) = excel_serial_to_date(serial) {
+            return d;
+        }
+    }
+    // 尝试 "2026-01-01 00:00:00" 形式
+    if let Some(idx) = s.find(' ') {
+        let part = &s[..idx];
+        if crate::is_valid_date_str(part) { return part.to_string(); }
+    }
+    s.to_string()
 }

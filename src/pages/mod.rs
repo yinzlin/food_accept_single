@@ -729,6 +729,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     <input type="text" id="searchKeyword" placeholder="搜索商品名称" class="form-control form-control-sm" style="width:200px" onkeydown="if(event.key==='Enter')searchProducts()">
                     <button class="btn btn-sm btn-outline-primary" onclick="searchProducts()">搜索</button>
                     <button class="btn btn-sm btn-outline-secondary" onclick="resetSearch()">显示全部</button>
+                    <button class="btn btn-sm btn-info" onclick="window.location.href='/query/price_schedule'">价格策略（按日期段）</button>
                     <button class="btn btn-sm btn-success" onclick="batchSetAutoUpdate(1)">全部开启自动更新售价</button>
                     <button class="btn btn-sm btn-secondary" onclick="batchSetAutoUpdate(0)">全部关闭自动更新售价</button>
                     <a href="/api/product/export" class="btn btn-sm btn-success">导出</a>
@@ -740,9 +741,9 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
         <div class="product-list-section">
         <table class="table table-bordered product-sticky-table">
-            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>审核</th><th style="width:260px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>最新政采/比价</th><th>审核</th><th style="width:280px">操作</th></tr></thead>
             <tbody id="productTableBody">
-                <tr><td colspan="13" class="text-center text-muted">加载中...</td></tr>
+                <tr><td colspan="14" class="text-center text-muted">加载中...</td></tr>
             </tbody>
         </table>
         <div id="productPagination" class="mt-3"></div>
@@ -788,7 +789,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 </div>
                                 <div class="col-md-4">
                                     <label class="form-label">基础单价（每基础单位，售价）</label>
-                                    <input type="number" step="0.01" name="base_price" class="form-control">
+                                    <input type="number" step="0.01" name="base_price" class="form-control" oninput="onBasePriceChange()">
                                 </div>
                                 <div class="col-md-4" id="purchasePriceField">
                                     <label class="form-label">当前进价（每基础单位，最近采购价）</label>
@@ -1074,9 +1075,27 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             function renderProductTable(products) {{
                 const tbody = document.getElementById('productTableBody');
                 if (!products || products.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="13" class="text-center text-muted">暂无商品数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="14" class="text-center text-muted">暂无商品数据</td></tr>';
                     return;
                 }}
+                // 异步拉取每个商品的最新政采价/超市比价
+                const today = new Date().toISOString().slice(0, 10);
+                const ids = products.map(function(p){{ return p.id; }});
+                fetch('/api/price_schedule/lookup_batch', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ date: today, product_ids: ids }})
+                }}).then(function(r){{ return r.json(); }}).then(function(data){{
+                    const prices = (data && data.prices) || {{}};
+                    renderProductTableHtml(products, prices);
+                }}).catch(function(e){{
+                    console.error('拉取价格策略失败:', e);
+                    renderProductTableHtml(products, {{}});
+                }});
+            }}
+
+            function renderProductTableHtml(products, prices) {{
+                const tbody = document.getElementById('productTableBody');
                 let html = '';
                 products.forEach(function(p) {{
                     let unitsText = '';
@@ -1119,8 +1138,41 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                             auditBtns += '<button class="btn btn-sm btn-success me-1" onclick="approveProduct(' + p.id + ')">审核</button>';
                         }}
                     }}
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + p.base_price + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td><td>' + auditBadge + '</td>';
-                    html += '<td>' + auditBtns + '<button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
+                    // 售价列：优先取政采平台价（gov_procurement，非空且 >0），否则回退到商品基础单价 base_price
+                    let priceCell = '<span class="text-muted">-</span>';
+                    let govForSell = 0;
+                    const pp = prices[String(p.id)] || prices[p.id];
+                    if (pp) {{
+                        govForSell = pp.gov_procurement || 0;
+                    }}
+                    const basePrice = parseFloat(p.base_price) || 0;
+                    if (govForSell > 0) {{
+                        // 政采价优先：显示政采价 + 标注来源；若 base_price 存在且与政采价不同，附小字提示
+                        let extra = '';
+                        if (basePrice > 0 && Math.abs(basePrice - govForSell) > 0.001) {{
+                            extra = '<br><small class="text-muted" title="商品基础单价">基础 ¥' + basePrice.toFixed(2) + '</small>';
+                        }}
+                        priceCell = '<b class="text-primary">¥' + govForSell.toFixed(2) + '</b><span class="badge bg-primary ms-1" style="font-size:10px;">政采</span>' + extra;
+                    }} else if (basePrice > 0) {{
+                        priceCell = '¥' + basePrice.toFixed(2);
+                    }}
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + priceCell + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
+                    // 最新政采/比价列：gov 优先，否则显示最大超市价
+                    let policyCell = '<span class="text-muted">-</span>';
+                    if (pp) {{
+                        const gov = pp.gov_procurement || 0;
+                        const sm1 = pp.supermarket_1 || 0;
+                        const sm2 = pp.supermarket_2 || 0;
+                        const sm3 = pp.supermarket_3 || 0;
+                        if (gov > 0) {{
+                            policyCell = '<span class="badge bg-primary" title="政采价(优先)">政采 ¥' + gov.toFixed(2) + '</span>';
+                        }} else if (Math.max(sm1, sm2, sm3) > 0) {{
+                            policyCell = '<span class="badge bg-info text-dark" title="超市比价">比价 ¥' + Math.max(sm1, sm2, sm3).toFixed(2) + '</span>';
+                        }}
+                    }}
+                    html += '<td>' + policyCell + '</td>';
+                    html += '<td>' + auditBadge + '</td>';
+                    html += '<td>' + auditBtns + '<button class="btn btn-sm btn-info me-1" onclick="openProductPriceSchedule(' + p.id + ', \'' + (p.name || '').replace(/'/g, '\\\\\'') + '\')">价策略</button><button class="btn btn-sm btn-outline-primary me-1" onclick="editProduct(' + p.id + ')">编辑</button><button class="btn btn-sm ' + toggleBtnClass + ' me-1" onclick="toggleProductStatus(' + p.id + ')">' + toggleBtnText + '</button><button class="btn btn-sm ' + autoBtnClass + ' me-1" onclick="toggleProductAutoUpdate(' + p.id + ', ' + (p.auto_update_price || 0) + ')">' + autoBtnText + '</button><button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(' + p.id + ')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML = html;
                 // P4: 渲染完成后,观察所有需要懒加载的占位符(没有 src 属性的 img)
@@ -1146,6 +1198,12 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 loadProductsByCategory(null, 1);
             }}
 
+            // 行内「价策略」按钮：跳转价格策略页并预筛选该商品
+            function openProductPriceSchedule(productId, productName) {{
+                const url = '/query/price_schedule?product_id=' + productId + '&product_name=' + encodeURIComponent(productName || '');
+                window.location.href = url;
+            }}
+
             function calcSellingPrice() {{
                 const form = document.getElementById('editForm');
                 const govPrice = parseFloat(form.gov_price.value) || 0;
@@ -1165,6 +1223,28 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
                 // 应用统一尾数规则
                 form.selling_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+            }}
+
+            // 基础单价快捷录入：基础单价变化时联动计算售价
+            // 规则：
+            //  - 若当前计算售价非空且 >0：将基础单价同步到计算售价（按尾数规则）
+            //  - 若计算售价为空或 0：用基础单价的快捷录入值回填计算售价（按尾数规则）
+            function onBasePriceChange() {{
+                const form = document.getElementById('editForm');
+                if (!form || !form.base_price || !form.selling_price) return;
+                const baseRaw = parseFloat(form.base_price.value);
+                if (!isFinite(baseRaw) || baseRaw <= 0) {{
+                    // 基础单价也清空时不做强制覆盖（保持 selling_price 现状）
+                    return;
+                }}
+                const sellingRaw = parseFloat(form.selling_price.value);
+                if (isFinite(sellingRaw) && sellingRaw > 0) {{
+                    // 计算售价非空/非零：基础单价同步到计算售价
+                    form.selling_price.value = roundToAllowedLastDigit(baseRaw).toFixed(2);
+                }} else {{
+                    // 计算售价为空/零：用基础单价的快捷录入值回填
+                    form.selling_price.value = roundToAllowedLastDigit(baseRaw).toFixed(2);
+                }}
             }}
 
             // 加成率变更时的客户端预览（仅在自动更新开启且有进价时）
@@ -2301,6 +2381,77 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderNoInput').value = data.order_no;
             }}
 
+            // 按订单日期批量加载政采价/超市比价，命中明细后自动填入单价
+            async function loadPriceScheduleByDate() {{
+                const date = document.getElementById('orderDateInput').value;
+                if (!date) {{
+                    alert('请先选择订单日期');
+                    return;
+                }}
+                if (!items || items.length === 0) {{
+                    alert('请先添加商品明细');
+                    return;
+                }}
+                const productIds = items.map(function(i){{ return i.product_id; }}).filter(function(id){{ return id > 0; }});
+                if (productIds.length === 0) {{
+                    alert('请先选择商品');
+                    return;
+                }}
+                try {{
+                    const res = await fetch('/api/price_schedule/lookup_batch', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ date: date, product_ids: productIds }})
+                    }});
+                    const data = await res.json();
+                    if (!data.success) {{
+                        alert('加载价格策略失败：' + (data.message || ''));
+                        return;
+                    }}
+                    const prices = data.prices || {{}};
+                    // 辅助：兼容 map key 是数字/字符串两种 JSON 序列化结果
+                    const getPrice = (pid) => prices[pid] || prices[String(pid)] || null;
+                    let filled = 0;
+                    const missingNames = [];
+                    items.forEach(function(item){{
+                        if (item.product_id <= 0) return;
+                        const p = getPrice(item.product_id);
+                        if (!p) {{
+                            missingNames.push(item.product_name || ('ID ' + item.product_id));
+                            return;
+                        }}
+                        const gov = p.gov_procurement || 0;
+                        const sm1 = p.supermarket_1 || 0;
+                        const sm2 = p.supermarket_2 || 0;
+                        const sm3 = p.supermarket_3 || 0;
+                        const maxSm = Math.max(sm1, sm2, sm3);
+                        if (gov > 0) {{
+                            item.unit_price = gov;
+                            item.base_price = gov;
+                            item.amount = item.unit_price * (item.quantity || 0);
+                            filled += 1;
+                        }} else if (maxSm > 0) {{
+                            item.unit_price = maxSm;
+                            item.base_price = maxSm;
+                            item.amount = item.unit_price * (item.quantity || 0);
+                            filled += 1;
+                        }} else {{
+                            missingNames.push(item.product_name || ('ID ' + item.product_id));
+                        }}
+                    }});
+                    renderItems();
+                    if (filled > 0 && missingNames.length === 0) {{
+                        alert('已按 ' + date + ' 政采价/超市比价回填 ' + filled + ' 条明细');
+                    }} else if (filled > 0 && missingNames.length > 0) {{
+                        alert('已回填 ' + filled + ' 条；以下 ' + missingNames.length + ' 个商品在 ' + date + ' 当日无任何价策略，将保持原单价：\n' + missingNames.join('、'));
+                    }} else {{
+                        alert('未找到 ' + date + ' 对应时段的政采价/超市比价，请先在【价格策略】页录入。\n\n涉及商品：' + missingNames.join('、') + '\n\n排查：\n1) 在【价格策略】页是否已为这些商品录入价格？\n2) 录入的 effective_date 是否 <= ' + date + '？\n3) 是否被后续时段的 end_date 提前结束？');
+                    }}
+                }} catch (e) {{
+                    alert('请求失败：' + e);
+                }}
+            }}
+
             function updateFinalAmount() {{
                 const total = parseFloat(document.getElementById('totalAmount').textContent) || 0;
                 const rate = parseFloat(document.getElementById('discountRateInput').value) || 0;
@@ -3154,7 +3305,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                     <div class="col-md-3">
                         <label>订单日期：</label>
-                        <input type="date" id="orderDateInput" class="form-control" value="{}" onchange="generateOrderNo('sales')">
+                        <input type="date" id="orderDateInput" class="form-control" value="{}" onchange="onOrderDateChange()">
                     </div>
                     <div class="col-md-3">
                         <label>供应商（验收单/报销单用）：</label>
@@ -3208,6 +3359,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 <div class="mt-3 d-flex align-items-center flex-wrap" style="gap:8px;">
                     <button onclick="saveOrder()" class="btn btn-success" id="saveBtn">保存销售订单</button>
                     <button onclick="resetForm()" class="btn btn-secondary">新建订单</button>
+                    <button onclick="loadPriceScheduleByDate()" class="btn btn-info" id="loadPriceByDateBtn" title="按订单日期加载政采价/超市比价">按日期加载价</button>
                     <button onclick="updatePrices()" class="btn btn-warning" id="updatePricesBtn" style="display:none">一键更新售价</button>
 
                     <input type="file" id="customerOrderImageInput" accept="image/*" style="display:none" onchange="uploadSalesOrderImage('customer')">
@@ -3400,7 +3552,122 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('finalAmount').textContent = finalAmount.toFixed(2);
             }}
 
+            // 按订单日期批量加载政采价/超市比价，命中明细后自动填入单价
+            async function loadPriceScheduleByDate() {{
+                const date = document.getElementById('orderDateInput').value;
+                if (!date) {{
+                    alert('请先选择订单日期');
+                    return;
+                }}
+                if (!items || items.length === 0) {{
+                    alert('请先添加商品明细');
+                    return;
+                }}
+                const productIds = items.map(function(i){{ return i.product_id; }}).filter(function(id){{ return id > 0; }});
+                if (productIds.length === 0) {{
+                    alert('请先选择商品');
+                    return;
+                }}
+                try {{
+                    const res = await fetch('/api/price_schedule/lookup_batch', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ date: date, product_ids: productIds }})
+                    }});
+                    const data = await res.json();
+                    if (!data.success) {{
+                        alert('加载价格策略失败：' + (data.message || ''));
+                        return;
+                    }}
+                    const prices = data.prices || {{}};
+                    // 兼容 map key 是数字/字符串两种 JSON 序列化结果
+                    const getPrice = (pid) => prices[pid] || prices[String(pid)] || null;
+                    let filled = 0;
+                    const missingNames = [];
+                    items.forEach(function(item){{
+                        if (item.product_id <= 0) return;
+                        const p = getPrice(item.product_id);
+                        if (!p) {{
+                            missingNames.push(item.product_name || ('ID ' + item.product_id));
+                            return;
+                        }}
+                        const gov = p.gov_procurement || 0;
+                        const sm1 = p.supermarket_1 || 0;
+                        const sm2 = p.supermarket_2 || 0;
+                        const sm3 = p.supermarket_3 || 0;
+                        const maxSm = Math.max(sm1, sm2, sm3);
+                        if (gov > 0) {{
+                            item.unit_price = gov;
+                            item.base_price = gov;
+                            item.amount = item.unit_price * (item.quantity || 0);
+                            filled += 1;
+                        }} else if (maxSm > 0) {{
+                            item.unit_price = maxSm;
+                            item.base_price = maxSm;
+                            item.amount = item.unit_price * (item.quantity || 0);
+                            filled += 1;
+                        }} else {{
+                            missingNames.push(item.product_name || ('ID ' + item.product_id));
+                        }}
+                    }});
+                    renderItems();
+                    if (filled > 0 && missingNames.length === 0) {{
+                        alert('已按 ' + date + ' 政采价/超市比价回填 ' + filled + ' 条明细');
+                    }} else if (filled > 0 && missingNames.length > 0) {{
+                        alert('已回填 ' + filled + ' 条；以下 ' + missingNames.length + ' 个商品在 ' + date + ' 当日无任何价策略，将保持原单价：\n' + missingNames.join('、'));
+                    }} else {{
+                        alert('未找到 ' + date + ' 对应时段的政采价/超市比价，请先在【价格策略】页录入。\n\n涉及商品：' + missingNames.join('、') + '\n\n排查：\n1) 在【价格策略】页是否已为这些商品录入价格？\n2) 录入的 effective_date 是否 <= ' + date + '？\n3) 是否被后续时段的 end_date 提前结束？');
+                    }}
+                }} catch (e) {{
+                    alert('请求失败：' + e);
+                }}
+            }}
+
             generateOrderNo('sales');
+
+            // 订单日期变化时：已选明细按新日期重新拉政采价/超市比价覆盖
+            async function onOrderDateChange() {{
+                generateOrderNo('sales');
+                if (!items || items.length === 0) return;
+                const newDate = document.getElementById('orderDateInput').value;
+                if (!newDate) return;
+                const ids = items.map(function(i){{ return i.product_id; }}).filter(function(id){{ return id > 0; }});
+                if (ids.length === 0) return;
+                try {{
+                    const resp = await fetch('/api/price_schedule/lookup_batch', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ date: newDate, product_ids: ids }})
+                    }});
+                    const jd = await resp.json();
+                    if (!(jd && jd.success)) return;
+                    const prices = jd.prices || {{}};
+                    let updated = 0;
+                    items.forEach(function(it){{
+                        if (it.product_id <= 0) return;
+                        const p = prices[it.product_id];
+                        if (!p) return;
+                        const gov = p.gov_procurement || 0;
+                        const maxSm = Math.max(p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0);
+                        if (gov > 0) {{
+                            it.unit_price = gov;
+                            it.base_price = gov;
+                            it.amount = (it.quantity || 0) * gov;
+                            updated += 1;
+                        }} else if (maxSm > 0) {{
+                            it.unit_price = maxSm;
+                            it.base_price = maxSm;
+                            it.amount = (it.quantity || 0) * maxSm;
+                            updated += 1;
+                        }}
+                    }});
+                    if (updated > 0) {{
+                        renderItems();
+                    }}
+                }} catch (e) {{
+                    console.error('onOrderDateChange 加载价失败:', e);
+                }}
+            }}
 
             function addItem() {{
                 items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, quantity: 0, base_quantity: 0, amount: 0, pre_sale_quantity: 0, ratio: 1, units: [], supplier_id: 0, supplier_name: '' }});
@@ -3664,6 +3931,38 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 input.value = items[index].product_name;
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
+
+                // 按订单日期拉取该商品的政采价/超市比价，命中时用历史生效价覆盖默认 base_price
+                // 优先级：gov_procurement > supermarket_1/2/3 最大值
+                const orderDate = document.getElementById('orderDateInput').value;
+                if (orderDate) {{
+                    try {{
+                        const resp = await fetch('/api/price_schedule/lookup_batch', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify({{ date: orderDate, product_ids: [items[index].product_id] }})
+                        }});
+                        const jd = await resp.json();
+                        if (jd && jd.success) {{
+                            const p = (jd.prices || {{}})[items[index].product_id];
+                            if (p) {{
+                                const gov = p.gov_procurement || 0;
+                                const maxSm = Math.max(p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0);
+                                if (gov > 0) {{
+                                    items[index].unit_price = gov;
+                                    items[index].base_price = gov;
+                                    items[index].amount = (items[index].quantity || 0) * gov;
+                                }} else if (maxSm > 0) {{
+                                    items[index].unit_price = maxSm;
+                                    items[index].base_price = maxSm;
+                                    items[index].amount = (items[index].quantity || 0) * maxSm;
+                                }}
+                            }}
+                        }}
+                    }} catch (e) {{
+                        console.error('按日期加载价失败:', e);
+                    }}
+                }}
 
                 // 销售单：本次零售价对比最近采购价（同基础单位），低于则提醒，等待价格提示弹窗关闭
                 await checkPriceAfterSelect(items[index].product_id, items[index].base_unit, items[index].unit_price, 'sales', items[index].product_name);
@@ -5656,6 +5955,659 @@ pub async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<Stri
         </script>
     "#;
     Html(crate::layout_html("销售价格查询", "/query/sales_price", &content))
+}
+
+/// 价格策略管理页面
+/// 政采价 / 超市比价按生效日期段录入与查询
+/// 支持单条录入、Excel 批量导入、按商品查看历史时段、按销售单按日期补价
+pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<String> {
+    match crate::check_page_permission(&headers, "/query/price_schedule").await {
+        Err(e) => return e,
+        Ok(_) => {}
+    }
+    let user_ctx = crate::auth::get_user_ctx(&headers).await;
+    let can_manage = matches!(user_ctx.role.as_str(), "super_admin" | "admin");
+    let content = format!(r#"
+        <style>
+            .ps-suggest {{
+                position: absolute; z-index: 1000; top: 100%; left: 0; right: 0;
+                max-height: 320px; overflow-y: auto; background: #fff;
+                border: 1px solid #ced4da; border-top: none;
+                border-radius: 0 0 4px 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            }}
+            .ps-suggest ul {{ list-style: none; margin: 0; padding: 0; }}
+            .ps-suggest li {{
+                padding: 8px 12px; cursor: pointer;
+                border-bottom: 1px solid #f0f0f0;
+            }}
+            .ps-suggest li:hover {{ background-color: #e9ecef; }}
+            .ps-suggest li.active {{ background-color: #cfe2ff; border-left: 3px solid #0d6efd; padding-left: 9px; }}
+            .ps-suggest li small {{ color: #6c757d; }}
+            .ps-suggest li .ps-alias {{ color: #0d6efd; font-size: 12px; }}
+            .ps-suggest li .ps-purchase {{
+                float: right; font-size: 12px; font-weight: 600;
+                color: #fd7e14; background: #fff3e0;
+                padding: 1px 6px; border-radius: 8px;
+            }}
+            .ps-suggest-wrap {{ position: relative; }}
+            .ps-tag {{
+                display: inline-block; padding: 2px 8px; border-radius: 10px;
+                font-size: 12px; margin-right: 4px;
+            }}
+            .ps-tag-gov {{ background: #dbeafe; color: #1d4ed8; }}
+            .ps-tag-sup {{ background: #fef3c7; color: #92400e; }}
+            .ps-tag-ai {{ background: #ede9fe; color: #6d28d9; }}
+        </style>
+        <div class="card p-4 mb-3">
+            <h3 class="mb-3">价格策略管理 <small class="text-muted">政采价 / 超市比价 按生效日期段</small></h3>
+
+            <div class="row g-2 mb-3">
+                <div class="col-md-3">
+                    <label class="form-label">价格类型</label>
+                    <select id="filterPriceType" class="form-select">
+                        <option value="">全部</option>
+                        <option value="gov_procurement">政采价</option>
+                        <option value="supermarket_1">超市1价</option>
+                        <option value="supermarket_2">超市2价</option>
+                        <option value="supermarket_3">超市3价</option>
+                        <option value="ai_realtime">AI实时价</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">生效日期（起）</label>
+                    <input type="date" id="filterEffectiveFrom" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">生效日期（止）</label>
+                    <input type="date" id="filterEffectiveTo" class="form-control">
+                </div>
+                <div class="col-md-3 ps-suggest-wrap">
+                    <label class="form-label">商品关键字</label>
+                    <input type="text" id="filterKeyword" class="form-control" placeholder="商品名/别称模糊搜索" autocomplete="off">
+                    <input type="hidden" id="filterProductId" value="">
+                </div>
+            </div>
+
+            <div id="productPresetBar" class="alert alert-info py-2 px-3 mb-2" style="display:none">
+                <i class="bi bi-funnel"></i>
+                当前仅显示商品：<b id="productPresetName"></b>（id=<span id="productPresetId"></span>）
+                <a href="javascript:void(0)" onclick="clearProductPreset()" class="ms-2">清除筛选</a>
+            </div>
+
+            <div class="d-flex flex-wrap gap-2 mb-3">
+                <button class="btn btn-primary" onclick="loadList(1)">查询</button>
+                <button class="btn btn-secondary" onclick="resetFilter()">重置</button>
+                <span class="vr"></span>
+                {manage_buttons}
+                <span class="vr"></span>
+                <a class="btn btn-outline-secondary" href="/api/price_schedule/export_template">下载导入模板</a>
+                <a class="btn btn-outline-secondary" id="exportListBtn" href="/api/price_schedule/export">导出列表</a>
+                <span class="ms-auto text-muted small align-self-center" id="listStat"></span>
+            </div>
+
+            <div class="alert alert-info py-2 px-3 mb-3" role="alert">
+                <i class="bi bi-info-circle"></i>
+                <b>按生效日期录入，系统自动维护时段连续性</b>：每个 (商品, 价格类型) 的多笔记录按生效日期升序排列，后一条的生效日期即前一条的失效日期，最后一条失效日期为「至今」。
+                例如：录入 08-01 / 08-08 / 08-15 三笔，则自动形成 08-01~08-07、08-08~08-14、08-15~至今 三段。
+            </div>
+
+            <div class="table-responsive">
+                <table class="table table-bordered table-hover table-sm">
+                    <thead class="table-light">
+                        <tr>
+                            <th>商品ID</th>
+                            <th>商品名称</th>
+                            <th>规格</th>
+                            <th>价格类型</th>
+                            <th>生效日期</th>
+                            <th>时段（含）</th>
+                            <th>价格</th>
+                            <th>来源</th>
+                            <th>备注</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="listBody"><tr><td colspan="10" class="text-center text-muted">请先点击查询</td></tr></tbody>
+                </table>
+            </div>
+            <nav><ul class="pagination pagination-sm" id="listPager"></ul></nav>
+        </div>
+
+        {edit_modal}
+
+        <div class="modal fade" id="diagModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">时段诊断</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body" id="diagBody"></div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        const CAN_MANAGE = {can_manage_bool};
+        const PRICE_TYPE_LABEL = {{
+            gov_procurement: '政采价',
+            supermarket_1: '超市1价',
+            supermarket_2: '超市2价',
+            supermarket_3: '超市3价',
+            ai_realtime: 'AI实时价',
+        }};
+        const PRICE_TYPE_TAG_CLASS = {{
+            gov_procurement: 'ps-tag ps-tag-gov',
+            supermarket_1: 'ps-tag ps-tag-sup',
+            supermarket_2: 'ps-tag ps-tag-sup',
+            supermarket_3: 'ps-tag ps-tag-sup',
+            ai_realtime: 'ps-tag ps-tag-ai',
+        }};
+
+        let currentPage = 1;
+        let currentEditId = null;
+        let currentEditProductId = null;
+
+        function resetFilter() {{
+            document.getElementById('filterPriceType').value = '';
+            document.getElementById('filterEffectiveFrom').value = '';
+            document.getElementById('filterEffectiveTo').value = '';
+            document.getElementById('filterKeyword').value = '';
+            document.getElementById('filterProductId').value = '';
+            const bar = document.getElementById('productPresetBar');
+            if (bar) bar.style.display = 'none';
+            // 清掉 URL 上的 product_id/product_name 参数
+            const u = new URL(window.location.href);
+            u.searchParams.delete('product_id');
+            u.searchParams.delete('product_name');
+            window.history.replaceState({{}}, '', u.toString());
+            loadList(1);
+        }}
+
+        // 从 URL ?product_id=xx&product_name=yy 预选并显示条
+        function applyProductPreset() {{
+            const u = new URL(window.location.href);
+            const pid = u.searchParams.get('product_id');
+            const pname = u.searchParams.get('product_name') || '';
+            if (!pid) return;
+            document.getElementById('filterProductId').value = pid;
+            document.getElementById('productPresetName').textContent = pname || ('ID ' + pid);
+            document.getElementById('productPresetId').textContent = pid;
+            const bar = document.getElementById('productPresetBar');
+            if (bar) bar.style.display = '';
+        }}
+
+        function clearProductPreset() {{
+            resetFilter();
+        }}
+
+        function priceTypeTag(pt) {{
+            const cls = PRICE_TYPE_TAG_CLASS[pt] || 'ps-tag';
+            return `<span class="${{cls}}">${{PRICE_TYPE_LABEL[pt] || pt}}</span>`;
+        }}
+
+        async function loadList(page) {{
+            currentPage = page || 1;
+            const params = new URLSearchParams({{
+                page: currentPage,
+                page_size: 20,
+                price_type: document.getElementById('filterPriceType').value,
+                effective_from: document.getElementById('filterEffectiveFrom').value,
+                effective_to: document.getElementById('filterEffectiveTo').value,
+                keyword: document.getElementById('filterKeyword').value,
+            }});
+            const pid = document.getElementById('filterProductId').value;
+            if (pid) params.set('product_id', pid);
+            const res = await fetch('/api/price_schedule/list?' + params.toString());
+            const data = await res.json();
+            const tbody = document.getElementById('listBody');
+            tbody.innerHTML = '';
+            if (!data.data || data.data.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
+                document.getElementById('listStat').textContent = '共 0 条';
+                document.getElementById('listPager').innerHTML = '';
+                return;
+            }}
+            for (const r of data.data) {{
+                const tr = document.createElement('tr');
+                const editBtn = CAN_MANAGE ? `<button class="btn btn-sm btn-outline-primary me-1" onclick="openEdit(${{r.id}})">编辑</button>` : '';
+                const delBtn = CAN_MANAGE ? `<button class="btn btn-sm btn-outline-danger me-1" onclick="delRecord(${{r.id}})">删除</button>` : '';
+                const diagBtn = `<button class="btn btn-sm btn-outline-info" onclick="diagnose(${{r.product_id}})">时段</button>`;
+                // 展示时段：end_date 在 SQL 语义上是"开区间上界"（不含），所以失效日期 = end_date - 1
+                let rangeText;
+                if (r.end_date) {{
+                    const ed = subtractOneDay(r.end_date);
+                    rangeText = `<code>${{r.effective_date}}</code> ~ <code>${{ed}}</code>`;
+                }} else {{
+                    rangeText = `<code>${{r.effective_date}}</code> ~ <span class="badge bg-success">至今</span>`;
+                }}
+                tr.innerHTML = `
+                    <td>${{r.product_id}}</td>
+                    <td>${{escapeHtml(r.product_name || '')}}<br><small class="text-muted">${{escapeHtml(r.alias1 || '')}} ${{escapeHtml(r.alias2 || '')}}</small></td>
+                    <td>${{escapeHtml(r.spec || '')}}<br><small>${{escapeHtml(r.unit || '')}}</small></td>
+                    <td>${{priceTypeTag(r.price_type)}}</td>
+                    <td><code>${{r.effective_date}}</code></td>
+                    <td>${{rangeText}}</td>
+                    <td><b>¥${{r.price.toFixed(2)}}</b></td>
+                    <td><small>${{escapeHtml(r.source || '')}}</small></td>
+                    <td><small>${{escapeHtml(r.remark || '')}}</small></td>
+                    <td>{actions_html}</td>
+                `.replace('{actions_html}', editBtn + delBtn + diagBtn);
+                tbody.appendChild(tr);
+            }}
+            document.getElementById('listStat').textContent = '共 ' + data.total + ' 条';
+            renderPager(data.total, data.page_size, data.page);
+            // 同步"导出列表"链接的当前筛选
+            const exportUrl = '/api/price_schedule/export?' + params.toString();
+            document.getElementById('exportListBtn').href = exportUrl;
+        }}
+
+        function renderPager(total, pageSize, page) {{
+            const pager = document.getElementById('listPager');
+            pager.innerHTML = '';
+            const totalPages = Math.max(1, Math.ceil(total / pageSize));
+            if (totalPages <= 1) return;
+            const mkItem = (label, p, disabled, active) => {{
+                const li = document.createElement('li');
+                li.className = 'page-item' + (disabled ? ' disabled' : '') + (active ? ' active' : '');
+                const a = document.createElement('a');
+                a.className = 'page-link';
+                a.href = 'javascript:void(0)';
+                a.textContent = label;
+                if (!disabled && !active) a.onclick = () => loadList(p);
+                li.appendChild(a);
+                return li;
+            }};
+            pager.appendChild(mkItem('«', page - 1, page <= 1, false));
+            const start = Math.max(1, page - 3);
+            const end = Math.min(totalPages, start + 6);
+            for (let p = start; p <= end; p++) pager.appendChild(mkItem(p, p, false, p === page));
+            pager.appendChild(mkItem('»', page + 1, page >= totalPages, false));
+        }}
+
+        async function delRecord(id) {{
+            if (!confirm('确定删除该价格策略吗？此操作不可恢复。')) return;
+            const res = await fetch('/api/price_schedule/delete', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ id: id }})
+            }});
+            const text = await res.text();
+            let msg = text;
+            try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
+            if (res.ok) {{
+                alert('已删除');
+                loadList(currentPage);
+            }} else {{
+                alert('删除失败：' + msg);
+            }}
+        }}
+
+        function openCreate() {{
+            currentEditId = null;
+            currentEditProductId = null;
+            document.getElementById('editModalTitle').textContent = '新增价格策略';
+            document.getElementById('editId').value = '';
+            document.getElementById('editPriceType').value = 'gov_procurement';
+            document.getElementById('editPrice').value = '';
+            document.getElementById('editEffectiveDate').value = new Date().toISOString().slice(0, 10);
+            document.getElementById('editRemark').value = '';
+            document.getElementById('editSource').value = 'manual';
+            document.getElementById('editProductKeyword').value = '';
+            document.getElementById('editProductId').value = '';
+            // 显式启用所有字段（防止上一次编辑后保留 disabled 状态）
+            document.getElementById('editProductKeyword').disabled = false;
+            document.getElementById('editPriceType').disabled = false;
+            document.getElementById('editEffectiveDate').disabled = false;
+            new bootstrap.Modal(document.getElementById('editModal')).show();
+        }}
+
+        async function openEdit(id) {{
+            // 直接按 id 查单条，不再受分页/筛选影响
+            const res = await fetch('/api/price_schedule/get?id=' + encodeURIComponent(id));
+            const data = await res.json();
+            const r = data && data.success ? data.data : null;
+            if (!r) {{
+                alert('未找到该记录（id=' + id + '），请刷新列表后重试');
+                loadList(currentPage);
+                return;
+            }}
+            currentEditId = id;
+            currentEditProductId = r.product_id;
+            document.getElementById('editModalTitle').textContent = '编辑价格策略 #' + id;
+            document.getElementById('editId').value = id;
+            document.getElementById('editProductKeyword').value = (r.product_name || '') + (r.spec ? '（' + r.spec + '）' : '');
+            document.getElementById('editProductId').value = r.product_id;
+            document.getElementById('editPriceType').value = r.price_type;
+            document.getElementById('editPrice').value = r.price;
+            document.getElementById('editEffectiveDate').value = r.effective_date;
+            document.getElementById('editRemark').value = r.remark || '';
+            document.getElementById('editSource').value = r.source || '';
+            // 编辑模式下也允许调整价格类型 / 生效日期（变更后由后端按主键 id 覆盖更新；时段连续性由后端自动维护）
+            document.getElementById('editProductKeyword').disabled = false;
+            document.getElementById('editPriceType').disabled = false;
+            document.getElementById('editEffectiveDate').disabled = false;
+            new bootstrap.Modal(document.getElementById('editModal')).show();
+        }}
+
+        async function submitEdit() {{
+            const pid = parseInt(document.getElementById('editProductId').value || '0');
+            if (!pid) {{ alert('请先选择商品'); return; }}
+            const price = parseFloat(document.getElementById('editPrice').value || '0');
+            if (price < 0) {{ alert('价格无效'); return; }}
+            const effDate = document.getElementById('editEffectiveDate').value;
+            if (!effDate) {{ alert('请选择生效日期'); return; }}
+            // 编辑模式下，若商品 / 价格类型 / 生效日期发生变化，给出确认提示（避免误操作破坏时段连续性）
+            if (currentEditId && currentEditProductId && pid !== currentEditProductId) {{
+                if (!confirm('已切换商品，原商品下该时段的策略将被移除，新商品下将新增。是否继续？')) return;
+            }}
+            const payload = {{
+                id: currentEditId ? currentEditId : null,
+                product_id: pid,
+                price_type: document.getElementById('editPriceType').value,
+                price: price,
+                effective_date: effDate,
+                end_date: null,
+                source: document.getElementById('editSource').value,
+                remark: document.getElementById('editRemark').value,
+            }};
+            const url = currentEditId ? '/api/price_schedule/update' : '/api/price_schedule/create';
+            const res = await fetch(url, {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(payload)
+            }});
+            const text = await res.text();
+            let data; try {{ data = JSON.parse(text); }} catch (e) {{ data = {{ message: text }}; }}
+            if (res.ok) {{
+                alert(currentEditId ? '已更新' : '已创建');
+                bootstrap.Modal.getInstance(document.getElementById('editModal')).hide();
+                loadList(currentPage);
+            }} else {{
+                alert('保存失败：' + (data.message || text));
+            }}
+        }}
+
+        // 商品搜索建议：支持商品名/别称1/别称2 模糊搜索，支持 ↑↓ 键盘导航 + Enter 选中 + Esc 关闭
+        let psSuggestTimer = null;
+        let psActiveIndex = -1;   // 当前键盘高亮项下标，-1 表示未选中
+        function bindProductSuggest() {{
+            const kwInput = document.getElementById('editProductKeyword');
+            const suggest = document.getElementById('editProductSuggest');
+
+            // 应用高亮：给第 idx 项加 .active，并滚动到可见区域
+            function applyActive(idx) {{
+                const items = suggest.querySelectorAll('li[data-pid]');
+                if (items.length === 0) {{ psActiveIndex = -1; return; }}
+                // 循环边界：越界时回绕
+                if (idx < 0) idx = items.length - 1;
+                if (idx >= items.length) idx = 0;
+                psActiveIndex = idx;
+                items.forEach((li, i) => li.classList.toggle('active', i === idx));
+                items[idx].scrollIntoView({{ block: 'nearest' }});
+            }}
+
+            // 选中第 idx 项，回填 product_id 与文本框
+            function pickActive(idx) {{
+                const items = suggest.querySelectorAll('li[data-pid]');
+                if (idx < 0 || idx >= items.length) return false;
+                const li = items[idx];
+                document.getElementById('editProductId').value = li.dataset.pid;
+                kwInput.value = li.dataset.name + (li.dataset.spec ? '（' + li.dataset.spec + '）' : '');
+                suggest.style.display = 'none';
+                psActiveIndex = -1;
+                return true;
+            }}
+
+            kwInput.addEventListener('input', () => {{
+                clearTimeout(psSuggestTimer);
+                const kw = kwInput.value.trim();
+                // 手动改动文本即视为重新选择，先清掉已绑定的 product_id，防止残留旧关联
+                document.getElementById('editProductId').value = '';
+                psActiveIndex = -1;
+                if (!kw) {{ suggest.style.display = 'none'; return; }}
+                psSuggestTimer = setTimeout(async () => {{
+                    // 后端 /api/product/search 已支持 name / alias1 / alias2 三名 LIKE 模糊匹配
+                    const res = await fetch('/api/product/search?keyword=' + encodeURIComponent(kw));
+                    const data = await res.json();
+                    const list = Array.isArray(data) ? data : (data.products || data.data || []);
+                    if (!list || list.length === 0) {{
+                        suggest.innerHTML = '<ul><li class="text-muted" style="cursor:default">未找到匹配商品</li></ul>';
+                        suggest.style.display = 'block';
+                        psActiveIndex = -1;
+                        return;
+                    }}
+                    suggest.innerHTML = '<ul>' + list.slice(0, 15).map(p => {{
+                        // 别称用蓝色小字括号展示，方便确认是通过哪个名字命中的
+                        const aliases = [p.alias1, p.alias2].filter(a => a && a.trim());
+                        const aliasHtml = aliases.length
+                            ? ` <span class="ps-alias">（${{aliases.map(a => escapeHtml(a)).join(' / ')}}）</span>`
+                            : '';
+                        const metaParts = [p.spec, p.unit, p.category_name].filter(x => x && String(x).trim());
+                        const metaHtml = metaParts.length
+                            ? `<small>${{metaParts.map(x => escapeHtml(String(x))).join(' · ')}}</small>`
+                            : '';
+                        // 最近采购进价（product.purchase_price，每基础单位）；后端仅对 super_admin 返回真实值
+                        const pp = parseFloat(p.purchase_price) || 0;
+                        const ppHtml = pp > 0
+                            ? `<span class="ps-purchase">进价 ¥${{pp.toFixed(2)}}/${{escapeHtml(p.base_unit || '')}}</span>`
+                            : '';
+                        return `<li data-pid="${{p.id}}" data-name="${{escapeHtml(p.name)}}" data-spec="${{escapeHtml(p.spec || '')}}">
+                            <strong>${{escapeHtml(p.name)}}</strong>${{aliasHtml}}${{ppHtml}}
+                            ${{metaHtml}}
+                        </li>`;
+                    }}).join('') + '</ul>';
+                    suggest.style.display = 'block';
+                    // 默认高亮第一项，方便直接按 Enter 选中
+                    applyActive(0);
+                    suggest.querySelectorAll('li[data-pid]').forEach((li, i) => {{
+                        li.onclick = () => pickActive(i);
+                        li.onmouseenter = () => applyActive(i);
+                    }});
+                }}, 250);
+            }});
+
+            // 键盘导航
+            kwInput.addEventListener('keydown', (e) => {{
+                const visible = suggest.style.display !== 'none' && suggest.querySelectorAll('li[data-pid]').length > 0;
+                if (!visible) return;
+                if (e.key === 'ArrowDown') {{
+                    e.preventDefault();
+                    applyActive(psActiveIndex + 1);
+                }} else if (e.key === 'ArrowUp') {{
+                    e.preventDefault();
+                    applyActive(psActiveIndex - 1);
+                }} else if (e.key === 'Enter') {{
+                    // 有高亮项时拦截回车，避免误提交表单
+                    if (psActiveIndex >= 0) {{
+                        e.preventDefault();
+                        pickActive(psActiveIndex);
+                    }}
+                }} else if (e.key === 'Escape') {{
+                    suggest.style.display = 'none';
+                    psActiveIndex = -1;
+                }}
+            }});
+
+            document.addEventListener('click', (e) => {{
+                if (!suggest.contains(e.target) && e.target !== kwInput) {{
+                    suggest.style.display = 'none';
+                    psActiveIndex = -1;
+                }}
+            }});
+        }}
+
+        // 时段诊断：弹窗展示该商品下所有价格类型的完整时段链
+        async function diagnose(productId) {{
+            const res = await fetch('/api/price_schedule/diagnose?product_id=' + encodeURIComponent(productId));
+            const d = await res.json();
+            if (!d || !d.success) {{ alert('诊断失败'); return; }}
+            const types = d.types || {{}};
+            const keys = Object.keys(types);
+            if (keys.length === 0) {{
+                alert('商品「' + (d.product_name || productId) + '」下暂无任何价格策略记录');
+                return;
+            }}
+            let html = '<div class="mb-2"><b>' + escapeHtml(d.product_name || '') + '</b>（ID ' + productId + '）共 ' + keys.length + ' 种价格类型</div>';
+            for (const k of keys) {{
+                const list = types[k] || [];
+                html += '<div class="mb-3"><div class="mb-1">' + priceTypeTag(k) + ' <small class="text-muted">' + list.length + ' 个时段</small></div>';
+                html += '<table class="table table-sm table-bordered mb-0"><thead class="table-light"><tr><th>ID</th><th>时段（含）</th><th>价格</th><th>来源</th></tr></thead><tbody>';
+                for (const it of list) {{
+                    const range = it.end_date
+                        ? '<code>' + it.effective_date + '</code> ~ <code>' + subtractOneDay(it.end_date) + '</code>'
+                        : '<code>' + it.effective_date + '</code> ~ <span class="badge bg-success">至今</span>';
+                    html += '<tr><td>' + it.id + '</td><td>' + range + '</td><td><b>¥' + Number(it.price).toFixed(2) + '</b></td><td><small>' + escapeHtml(it.source || '') + '</small></td></tr>';
+                }}
+                html += '</tbody></table></div>';
+            }}
+            document.getElementById('diagBody').innerHTML = html;
+            new bootstrap.Modal(document.getElementById('diagModal')).show();
+        }}
+
+        function escapeHtml(s) {{
+            if (s == null) return '';
+            return String(s).replace(/[&<>"']/g, c => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[c]);
+        }}
+        // 日期字符串减 1 天（end_date 在 SQL 语义上为"开区间上界"，展示给用户时减 1 天更直观）
+        function subtractOneDay(isoDate) {{
+            try {{
+                const parts = String(isoDate).split('-');
+                if (parts.length !== 3) return isoDate;
+                const d = new Date(Date.UTC(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2])));
+                d.setUTCDate(d.getUTCDate() - 1);
+                const y = d.getUTCFullYear();
+                const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+                const day = String(d.getUTCDate()).padStart(2, '0');
+                return `${{y}}-${{m}}-${{day}}`;
+            }} catch (e) {{
+                return isoDate;
+            }}
+        }}
+
+        // 批量导入
+        async function doImport(input) {{
+            const file = input.files[0];
+            if (!file) return;
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch('/api/price_schedule/batch_import_excel', {{
+                method: 'POST', body: form
+            }});
+            input.value = '';
+            const text = await res.text();
+            try {{
+                const data = JSON.parse(text);
+                if (res.ok) {{
+                    let msg = '导入完成：inserted=' + data.inserted + ', skipped=' + data.skipped;
+                    if (data.errors && data.errors.length > 0) msg += '\n\n错误明细：\n' + data.errors.join('\n');
+                    alert(msg);
+                    loadList(1);
+                }} else {{
+                    alert('导入失败：' + (data.message || text));
+                }}
+            }} catch (e) {{
+                alert('解析响应失败：' + text);
+            }}
+        }}
+
+        // 销售单补价
+        async function doBackfill() {{
+            const orderId = prompt('请输入销售单 ID：');
+            if (!orderId) return;
+            const priceType = prompt('价格类型（gov_procurement / supermarket_1 / supermarket_2 / supermarket_3 / ai_realtime）：', 'gov_procurement');
+            if (!priceType) return;
+            const force = confirm('是否强制覆盖已有非零价？\n确定=force=1（全部重算），取消=force=0（仅补 unit_price=0 的明细）');
+            const res = await fetch(`/api/price_schedule/backfill_sales_order?order_id=${{orderId}}&price_type=${{encodeURIComponent(priceType)}}&force=${{force ? 1 : 0}}`);
+            const data = await res.json();
+            if (res.ok) {{
+                let msg = `补价完成：\n按 order_date=${{data.order_date}} 应用 ${{data.price_type}}\n更新 ${{data.updated}} 条，保留 ${{data.kept}} 条`;
+                if (data.missing && data.missing.length > 0) msg += '\n\n未找到价：\n' + data.missing.join('\n');
+                alert(msg);
+            }} else {{
+                alert('失败：' + (data.message || JSON.stringify(data)));
+            }}
+        }}
+
+        document.addEventListener('DOMContentLoaded', () => {{
+            applyProductPreset();
+            loadList(1);
+            bindProductSuggest();
+        }});
+        </script>
+    "#,
+        manage_buttons = if can_manage {
+            r#"<button class="btn btn-success" onclick="openCreate()">新增价格策略</button>
+                <label class="btn btn-warning mb-0">
+                    批量导入 Excel
+                    <input type="file" accept=".xlsx" style="display:none" onchange="doImport(this)">
+                </label>
+                <button class="btn btn-info" onclick="doBackfill()">销售单按价补单</button>"#
+        } else { "" },
+        edit_modal = if can_manage { r#"
+        <div class="modal fade" id="editModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="editModalTitle">新增价格策略</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <input type="hidden" id="editId">
+                        <input type="hidden" id="editProductId">
+                        <div class="mb-2 ps-suggest-wrap">
+                            <label class="form-label">商品 *</label>
+                            <input type="text" id="editProductKeyword" class="form-control" placeholder="输入商品名称搜索" autocomplete="off">
+                            <div id="editProductSuggest" class="ps-suggest" style="display:none"></div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-2">
+                                <label class="form-label">价格类型 *</label>
+                                <select id="editPriceType" class="form-select">
+                                    <option value="gov_procurement">政采价</option>
+                                    <option value="supermarket_1">超市1价</option>
+                                    <option value="supermarket_2">超市2价</option>
+                                    <option value="supermarket_3">超市3价</option>
+                                    <option value="ai_realtime">AI实时价</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-2">
+                                <label class="form-label">生效日期 *</label>
+                                <input type="date" id="editEffectiveDate" class="form-control">
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-2">
+                                <label class="form-label">价格 *</label>
+                                <input type="number" step="0.01" min="0" id="editPrice" class="form-control">
+                            </div>
+                            <div class="col-md-6 mb-2">
+                                <label class="form-label">来源</label>
+                                <input type="text" id="editSource" class="form-control" placeholder="manual / excel_import / ...">
+                            </div>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label">备注</label>
+                            <input type="text" id="editRemark" class="form-control" placeholder="选填">
+                        </div>
+                        <div class="text-muted small">
+                            <i class="bi bi-info-circle"></i> 时段连续性由系统自动维护；保存后该 (商品, 价格类型) 的后续所有时段按生效日期自动归并。
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                        <button type="button" class="btn btn-primary" onclick="submitEdit()">保存</button>
+                    </div>
+                </div>
+            </div>
+        </div>"# } else { "" },
+        can_manage_bool = can_manage,
+        actions_html = "{actions_html}",
+    );
+    Html(crate::layout_html("价格策略管理", "/query/price_schedule", &content))
 }
 
 pub async fn page_query_supplier_balance() -> Html<String> {

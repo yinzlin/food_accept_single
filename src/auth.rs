@@ -68,11 +68,12 @@ pub fn has_permission(role: &str, required_role: &str) -> bool {
 pub fn has_permission_point(role: &str, permission: &str) -> bool {
     // 全部业务权限点（供 super_admin 全量拥有）
     // supplier/purchaser 为基础资料管理权限点：供应商/采购方角色及以上可维护各自基础资料
-    const ALL_PERMS: [&str; 22] = [
+    const ALL_PERMS: [&str; 24] = [
         "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.unapprove", "purchase_order.cancel", "purchase_order.delete",
         "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.unapprove", "sales_order.adjust_price", "sales_order.cancel", "sales_order.delete",
         "query.view", "manage.admin", "manage.user", "manage.system", "manage.backup",
         "supplier", "purchaser",
+        "price_schedule.view", "price_schedule.manage",
     ];
 
     let role_perms: HashSet<&str> = match role {
@@ -82,12 +83,14 @@ pub fn has_permission_point(role: &str, permission: &str) -> bool {
             "supplier",
             "purchase_order.view", "purchase_order.create", "purchase_order.update", "purchase_order.approve", "purchase_order.cancel",
             "sales_order.view", "query.view",
+            "price_schedule.view",
         ]),
         "purchaser" => HashSet::from([
             "purchaser",
             "purchase_order.view",
             "sales_order.view", "sales_order.create", "sales_order.update", "sales_order.approve", "sales_order.adjust_price", "sales_order.cancel",
             "query.view",
+            "price_schedule.view",
         ]),
         "user" => HashSet::from(["query.view"]),
         _ => HashSet::new(),
@@ -194,7 +197,7 @@ pub fn get_route_required_role(path: &str) -> Option<&str> {
         "/purchase" | "/api/purchase_order/create" | "/api/purchase_order/update" | "/api/purchase_order/delete" => Some("supplier"),
         "/sales" | "/api/sales_order/create" | "/api/sales_order/update" | "/api/sales_order/update_prices" | "/api/sales_order/delete" | "/api/sales_order/upload_image" | "/api/sales_order/delete_image" => Some("purchaser"),
         "/query/purchase_order" | "/query/purchase_document" | "/query/purchase_price" | "/query/purchase_summary" | "/query/supplier_balance" => Some("supplier"),
-        "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" => Some("purchaser"),
+        "/query/sales_order" | "/query/sales_summary" | "/query/sales_price" | "/query/purchaser_balance" | "/query/product_rank" | "/query/reimburse_summary" | "/query/allocation_source" | "/query/order_adjust" | "/query/price_schedule" => Some("purchaser"),
         "/query/stock_balance" | "/query/stock_flow" | "/query/stock_warning" | "/query/slow_stock" | "/query/stock_summary" | "/query/stock_summary_reimburse" => Some("admin"),
         "/query/income_expense" | "/query/profit_detail" | "/query/overview" | "/query/category_stats" | "/query/document_summary" => Some("admin"),
         "/user" | "/api/user" | "/api/user/*" => Some("super_admin"),
@@ -280,6 +283,21 @@ pub fn check_api_route_permission(path: &str) -> Option<&str> {
             Some("query.view")
         } else {
             Some("manage.user")
+        }
+    } else if path.starts_with("/api/price_schedule/") {
+        // 价格策略管理：写操作（增/改/删/导入）需 manage 权限，读操作（list/history/lookup/batch_lookup/export/backfill）view 权限
+        if path.ends_with("/list")
+            || path.ends_with("/history")
+            || path.ends_with("/lookup")
+            || path.ends_with("/lookup_batch")
+            || path.ends_with("/get")
+            || path.ends_with("/diagnose")
+            || path.ends_with("/export")
+            || path.ends_with("/backfill_sales_order")
+        {
+            Some("price_schedule.view")
+        } else {
+            Some("price_schedule.manage")
         }
     } else if path.starts_with("/api/system/") {
         Some("manage.system")
