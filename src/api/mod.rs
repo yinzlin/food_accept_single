@@ -13361,9 +13361,8 @@ pub async fn api_price_schedule_create(
     if let Err((code, msg)) = crate::auth::check_api_permission(&headers, "/api/price_schedule/create").await {
         return (code, msg).into_response();
     }
-    if let Err(e) = check_basic_not_confirmed("product", req.product_id).await {
-        return e.into_response();
-    }
+    // 价格策略是独立的价格时段数据，与商品基础信息的审核状态无关，
+    // 因此不做「商品已审核则禁止修改」的锁定校验（市场价格随时变动，需随时可录入）
     if let Some(err) = validate_price_schedule_req(&req) {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
