@@ -2212,38 +2212,56 @@ pub async fn api_product_delete(headers: axum::http::HeaderMap, Json(req): Json<
         ("库存", "SELECT COUNT(*) FROM inventory WHERE product_id = ?"),
         ("采购订单明细", "SELECT COUNT(*) FROM purchase_order_item WHERE product_id = ?"),
         ("销售订单明细", "SELECT COUNT(*) FROM sales_order_item WHERE product_id = ?"),
-        ("食品项", "SELECT COUNT(*) FROM food_item WHERE product_id = ?"),
+        ("补货/订单调整明细", "SELECT COUNT(*) FROM order_supplement_item WHERE product_id = ?"),
     ];
 
     for (name, sql) in check_tables {
-        let count: i64 = sqlx::query(sql)
-            .bind(id)
-            .fetch_one(crate::db::pool())
-            .await
-            .map(|r| r.get(0))
-            .unwrap_or(0);
+        // 查询本身出错（如表结构变更导致列不存在）必须显式报错，不能静默当作 0 放行
+        let count: i64 = match sqlx::query(sql).bind(id).fetch_one(crate::db::pool()).await {
+            Ok(r) => r.get(0),
+            Err(e) => {
+                eprintln!("校验商品关联数据失败({}): {}", name, e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("校验{}时出错，删除已中止", name));
+            }
+        };
         if count > 0 {
             return (StatusCode::BAD_REQUEST, format!("该商品存在{}记录（{}条），无法删除，请先处理关联数据", name, count));
         }
     }
 
+    // product 被多张表以外键引用，且数据库开启了 foreign_keys 约束，
+    // 必须先清理附属数据再删商品，否则 DELETE 会因 FOREIGN KEY constraint failed 而失败
+    let mut tx = match crate::db::pool().begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("删除商品开启事务失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string());
+        }
+    };
+
+    for sql in [
+        "DELETE FROM product_unit WHERE product_id = ?",
+        "DELETE FROM product_price WHERE product_id = ?",
+        "DELETE FROM product_price_schedule WHERE product_id = ?",
+        "DELETE FROM product_price_log WHERE product_id = ?",
+    ] {
+        if let Err(e) = sqlx::query(sql).bind(id).execute(&mut *tx).await {
+            eprintln!("清理商品附属数据失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "删除失败：清理关联数据出错".to_string());
+        }
+    }
+
     let result = sqlx::query("DELETE FROM product WHERE id = ?")
         .bind(id)
-        .execute(crate::db::pool())
+        .execute(&mut *tx)
         .await;
     match result {
         Ok(r) => {
             if r.rows_affected() > 0 {
-                sqlx::query("DELETE FROM product_unit WHERE product_id = ?")
-                    .bind(id)
-                    .execute(crate::db::pool())
-                    .await
-                    .ok();
-                sqlx::query("DELETE FROM product_price WHERE product_id = ?")
-                    .bind(id)
-                    .execute(crate::db::pool())
-                    .await
-                    .ok();
+                if let Err(e) = tx.commit().await {
+                    eprintln!("删除商品提交事务失败: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string());
+                }
                 (StatusCode::OK, "删除成功".to_string())
             } else {
                 (StatusCode::NOT_FOUND, "商品不存在".to_string())
@@ -2251,7 +2269,7 @@ pub async fn api_product_delete(headers: axum::http::HeaderMap, Json(req): Json<
         }
         Err(e) => {
             eprintln!("删除商品失败: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "删除失败".to_string())
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败：{}", e))
         }
     }
 }
@@ -2976,9 +2994,7 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
 }
 
 pub async fn api_product_unit_create(Json(req): Json<ProductUnitReq>) -> impl IntoResponse {
-    if let Err((code, msg)) = check_basic_not_confirmed("product", req.product_id).await {
-        return (code, msg);
-    }
+    // 商品单位属价格维度（随时变动），不受商品基础信息审核状态锁定
     let result = sqlx::query(
         "INSERT INTO product_unit(product_id, unit_name, ratio, unit_price, purchase_price, sort_order) VALUES (?, ?, ?, ?, ?, ?)"
     )
@@ -3044,9 +3060,7 @@ pub async fn api_product_unit_delete(Json(req): Json<DeleteReq>) -> (StatusCode,
 
 pub async fn api_product_unit_delete_by_product(Json(req): Json<serde_json::Value>) -> (StatusCode, String) {
     let product_id = req["product_id"].as_i64().unwrap_or(0);
-    if let Err((code, msg)) = check_basic_not_confirmed("product", product_id).await {
-        return (code, msg);
-    }
+    // 商品单位属价格维度（随时变动），不受商品基础信息审核状态锁定
     let result = sqlx::query("DELETE FROM product_unit WHERE product_id = ?")
         .bind(product_id)
         .execute(crate::db::pool())
@@ -3089,9 +3103,7 @@ pub async fn api_product_unit_list(headers: axum::http::HeaderMap, axum::extract
 }
 
 pub async fn api_product_price_upsert(Json(req): Json<ProductPriceReq>) -> impl IntoResponse {
-    if let Err((code, msg)) = check_basic_not_confirmed("product", req.product_id).await {
-        return (code, msg).into_response();
-    }
+    // product_price 为最新价快照（价格策略 schedule 会同步刷新），属价格维度，不受商品审核锁定
     let result = sqlx::query(
         "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source) VALUES (?, ?, ?, ?, ?)"
     )
@@ -3161,9 +3173,7 @@ pub async fn api_product_price_delete_by_product(Json(req): Json<std::collection
         Some(&id) => id,
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if let Err((code, msg)) = check_basic_not_confirmed("product", product_id).await {
-        return (code, msg).into_response();
-    }
+    // product_price 为最新价快照（价格策略 schedule 会同步刷新），属价格维度，不受商品审核锁定
     sqlx::query("DELETE FROM product_price WHERE product_id = ?")
         .bind(product_id)
         .execute(crate::db::pool())

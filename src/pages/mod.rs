@@ -1664,8 +1664,11 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }}
                 }});
+                const msg = await res.text();
                 if (res.ok) {{
                     loadProductsByCategory(currentCategoryId);
+                }} else {{
+                    alert(action + '失败：' + (msg || ('HTTP ' + res.status)));
                 }}
             }}
 
@@ -1679,8 +1682,12 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify({{ id: id }})
                 }});
+                const msg = await res.text();
                 if (res.ok) {{
                     loadProductsByCategory(currentCategoryId);
+                }} else {{
+                    // 失败必须给出后端返回的具体原因，避免用户以为「点了没反应」
+                    alert('删除失败：' + (msg || ('HTTP ' + res.status)));
                 }}
             }}
 
@@ -6249,20 +6256,62 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
         function openCreate() {{
             currentEditId = null;
             currentEditProductId = null;
+            psTypeCache = null;
             document.getElementById('editModalTitle').textContent = '新增价格策略';
             document.getElementById('editId').value = '';
             document.getElementById('editPriceType').value = 'gov_procurement';
             document.getElementById('editPrice').value = '';
             document.getElementById('editEffectiveDate').value = new Date().toISOString().slice(0, 10);
             document.getElementById('editRemark').value = '';
-            document.getElementById('editSource').value = 'manual';
+            document.getElementById('editSource').value = '菜篮子/询价表';
             document.getElementById('editProductKeyword').value = '';
             document.getElementById('editProductId').value = '';
+            document.getElementById('editPrefillHint').innerHTML = '';
             // 显式启用所有字段（防止上一次编辑后保留 disabled 状态）
             document.getElementById('editProductKeyword').disabled = false;
             document.getElementById('editPriceType').disabled = false;
             document.getElementById('editEffectiveDate').disabled = false;
             new bootstrap.Modal(document.getElementById('editModal')).show();
+        }}
+
+        // 新增模式下：选中商品后拉取该商品所有价类型的完整时段链，缓存供回填使用
+        let psTypeCache = null;
+        async function loadProductPriceTypes(productId) {{
+            psTypeCache = null;
+            if (!productId) return;
+            try {{
+                const res = await fetch('/api/price_schedule/diagnose?product_id=' + encodeURIComponent(productId));
+                const data = await res.json();
+                if (data && data.success) psTypeCache = data.types || {{}};
+            }} catch (e) {{
+                psTypeCache = null;
+            }}
+            applyPrefillFromCache();
+        }}
+
+        // 按当前选择的价格类型，从缓存中取「最近一条」时段的价格与生效日期回填表单
+        function applyPrefillFromCache() {{
+            // 仅新增模式下自动回填，编辑模式保留原记录值，避免覆盖用户正在改的数据
+            if (currentEditId) return;
+            const hint = document.getElementById('editPrefillHint');
+            const pt = document.getElementById('editPriceType').value;
+            const list = psTypeCache ? psTypeCache[pt] : null;
+            if (!list || list.length === 0) {{
+                document.getElementById('editPrice').value = '';
+                document.getElementById('editEffectiveDate').value = new Date().toISOString().slice(0, 10);
+                if (hint) hint.innerHTML = psTypeCache
+                    ? '<span class="text-muted">该商品暂无「' + (PRICE_TYPE_LABEL[pt] || pt) + '」历史记录，生效日期默认为今天</span>'
+                    : '';
+                return;
+            }}
+            // diagnose 返回按 effective_date ASC 排序，最后一条即最近时段
+            const latest = list[list.length - 1];
+            document.getElementById('editPrice').value = latest.price;
+            document.getElementById('editEffectiveDate').value = latest.effective_date;
+            if (latest.source) document.getElementById('editSource').value = latest.source;
+            if (hint) hint.innerHTML = '<span class="text-primary">已带出最近一条「' + (PRICE_TYPE_LABEL[pt] || pt)
+                + '」：¥' + Number(latest.price).toFixed(2) + '（生效日 ' + latest.effective_date
+                + '），如需新增时段请修改生效日期</span>';
         }}
 
         async function openEdit(id) {{
@@ -6277,6 +6326,8 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
             }}
             currentEditId = id;
             currentEditProductId = r.product_id;
+            psTypeCache = null;
+            document.getElementById('editPrefillHint').innerHTML = '';
             document.getElementById('editModalTitle').textContent = '编辑价格策略 #' + id;
             document.getElementById('editId').value = id;
             document.getElementById('editProductKeyword').value = (r.product_name || '') + (r.spec ? '（' + r.spec + '）' : '');
@@ -6359,6 +6410,8 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
                 kwInput.value = li.dataset.name + (li.dataset.spec ? '（' + li.dataset.spec + '）' : '');
                 suggest.style.display = 'none';
                 psActiveIndex = -1;
+                // 选中商品后按当前价格类型带出最近一条时段的价格与生效日期
+                loadProductPriceTypes(li.dataset.pid);
                 return true;
             }}
 
@@ -6367,6 +6420,7 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
                 const kw = kwInput.value.trim();
                 // 手动改动文本即视为重新选择，先清掉已绑定的 product_id，防止残留旧关联
                 document.getElementById('editProductId').value = '';
+                psTypeCache = null;
                 psActiveIndex = -1;
                 if (!kw) {{ suggest.style.display = 'none'; return; }}
                 psSuggestTimer = setTimeout(async () => {{
@@ -6566,7 +6620,7 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
                         <div class="row">
                             <div class="col-md-6 mb-2">
                                 <label class="form-label">价格类型 *</label>
-                                <select id="editPriceType" class="form-select">
+                                <select id="editPriceType" class="form-select" onchange="applyPrefillFromCache()">
                                     <option value="gov_procurement">政采价</option>
                                     <option value="supermarket_1">超市1价</option>
                                     <option value="supermarket_2">超市2价</option>
@@ -6586,9 +6640,16 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
                             </div>
                             <div class="col-md-6 mb-2">
                                 <label class="form-label">来源</label>
-                                <input type="text" id="editSource" class="form-control" placeholder="manual / excel_import / ...">
+                                <input type="text" id="editSource" class="form-control" placeholder="菜篮子/询价表" list="editSourceOptions">
+                                <datalist id="editSourceOptions">
+                                    <option value="菜篮子/询价表"></option>
+                                    <option value="政采平台"></option>
+                                    <option value="超市实地采价"></option>
+                                    <option value="Excel导入"></option>
+                                </datalist>
                             </div>
                         </div>
+                        <div class="mb-2" id="editPrefillHint" style="min-height:20px;font-size:12px"></div>
                         <div class="mb-2">
                             <label class="form-label">备注</label>
                             <input type="text" id="editRemark" class="form-control" placeholder="选填">
