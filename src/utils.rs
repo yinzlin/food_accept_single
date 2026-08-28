@@ -781,12 +781,14 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!await priceConfirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
+            // 先取快照：等待确认框期间右键菜单会被隐藏并清空 currentCtxTarget
+            const target = currentCtxTarget;
+            if (!await priceConfirm('确定要删除分类"' + target.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ id: currentCtxTarget.id }})
+                    body: JSON.stringify({{ id: target.id }})
                 }});
                 const text = await res.text();
                 if (res.ok) {{
@@ -987,12 +989,14 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeleteSupplierCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!await priceConfirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
+            // 先取快照：等待确认框期间右键菜单会被隐藏并清空 currentCtxTarget
+            const target = currentCtxTarget;
+            if (!await priceConfirm('确定要删除分类"' + target.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ id: currentCtxTarget.id }})
+                    body: JSON.stringify({{ id: target.id }})
                 }});
                 const text = await res.text();
                 if (res.ok) {{
@@ -1193,12 +1197,14 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
         
         async function ctxDeletePurchaserCategory() {{
             if (!currentCtxTarget || currentCtxTarget.type !== 'category') return;
-            if (!await priceConfirm('确定要删除分类"' + currentCtxTarget.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
+            // 先取快照：等待确认框期间右键菜单会被隐藏并清空 currentCtxTarget
+            const target = currentCtxTarget;
+            if (!await priceConfirm('确定要删除分类"' + target.name + '"吗？\n\n注意：有子分类或已被引用的分类无法删除。')) return;
             try {{
                 const res = await fetch('/api/category/delete', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ id: currentCtxTarget.id }})
+                    body: JSON.stringify({{ id: target.id }})
                 }});
                 const text = await res.text();
                 if (res.ok) {{

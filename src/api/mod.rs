@@ -7302,10 +7302,12 @@ pub async fn api_sales_order_generate_purchase(
     let mut new_snapshot_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // 取销售订单明细（含销售单位 unit、备注）
+    // ORDER BY soi.product_name, soi.id 使采购订单明细顺序与供应商分拣导出一致（按品名排序）
     let item_rows = sqlx::query(
         "SELECT soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.supplier_id, soi.supplier_name, soi.remark, p.purchase_price, p.base_unit, p.base_price
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
-         WHERE soi.order_id = ?"
+         WHERE soi.order_id = ?
+         ORDER BY soi.product_name, soi.id"
     )
     .bind(id)
     .fetch_all(crate::db::pool())
@@ -10960,7 +10962,7 @@ pub async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params)
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.id as item_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id as item_id, soi.order_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
@@ -10987,6 +10989,7 @@ pub async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params)
         
         purchaser_items.push(serde_json::json!({
             "item_id": r.get::<i64, _>("item_id"),
+            "order_id": r.get::<i64, _>("order_id"),
             "product_id": r.get::<i64, _>("product_id"),
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
@@ -11268,10 +11271,14 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
                                     let product_name = item["product_name"].as_str().unwrap_or("");
                                     let quantity = item["quantity"].as_f64().unwrap_or(0.0);
                                     let pre_sale_quantity = item["pre_sale_quantity"].as_f64().unwrap_or(0.0);
-                                    let amount = item["amount"].as_f64().unwrap_or(0.0);
+                                    let stored_amount = item["amount"].as_f64().unwrap_or(0.0);
                                     let remark = item["remark"].as_str().unwrap_or("");
+                                    // 单价：使用基础单位的进价（来自 product.purchase_price），而不是售价
+                                    let unit_price = item["unit_price"].as_f64().unwrap_or(0.0);
+                                    // 金额：实量 × 进价（含数值导出时以实量与进价之积为准）
+                                    let row_amount = if print_values { quantity * unit_price } else { stored_amount };
 
-                                    unit_amount += amount;
+                                    unit_amount += row_amount;
 
                                     worksheet.write_with_format(current_row, 0, purchaser_seq as f64, &cell_format)?;
                                     worksheet.write_with_format(current_row, 1, product_name, &cell_left_format)?;
@@ -11279,10 +11286,8 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
                                     worksheet.write_with_format(current_row, 3, pre_sale_quantity, &cell_format)?;
                                     if print_values {
                                         worksheet.write_with_format(current_row, 4, quantity, &cell_format)?;
-                                        // 单价列：使用基础单位的进价（来自 product.purchase_price），而不是售价
-                                        let unit_price = item["unit_price"].as_f64().unwrap_or(0.0);
                                         worksheet.write_with_format(current_row, 5, unit_price, &cell_format)?;
-                                        worksheet.write_with_format(current_row, 6, amount, &cell_right_format)?;
+                                        worksheet.write_with_format(current_row, 6, row_amount, &cell_right_format)?;
                                     } else {
                                         worksheet.write_with_format(current_row, 4, "", &cell_format)?;
                                         worksheet.write_with_format(current_row, 5, "", &cell_format)?;

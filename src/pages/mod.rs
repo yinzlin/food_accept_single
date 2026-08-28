@@ -10135,6 +10135,9 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
         .empty-state { text-align: center; padding: 60px 20px; color: #999; }
         .empty-icon { font-size: 48px; margin-bottom: 16px; }
         .cat-supplier { background: linear-gradient(135deg, #10b981 0%, #34d399 100%); }
+        .gen-po-bar { margin-top: 10px; text-align: center; }
+        .gen-po-bar button { width: 100%; max-width: 400px; padding: 12px 0; border: none; border-radius: 10px; background: #ffffff; color: #059669; font-size: 15px; font-weight: 600; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+        .gen-po-hint { font-size: 11px; opacity: 0.85; margin-top: 6px; }
         .correction-input { width: 60px; padding: 6px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; text-align: center; }
         .correction-input:focus { outline: none; border-color: #3b82f6; }
         .corrected-tag { background: #fef3c7; color: #d97706; padding: 2px 5px; border-radius: 3px; font-size: 11px; }
@@ -10157,6 +10160,10 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
             <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
+        </div>
+        <div class="gen-po-bar">
+            <button onclick="generatePurchaseOrdersFromView()">📋 生成采购订单</button>
+            <div class="gen-po-hint">按分拣清单顺序为当前视图中的销售订单生成采购订单（同供应商同日期自动合并）</div>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -10452,6 +10459,80 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             }
             
             container.innerHTML = html;
+        }
+
+        // 参照销售订单页面的「生成采购订单」：按分拣清单显示顺序逐单调用，同供应商同日期自动合并
+        async function generatePurchaseOrdersFromView() {
+            const orderIds = [];
+            suppliers.forEach(supplier => {
+                if (!supplier.purchasers) return;
+                supplier.purchasers.forEach(purchaser => {
+                    purchaser.items.forEach(item => {
+                        if (item.order_id && orderIds.indexOf(item.order_id) === -1) {
+                            orderIds.push(item.order_id);
+                        }
+                    });
+                });
+            });
+            if (orderIds.length === 0) {
+                alert('当前视图没有可生成采购订单的销售订单');
+                return;
+            }
+            const date = document.getElementById('historyDate').value || '今天';
+            if (!confirm('将为 ' + date + ' 的 ' + orderIds.length + ' 个销售订单生成采购订单（按分拣清单顺序，同供应商同日期自动合并）。\n是否继续？')) return;
+
+            let successCount = 0, mergedCount = 0;
+            const errors = [];
+            const pendingWarnings = [];
+
+            for (const orderId of orderIds) {
+                const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=0', { method: 'POST' });
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.indexOf('application/json') !== -1) {
+                    const data = await res.json();
+                    if (data.error) { errors.push(data.message); continue; }
+                    if (data.warning) { pendingWarnings.push({ orderId: orderId, message: data.message }); continue; }
+                    if (res.ok) {
+                        successCount += (data.count || 0);
+                        mergedCount += (data.merged || 0);
+                        continue;
+                    }
+                    errors.push(data.message || '订单 ' + orderId + ' 生成失败');
+                } else if (res.ok) {
+                    successCount += 1;
+                } else {
+                    errors.push('订单 ' + orderId + ' 生成失败');
+                }
+            }
+
+            // 已有待分拣采购订单的订单：确认后强制重新生成（与销售订单页一致）
+            if (pendingWarnings.length > 0) {
+                const detail = pendingWarnings.map(p => p.message.split('\n')[0]).join('\n');
+                if (confirm(pendingWarnings.length + ' 个订单已生成过待分拣状态的采购订单：\n' + detail + '\n\n是否强制重新生成（按新销售单明细增删改）？')) {
+                    for (const p of pendingWarnings) {
+                        const res = await fetch('/api/sales_order/generate_purchase/' + p.orderId + '?force=1', { method: 'POST' });
+                        const contentType = res.headers.get('content-type') || '';
+                        if (contentType.indexOf('application/json') !== -1) {
+                            const data = await res.json();
+                            if (data.error) { errors.push(data.message); }
+                            else if (res.ok) {
+                                successCount += (data.count || 0);
+                                mergedCount += (data.merged || 0);
+                            }
+                        } else if (res.ok) {
+                            successCount += 1;
+                        }
+                    }
+                }
+            }
+
+            let msg = '成功生成 ' + successCount + ' 张采购订单';
+            if (mergedCount > 0) msg += '，合并 ' + mergedCount + ' 条明细';
+            if (errors.length > 0) {
+                msg += '\n\n以下订单已处理过，无法重新生成（请到采购订单页面处理）：\n' + errors.join('\n');
+            }
+            alert(msg);
+            loadItems();
         }
 
         function exportExcel(withValues) {
