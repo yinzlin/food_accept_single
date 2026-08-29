@@ -2463,8 +2463,8 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 const total = parseFloat(document.getElementById('totalAmount').textContent) || 0;
                 const rate = parseFloat(document.getElementById('discountRateInput').value) || 0;
                 const reduction = parseFloat(document.getElementById('amountReductionInput').value) || 0;
-                const discountAmount = total * (1 - rate / 100);
-                const finalAmount = Math.max(0, discountAmount - reduction);
+                const discountAmount = Math.round(total * (1 - rate / 100) * 100) / 100;
+                const finalAmount = Math.max(0, Math.round((discountAmount - reduction) * 100) / 100);
                 document.getElementById('discountAmount').textContent = discountAmount.toFixed(2);
                 document.getElementById('finalAmount').textContent = finalAmount.toFixed(2);
             }}
@@ -2952,12 +2952,12 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     const cellIndex = td ? td.cellIndex : -1;
                     // 回车时同步当前输入值（与 onchange 一致），避免 renderItems 覆盖未提交的值
                     if (field === 'quantity') {{
-                        items[index].quantity = parseFloat(input.value) || 0;
-                        items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
-                        items[index].amount = items[index].unit_price * items[index].quantity;
+                        items[index].quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                        items[index].base_quantity = Math.round(items[index].quantity * (items[index].ratio || 1) * 100) / 100;
+                        items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                     }} else if (field === 'unit_price') {{
-                        items[index].unit_price = parseFloat(input.value) || 0;
-                        items[index].amount = items[index].unit_price * items[index].quantity;
+                        items[index].unit_price = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                        items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                     }} else if (field === 'ordered_quantity') {{
                         items[index].ordered_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
                     }} else if (field === 'spec') {{
@@ -3553,8 +3553,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 const total = parseFloat(document.getElementById('totalAmount').textContent) || 0;
                 const rate = parseFloat(document.getElementById('discountRateInput').value) || 0;
                 const reduction = parseFloat(document.getElementById('amountReductionInput').value) || 0;
-                const discountAmount = total * (1 - rate / 100);
-                const finalAmount = Math.max(0, discountAmount - reduction);
+                const discountAmount = Math.round(total * (1 - rate / 100) * 100) / 100;
+                const finalAmount = Math.max(0, Math.round((discountAmount - reduction) * 100) / 100);
                 document.getElementById('discountAmount').textContent = discountAmount.toFixed(2);
                 document.getElementById('finalAmount').textContent = finalAmount.toFixed(2);
             }}
@@ -4033,7 +4033,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].pre_sale_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
                 if (parseFloat(input.value) > 0) {{
                     items[index].quantity = items[index].pre_sale_quantity;
-                    items[index].amount = items[index].unit_price * items[index].quantity;
+                    items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                 }}
                 renderItems();
             }}
@@ -4067,17 +4067,17 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     const cellIndex = td ? td.cellIndex : -1;
                     // 回车时同步当前输入值（与 onchange 一致），避免 renderItems 覆盖未提交的值
                     if (field === 'quantity') {{
-                        items[index].quantity = parseFloat(input.value) || 0;
-                        items[index].base_quantity = items[index].quantity * (items[index].ratio || 1);
-                        items[index].amount = items[index].unit_price * items[index].quantity;
+                        items[index].quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                        items[index].base_quantity = Math.round(items[index].quantity * (items[index].ratio || 1) * 100) / 100;
+                        items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                     }} else if (field === 'unit_price') {{
-                        items[index].unit_price = parseFloat(input.value) || 0;
-                        items[index].amount = items[index].unit_price * items[index].quantity;
+                        items[index].unit_price = Math.round((parseFloat(input.value) || 0) * 100) / 100;
+                        items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                     }} else if (field === 'pre_sale_quantity') {{
                         items[index].pre_sale_quantity = Math.round((parseFloat(input.value) || 0) * 100) / 100;
                         if (items[index].pre_sale_quantity > 0) {{
                             items[index].quantity = items[index].pre_sale_quantity;
-                            items[index].amount = items[index].unit_price * items[index].quantity;
+                            items[index].amount = Math.round(items[index].unit_price * items[index].quantity * 100) / 100;
                         }}
                     }} else if (field === 'spec') {{
                         items[index].spec = input.value;
@@ -7909,6 +7909,7 @@ pub async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<St
                         <th class="text-center">出库单数</th>
                         <th class="text-center">出库条数</th>
                         <th class="text-right">毛利</th>
+                        <th class="text-right">毛利率</th>
                     </tr>
                 </thead>
                 <tbody id="resultTable"></tbody>
@@ -7936,11 +7937,16 @@ pub async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<St
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (!data.rows || data.rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无数据</td></tr>';
                 } else {
                     let prevDay = null;
                     data.rows.forEach(it => {
-                        const profitCls = (it.gross_profit || 0) >= 0 ? 'text-success' : 'text-danger';
+                        const gp = it.gross_profit || 0;
+                        const dOut = it.discounted_out_amount || 0;
+                        const profitCls = gp >= 0 ? 'text-success' : 'text-danger';
+                        // 毛利率 = 毛利润 / 下浮后出库金额
+                        const marginRate = dOut !== 0 ? (gp / dOut * 100) : 0;
+                        const marginCls = marginRate >= 0 ? 'text-success' : 'text-danger';
                         const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
                         const dayDisplay = it.day !== prevDay ? it.day : '';
                         prevDay = it.day;
@@ -7954,7 +7960,8 @@ pub async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<St
                             '<td class="text-right text-danger">' + (it.discounted_out_amount || 0).toFixed(2) + '</td>' +
                             '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
-                            '<td class="text-right ' + profitCls + '">' + (it.gross_profit || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right ' + profitCls + '">' + gp.toFixed(2) + '</td>' +
+                            '<td class="text-right ' + marginCls + '">' + marginRate.toFixed(2) + '%</td>' +
                             '</tr>';
                     });
                 }
@@ -8056,6 +8063,7 @@ pub async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) 
                         <th class="text-center">出库单数</th>
                         <th class="text-center">出库条数</th>
                         <th class="text-right">毛利</th>
+                        <th class="text-right">毛利率</th>
                     </tr>
                 </thead>
                 <tbody id="resultTable"></tbody>
@@ -8083,11 +8091,16 @@ pub async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) 
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (!data.rows || data.rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无数据</td></tr>';
                 } else {
                     let prevDay = null;
                     data.rows.forEach(it => {
-                        const profitCls = (it.gross_profit || 0) >= 0 ? 'text-success' : 'text-danger';
+                        const gp = it.gross_profit || 0;
+                        const dOut = it.discounted_out_amount || 0;
+                        const profitCls = gp >= 0 ? 'text-success' : 'text-danger';
+                        // 毛利率 = 毛利润 / 下浮后出库金额
+                        const marginRate = dOut !== 0 ? (gp / dOut * 100) : 0;
+                        const marginCls = marginRate >= 0 ? 'text-success' : 'text-danger';
                         const rowStyle = it.is_summary ? 'font-weight:bold;background-color:#fff8e1;' : '';
                         const dayDisplay = it.day !== prevDay ? it.day : '';
                         prevDay = it.day;
@@ -8101,7 +8114,8 @@ pub async fn page_query_stock_summary_reimburse(headers: axum::http::HeaderMap) 
                             '<td class="text-right text-danger">' + (it.discounted_out_amount || 0).toFixed(2) + '</td>' +
                             '<td class="text-center">' + (it.out_order_count || 0) + '</td>' +
                             '<td class="text-center">' + (it.out_item_count || 0) + '</td>' +
-                            '<td class="text-right ' + profitCls + '">' + (it.gross_profit || 0).toFixed(2) + '</td>' +
+                            '<td class="text-right ' + profitCls + '">' + gp.toFixed(2) + '</td>' +
+                            '<td class="text-right ' + marginCls + '">' + marginRate.toFixed(2) + '%</td>' +
                             '</tr>';
                     });
                 }
@@ -10135,10 +10149,8 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
         .empty-state { text-align: center; padding: 60px 20px; color: #999; }
         .empty-icon { font-size: 48px; margin-bottom: 16px; }
         .cat-supplier { background: linear-gradient(135deg, #10b981 0%, #34d399 100%); }
-        .gen-po-bar { margin-top: 10px; text-align: center; }
-        .gen-po-bar button { width: 100%; max-width: 400px; padding: 12px 0; border: none; border-radius: 10px; background: #ffffff; color: #059669; font-size: 15px; font-weight: 600; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-        .gen-po-hint { font-size: 11px; opacity: 0.85; margin-top: 6px; }
         .correction-input { width: 60px; padding: 6px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; text-align: center; }
+        .correction-input-wide { width: 92px; }
         .correction-input:focus { outline: none; border-color: #3b82f6; }
         .corrected-tag { background: #fef3c7; color: #d97706; padding: 2px 5px; border-radius: 3px; font-size: 11px; }
         .purchaser-section { margin: 0 12px; border-bottom: 1px solid #f0f0f0; padding: 10px 0; }
@@ -10160,10 +10172,7 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
             <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
-        </div>
-        <div class="gen-po-bar">
-            <button onclick="generatePurchaseOrdersFromView()">📋 生成采购订单</button>
-            <div class="gen-po-hint">按分拣清单顺序为当前视图中的销售订单生成采购订单（同供应商同日期自动合并）</div>
+            <a class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold; cursor:pointer;" onclick="generatePurchaseOrdersFromView()">📋 生成采购订单</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -10422,18 +10431,19 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
                             html += '<div class="item-name">' + item.product_name + '</div>';
                             html += '<div class="item-detail">';
                             html += '<span>' + item.unit + '</span>';
+                            html += '<span>单价 ¥' + (item.unit_price || 0).toFixed(2) + '</span>';
                             if (item.remark && item.remark.trim()) {
                                 html += '<span style="color:#d97706;">备注: ' + item.remark + '</span>';
                             }
                             if (isCorrected) {
-                                html += '<span class="corrected-tag">修正: ' + item.quantity + '→' + displayQty + '</span>';
+                                html += '<span class="corrected-tag">数量修正: ' + item.quantity + '→' + displayQty + '</span>';
                             }
                             html += '</div>';
                             html += '</div>';
                             html += '<div class="quantity-badge">';
                             html += '<div class="quantity-value">' + displayQty + '</div>';
                             html += '<div class="quantity-unit">' + item.unit + '</div>';
-                            html += '<input type="number" min="0" step="any" class="correction-input" placeholder="修正" ' + (isCorrected ? 'value="' + correctedQuantities[item.item_id] + '"' : '') + ' onchange="updateCorrectedQuantity(' + item.item_id + ', this.value)" onclick="event.stopPropagation()">';
+                            html += '<input type="text" inputmode="decimal" class="correction-input correction-input-wide" placeholder="修正数量" ' + (isCorrected ? 'value="' + correctedQuantities[item.item_id] + '"' : '') + ' onchange="updateCorrectedQuantity(' + item.item_id + ', this.value)" onclick="event.stopPropagation()">';
                             html += '</div>';
                             html += '</div>';
                         });
@@ -10479,57 +10489,64 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
                 return;
             }
             const date = document.getElementById('historyDate').value || '今天';
-            if (!confirm('将为 ' + date + ' 的 ' + orderIds.length + ' 个销售订单生成采购订单（按分拣清单顺序，同供应商同日期自动合并）。\n是否继续？')) return;
+            if (!confirm('将为 ' + date + ' 的 ' + orderIds.length + ' 个销售订单生成或补全采购订单（已审核的自动跳过，同供应商同日期自动合并）。\n是否继续？')) return;
 
-            let successCount = 0, mergedCount = 0;
+            let createdCount = 0, mergedCount = 0, refreshedCount = 0, excludedCount = 0;
             const errors = [];
-            const pendingWarnings = [];
+            const toRefresh = []; // 已有待分拣采购订单的订单：自动补全（force=1）
 
+            // 第一遍：分类——从未生成的直接新建；已有待分拣的收集待补全；已审核的跳过
             for (const orderId of orderIds) {
                 const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=0', { method: 'POST' });
                 const contentType = res.headers.get('content-type') || '';
                 if (contentType.indexOf('application/json') !== -1) {
                     const data = await res.json();
-                    if (data.error) { errors.push(data.message); continue; }
-                    if (data.warning) { pendingWarnings.push({ orderId: orderId, message: data.message }); continue; }
+                    if (data.error) {
+                        // 已审核/已处理的采购订单：不重复生成，自动跳过，不视为错误
+                        if (data.excluded) { excludedCount += (data.excluded_count || 1); continue; }
+                        errors.push(data.message); continue;
+                    }
+                    if (data.warning) { toRefresh.push(orderId); continue; }
                     if (res.ok) {
-                        successCount += (data.count || 0);
+                        createdCount += (data.count || 0);
                         mergedCount += (data.merged || 0);
+                        excludedCount += (data.excluded_count || 0);
                         continue;
                     }
                     errors.push(data.message || '订单 ' + orderId + ' 生成失败');
                 } else if (res.ok) {
-                    successCount += 1;
+                    createdCount += 1;
                 } else {
                     errors.push('订单 ' + orderId + ' 生成失败');
                 }
             }
 
-            // 已有待分拣采购订单的订单：确认后强制重新生成（与销售订单页一致）
-            if (pendingWarnings.length > 0) {
-                const detail = pendingWarnings.map(p => p.message.split('\n')[0]).join('\n');
-                if (confirm(pendingWarnings.length + ' 个订单已生成过待分拣状态的采购订单：\n' + detail + '\n\n是否强制重新生成（按新销售单明细增删改）？')) {
-                    for (const p of pendingWarnings) {
-                        const res = await fetch('/api/sales_order/generate_purchase/' + p.orderId + '?force=1', { method: 'POST' });
-                        const contentType = res.headers.get('content-type') || '';
-                        if (contentType.indexOf('application/json') !== -1) {
-                            const data = await res.json();
-                            if (data.error) { errors.push(data.message); }
-                            else if (res.ok) {
-                                successCount += (data.count || 0);
-                                mergedCount += (data.merged || 0);
-                            }
-                        } else if (res.ok) {
-                            successCount += 1;
-                        }
+            // 第二遍：补全未审核（待分拣）的采购订单——按新销售单明细增删改，无需再次确认
+            for (const orderId of toRefresh) {
+                const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=1', { method: 'POST' });
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.indexOf('application/json') !== -1) {
+                    const data = await res.json();
+                    if (data.error) {
+                        if (data.excluded) { excludedCount += (data.excluded_count || 1); }
+                        else { errors.push(data.message); }
+                    } else if (res.ok) {
+                        refreshedCount += 1;
+                        createdCount += (data.count || 0);
+                        mergedCount += (data.merged || 0);
+                        excludedCount += (data.excluded_count || 0);
                     }
+                } else if (res.ok) {
+                    refreshedCount += 1;
                 }
             }
 
-            let msg = '成功生成 ' + successCount + ' 张采购订单';
+            let msg = '成功生成 ' + createdCount + ' 张采购订单';
+            if (refreshedCount > 0) msg += '，补全 ' + refreshedCount + ' 张未审核采购订单';
             if (mergedCount > 0) msg += '，合并 ' + mergedCount + ' 条明细';
+            if (excludedCount > 0) msg += '（已审核 ' + excludedCount + ' 张自动跳过）';
             if (errors.length > 0) {
-                msg += '\n\n以下订单已处理过，无法重新生成（请到采购订单页面处理）：\n' + errors.join('\n');
+                msg += '\n\n以下订单生成失败：\n' + errors.join('\n');
             }
             alert(msg);
             loadItems();

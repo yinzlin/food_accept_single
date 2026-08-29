@@ -1942,9 +1942,10 @@ pub async fn api_product_create(headers: axum::http::HeaderMap, Json(req): Json<
     let role = crate::auth::get_user_ctx(&headers).await.role;
     let base_unit = req.base_unit.clone().unwrap_or_else(|| req.unit.clone().unwrap_or_else(|| "个".to_string()));
     let unit = req.unit.clone().unwrap_or_else(|| "个".to_string());
-    let base_price = req.base_price.unwrap_or(0.0);
+    // 价格统一四舍五入保留两位小数
+    let base_price = ((req.base_price.unwrap_or(0.0)) * 100.0).round() / 100.0;
     
-    let purchase_price = if role == "super_admin" { req.purchase_price.unwrap_or(0.0) } else { 0.0 };
+    let purchase_price = if role == "super_admin" { ((req.purchase_price.unwrap_or(0.0)) * 100.0).round() / 100.0 } else { 0.0 };
     
     let result = sqlx::query(
         "INSERT INTO product(name, spec, alias1, alias2, unit, base_unit, base_price, purchase_price, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -2958,8 +2959,11 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
         };
         
         let spec = if row.len() > 4 { row[4].trim() } else { "" };
-        let base_price: f64 = if row.len() > 7 { row[7].trim().parse().unwrap_or(0.0) } else { 0.0 };
-        let purchase_price: f64 = if row.len() > 8 { row[8].trim().parse().unwrap_or(0.0) } else { 0.0 };
+        // 价格统一四舍五入保留两位小数
+        let raw_base: f64 = if row.len() > 7 { row[7].trim().parse().unwrap_or(0.0) } else { 0.0 };
+        let raw_purchase: f64 = if row.len() > 8 { row[8].trim().parse().unwrap_or(0.0) } else { 0.0 };
+        let base_price: f64 = (raw_base * 100.0).round() / 100.0;
+        let purchase_price: f64 = (raw_purchase * 100.0).round() / 100.0;
         
         let result = sqlx::query(
             "INSERT OR IGNORE INTO product(name, alias1, alias2, spec, unit, base_unit, base_price, purchase_price, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -2995,14 +2999,17 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
 
 pub async fn api_product_unit_create(Json(req): Json<ProductUnitReq>) -> impl IntoResponse {
     // 商品单位属价格维度（随时变动），不受商品基础信息审核状态锁定
+    // 价格统一四舍五入保留两位小数
+    let unit_price = ((req.unit_price.unwrap_or(0.0)) * 100.0).round() / 100.0;
+    let purchase_price = ((req.purchase_price.unwrap_or(0.0)) * 100.0).round() / 100.0;
     let result = sqlx::query(
         "INSERT INTO product_unit(product_id, unit_name, ratio, unit_price, purchase_price, sort_order) VALUES (?, ?, ?, ?, ?, ?)"
     )
     .bind(req.product_id)
     .bind(&req.unit_name)
     .bind(req.ratio)
-    .bind(req.unit_price.unwrap_or(0.0))
-    .bind(req.purchase_price.unwrap_or(0.0))
+    .bind(unit_price)
+    .bind(purchase_price)
     .bind(req.sort_order.unwrap_or(0))
     .execute(crate::db::pool())
     .await;
@@ -3017,13 +3024,16 @@ pub async fn api_product_unit_create(Json(req): Json<ProductUnitReq>) -> impl In
 }
 
 pub async fn api_product_unit_update(Json(req): Json<ProductUnitReq>) -> (StatusCode, String) {
+    // 价格统一四舍五入保留两位小数
+    let unit_price = ((req.unit_price.unwrap_or(0.0)) * 100.0).round() / 100.0;
+    let purchase_price = ((req.purchase_price.unwrap_or(0.0)) * 100.0).round() / 100.0;
     let result = sqlx::query(
         "UPDATE product_unit SET unit_name = ?, ratio = ?, unit_price = ?, purchase_price = ?, sort_order = ? WHERE id = ?"
     )
     .bind(&req.unit_name)
     .bind(req.ratio)
-    .bind(req.unit_price.unwrap_or(0.0))
-    .bind(req.purchase_price.unwrap_or(0.0))
+    .bind(unit_price)
+    .bind(purchase_price)
     .bind(req.sort_order.unwrap_or(0))
     .bind(req.product_id)
     .execute(crate::db::pool())
@@ -4652,13 +4662,13 @@ pub async fn api_purchase_order_print_excel(
         ws.set_margins(0.0, 0.0, 0.0, 0.4, 0.0, 0.0);
         ws.set_print_center_horizontally(true);
 
-        // 列宽：A(28:品名规格/标签+值) B(8)+C(10)+D(12)=30 E(12)+F(18)=30
-        ws.set_column_width(0, 20)?;
-        ws.set_column_width(1, 5)?;
-        ws.set_column_width(2, 6)?;
-        ws.set_column_width(3, 8)?;
-        ws.set_column_width(4, 10)?;
-        ws.set_column_width(5, 18)?;
+        // 列宽（用户指定，cm→px 按 96dpi 换算，1cm≈38px）：A=4cm B=1cm C=1cm D=2cm E=2cm F=2cm
+        ws.set_column_width_pixels(0, 150)?;
+        ws.set_column_width_pixels(1, 40)?;
+        ws.set_column_width_pixels(2, 50)?;
+        ws.set_column_width_pixels(3, 80)?;
+        ws.set_column_width_pixels(4, 80)?;
+        ws.set_column_width_pixels(5, 50)?;
 
         // 行 0: 标题（采购单），合并 A-F
         ws.merge_range(0, 0, 0, 5, "采购单", &title_format)?;
@@ -5367,8 +5377,8 @@ pub async fn api_sales_order_update_prices(headers: axum::http::HeaderMap, Path(
     .await
     .unwrap_or(0.0);
 
-    let discount_amount = new_total * (1.0 - discount_rate / 100.0);
-    let new_final = discount_amount - amount_reduction;
+    let discount_amount = ((new_total * (1.0 - discount_rate / 100.0)) * 100.0).round() / 100.0;
+    let new_final = ((discount_amount - amount_reduction) * 100.0).round() / 100.0;
 
     let resp = serde_json::json!({
         "items": result_items,
@@ -6999,6 +7009,9 @@ pub async fn api_sales_order_generate_purchase(
 
     let force = params.get("force").map(|s| s == "1").unwrap_or(false);
 
+    // 本次生成中被排除（已审核/已处理）的采购订单数量，仅作提示
+    let mut skipped_count: usize = 0;
+
     let order_row = sqlx::query(
         "SELECT so.id, so.order_date, so.warehouse_id, so.warehouse_name, so.purchaser_id
          FROM sales_order so WHERE so.id = ?"
@@ -7053,7 +7066,8 @@ pub async fn api_sales_order_generate_purchase(
     ))
     .collect();
 
-    // 兜底：当天同供应商已存在非取消 PO（按"供应商+日期"合并到他人 PO 的场景）
+    // 兜底：当天同供应商已存在待分拣 PO（按"供应商+日期"合并到他人 PO 的场景）
+    // 已审核/已处理的 PO 不视为"已生成过"，不参与合并也不拦截首次生成
     if existed.is_empty() {
         let involved_suppliers: Vec<(i64,)> = sqlx::query(
             "SELECT DISTINCT supplier_id FROM sales_order_item WHERE order_id = ? AND supplier_id > 0"
@@ -7074,7 +7088,7 @@ pub async fn api_sales_order_generate_purchase(
             let sql = format!(
                 "SELECT po.id, po.order_no, po.status, COALESCE(s.name, '未知供应商') as supplier_name
                  FROM purchase_order po LEFT JOIN supplier s ON po.supplier_id = s.id
-                 WHERE po.order_date = ? AND po.status != 'cancelled'
+                 WHERE po.order_date = ? AND po.status = 'pending'
                    AND po.supplier_id IN ({})
                  ORDER BY po.id",
                 placeholders
@@ -7122,8 +7136,11 @@ pub async fn api_sales_order_generate_purchase(
         };
         let pending: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 == "pending").collect();
         let processed: Vec<&(i64, String, String, String)> = existed.iter().filter(|x| x.2 != "pending").collect();
+        skipped_count = processed.len();
 
-        if !processed.is_empty() {
+        // 已审核/已处理的采购订单受保护：仅排除，不覆盖。
+        // 若本销售单关联的采购订单均已处理（已审核），则整单排除，不做任何修改。
+        if pending.is_empty() && !processed.is_empty() {
             let detail = processed.iter()
                 .map(|x| format!("{}（{}，状态：{}）", x.1, x.3, status_text(&x.2)))
                 .collect::<Vec<_>>().join("\n");
@@ -7132,7 +7149,9 @@ pub async fn api_sales_order_generate_purchase(
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 serde_json::json!({
                     "error": true,
-                    "message": format!("该销售订单已生成过采购订单，其中 {} 张已处理（{}），不能重新生成。\n如需调整，请到采购订单页面手动处理对应单据。", processed.len(), detail)
+                    "excluded": true,
+                    "excluded_count": skipped_count,
+                    "message": format!("该销售订单关联的 {} 张采购订单均已审核/处理（{}），本次已排除，未作修改。\n如需调整，请到采购订单页面手动处理对应单据。", skipped_count, detail)
                 }).to_string(),
             ).into_response();
         }
@@ -7141,13 +7160,21 @@ pub async fn api_sales_order_generate_purchase(
             let detail = pending.iter()
                 .map(|x| format!("{}（{}）", x.1, x.3))
                 .collect::<Vec<_>>().join("\n");
+            let mut warn = format!("该销售订单已生成过 {} 张采购订单（均为待分拣状态）：{}\n继续操作将对存在的采购订单对应的明细进行增删改（按新销售单明细），是否继续？", pending.len(), detail);
+            if skipped_count > 0 {
+                let skip_detail = processed.iter()
+                    .map(|x| format!("{}（{}，状态：{}）", x.1, x.3, status_text(&x.2)))
+                    .collect::<Vec<_>>().join("\n");
+                warn += &format!("\n另有 {} 张采购订单已审核/处理（{}），本次将排除、不覆盖。", skipped_count, skip_detail);
+            }
             return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 serde_json::json!({
                     "warning": true,
                     "count": pending.len(),
-                    "message": format!("该销售订单已生成过 {} 张采购订单（均为待分拣状态）：{}\n继续操作将对存在的采购订单对应的明细进行增删改（按新销售单明细），是否继续？", pending.len(), detail)
+                    "excluded_count": skipped_count,
+                    "message": warn
                 }).to_string(),
             ).into_response();
         }
@@ -7168,7 +7195,7 @@ pub async fn api_sales_order_generate_purchase(
         // 兜底：按 supplier_id + order_date 找出当天所有非取消 PO，让重算也能覆盖到
         // （例如本销售单明细合并到他人创建的 PO 时）
         let po_pool: Vec<(i64, i64, String)> = sqlx::query(
-            "SELECT po.id, po.supplier_id, po.status FROM purchase_order po WHERE po.order_date = ? AND po.status != 'cancelled'"
+            "SELECT po.id, po.supplier_id, po.status FROM purchase_order po WHERE po.order_date = ? AND po.status = 'pending'"
         )
         .bind(&order_date)
         .fetch_all(crate::db::pool())
@@ -7337,7 +7364,7 @@ pub async fn api_sales_order_generate_purchase(
         let base_price = r.get::<f64, _>("base_price");
         let remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
 
-        let unit_price = if purchase_price > 0.0 { purchase_price } else { base_price };
+        let unit_price = ((if purchase_price > 0.0 { purchase_price } else { base_price }) * 100.0).round() / 100.0;
 
         supplier_items.entry(supplier_id).or_insert_with(Vec::new).push(
             (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, base_unit, base_price, remark)
@@ -7370,9 +7397,9 @@ pub async fn api_sales_order_generate_purchase(
         let main_wh_name = so_warehouse_name.clone();
         let _ = (wh_id_set, wh_names, total_amount);
 
-        // 查找当天同供应商是否已有非取消的采购订单
+        // 查找当天同供应商是否已有待分拣的采购订单（已审核/已处理的排除，只合并到未审核的）
         let existing_po: Option<i64> = sqlx::query(
-            "SELECT id FROM purchase_order WHERE supplier_id = ? AND order_date = ? AND status != 'cancelled' ORDER BY id LIMIT 1"
+            "SELECT id FROM purchase_order WHERE supplier_id = ? AND order_date = ? AND status = 'pending' ORDER BY id LIMIT 1"
         )
         .bind(supplier_id)
         .bind(&order_date)
@@ -7466,7 +7493,7 @@ pub async fn api_sales_order_generate_purchase(
         let mut delta_amount: f64 = 0.0; // UPDATE 同步：金额增量 = 新 - 旧
 
         for (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, _base_unit, _base_price, remark) in items {
-            let amount = quantity * unit_price;
+            let amount = ((quantity * unit_price) * 100.0).round() / 100.0;
             let base_quantity = quantity;
             let sales_unit = unit.clone();
             // 1) 快照中找 (P,U, warehouse) → 尝试按主键 UPDATE
@@ -7533,7 +7560,7 @@ pub async fn api_sales_order_generate_purchase(
                 // 明细（数量/仓库等）覆盖到 SO X 的行上，导致不同仓库的明细被吞并成最后一条。
                 // 业务上要求"不同仓库出库的相同商品在同一个 PO 中要同时保留"，
                 // 所以仓库是行级区分维度，不能跨仓库复用。
-                let new_amount = quantity * unit_price;
+                let new_amount = ((quantity * unit_price) * 100.0).round() / 100.0;
                 // 孤儿匹配：同 (P,U,warehouse_id) 任意 source；优先选 source=本单的（极端兜底），
                 // 否则按 id 最小的（最早插入的）复用。
                 let orphan_id: Option<i64> = sqlx::query(
@@ -7688,9 +7715,15 @@ pub async fn api_sales_order_generate_purchase(
     } else {
         format!("已将销售明细合并到已有采购订单（{} 条合并）", merged_count)
     };
+    let msg = if skipped_count > 0 {
+        format!("{}（另排除 {} 张已审核/已处理的采购订单）", msg, skipped_count)
+    } else {
+        msg
+    };
     (StatusCode::OK, serde_json::json!({
         "count": created_count,
         "merged": merged_count,
+        "excluded_count": skipped_count,
         "message": msg
     }).to_string()).into_response()
 }
@@ -9461,7 +9494,7 @@ pub async fn api_sales_order_accept(headers: axum::http::HeaderMap, Path(id): Pa
 
     // 3) 按合并后明细重算验收金额
     let accept_total_amount: f64 = items_vec.iter().map(|item| item.6).sum();
-    let accept_final_amount = accept_total_amount * (1.0 - discount_rate / 100.0);
+    let accept_final_amount = ((accept_total_amount * (1.0 - discount_rate / 100.0)) * 100.0).round() / 100.0;
 
     // 4) 输出 JSON（字段名与原接口一致）
     let items: Vec<serde_json::Value> = items_vec
@@ -10963,11 +10996,13 @@ pub async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params)
     };
     let sql = format!(
         "SELECT soi.id as item_id, soi.order_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
-                soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no
+                soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no,
+                COALESCE(pr.purchase_price, 0.0) as purchase_price
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN supplier s ON soi.supplier_id = s.id
+         LEFT JOIN product pr ON soi.product_id = pr.id
          {}
          ORDER BY s.name, p.name, soi.product_name, so.id, soi.id", where_sql
     );
@@ -10994,6 +11029,7 @@ pub async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params)
             "product_name": r.get::<String, _>("product_name"),
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "unit_price": r.get::<f64, _>("unit_price"),
+            "purchase_price": r.get::<f64, _>("purchase_price"),
             "quantity": r.get::<f64, _>("quantity"),
             "amount": r.get::<f64, _>("amount"),
             "remark": r.get::<Option<String>, _>("remark").unwrap_or_default(),
@@ -11469,8 +11505,10 @@ pub async fn api_product_today_price_save(
                 let old_purchase: f64 = r.get("purchase_price");
                 let old_max: f64 = r.get("max_purchase_price");
                 let old_min: f64 = r.get("min_purchase_price");
-                let new_max = if old_max > 0.0 { old_max.max(price) } else { price };
-                let new_min = if old_min > 0.0 { old_min.min(price) } else { price };
+                // 进价统一四舍五入保留两位小数
+                let price = (price * 100.0).round() / 100.0;
+                let new_max = ((if old_max > 0.0 { old_max.max(price) } else { price }) * 100.0).round() / 100.0;
+                let new_min = ((if old_min > 0.0 { old_min.min(price) } else { price }) * 100.0).round() / 100.0;
                 let res = sqlx::query(
                     "UPDATE product SET purchase_price = ?, max_purchase_price = ?, min_purchase_price = ? WHERE id = ?"
                 )
@@ -13198,37 +13236,80 @@ pub async fn api_sales_order_correction(headers: axum::http::HeaderMap, Json(dat
     for item in corrections {
         let item_id = item.get("id").and_then(|v| v.as_i64());
         let product_id = item.get("product_id").and_then(|v| v.as_i64());
-        let quantity = item.get("quantity").and_then(|v| v.as_f64());
-        
-        if quantity.is_none() {
+        // 数量与单价独立可选：只更新提供的字段，金额按当前生效的单价×数量重算
+        let quantity = item.get("quantity").and_then(|v| v.as_f64())
+            .map(|q| (q * 100.0).round() / 100.0);
+        let unit_price = item.get("unit_price").and_then(|v| v.as_f64())
+            .map(|p| (p * 100.0).round() / 100.0);
+        // 进价修正：更新商品进价（product.purchase_price），供采购订单生成/导出使用
+        let purchase_price = item.get("purchase_price").and_then(|v| v.as_f64())
+            .map(|p| (p * 100.0).round() / 100.0);
+
+        if quantity.is_none() && unit_price.is_none() && purchase_price.is_none() {
             continue;
         }
-        
-        let quantity = quantity.unwrap();
-        
+
+        if let Some(pp) = purchase_price {
+            // 由明细定位商品，再回写商品进价
+            let product_id: Option<i64> = if let Some(iid) = item_id {
+                sqlx::query_scalar("SELECT product_id FROM sales_order_item WHERE id = ?")
+                    .bind(iid)
+                    .fetch_optional(crate::db::pool())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                product_id
+            };
+            if let Some(pid) = product_id {
+                let upd = sqlx::query("UPDATE product SET purchase_price = ? WHERE id = ?")
+                    .bind(pp)
+                    .bind(pid)
+                    .execute(crate::db::pool())
+                    .await;
+                if let Ok(r) = upd {
+                    updated_count += r.rows_affected() as i64;
+                }
+                // 若商品开启了自动售价更新，按新进价联动重算售价
+                crate::recalc_base_price_by_markup(pid, "sales_order_correction", None).await;
+            }
+        }
+
         if let Some(item_id) = item_id {
             let result = sqlx::query(
-                "UPDATE sales_order_item SET quantity = ?, amount = unit_price * ? WHERE id = ?"
+                "UPDATE sales_order_item
+                 SET quantity = COALESCE(?, quantity),
+                     unit_price = COALESCE(?, unit_price),
+                     amount = ROUND(COALESCE(?, unit_price) * COALESCE(?, quantity), 2)
+                 WHERE id = ?"
             )
             .bind(quantity)
+            .bind(unit_price)
+            .bind(unit_price)
             .bind(quantity)
             .bind(item_id)
             .execute(crate::db::pool())
             .await;
-            
+
             if let Ok(r) = result {
                 updated_count += r.rows_affected() as i64;
             }
         } else if let Some(product_id) = product_id {
             let result = sqlx::query(
-                "UPDATE sales_order_item SET quantity = ?, amount = unit_price * ? WHERE product_id = ?"
+                "UPDATE sales_order_item
+                 SET quantity = COALESCE(?, quantity),
+                     unit_price = COALESCE(?, unit_price),
+                     amount = ROUND(COALESCE(?, unit_price) * COALESCE(?, quantity), 2)
+                 WHERE product_id = ?"
             )
             .bind(quantity)
+            .bind(unit_price)
+            .bind(unit_price)
             .bind(quantity)
             .bind(product_id)
             .execute(crate::db::pool())
             .await;
-            
+
             if let Ok(r) = result {
                 updated_count += r.rows_affected() as i64;
             }
@@ -13236,7 +13317,7 @@ pub async fn api_sales_order_correction(headers: axum::http::HeaderMap, Json(dat
     }
     
     crate::auth::log_operation(&ctx, "sales_order.correction", "sales_order", "", 
-        &format!("批量修正销售单数量，共修正 {} 条记录", updated_count)).await;
+        &format!("批量修正分拣明细（数量/售价/进价），共修正 {} 条记录", updated_count)).await;
 
     (StatusCode::OK, format!("成功修正 {} 条记录", updated_count))
 }
@@ -13382,13 +13463,15 @@ pub async fn api_price_schedule_create(
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
     // 录入时 end_date 强制 NULL；由 rebuild_price_schedule_end_dates 维护
+    // 价格统一四舍五入保留两位小数
+    let price = (req.price * 100.0).round() / 100.0;
     let result = sqlx::query(
         "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
          VALUES (?, ?, ?, ?, NULL, ?, ?)"
     )
     .bind(req.product_id)
     .bind(&req.price_type)
-    .bind(req.price)
+    .bind(price)
     .bind(&req.effective_date)
     .bind(&req.source)
     .bind(&req.remark)
@@ -13719,6 +13802,8 @@ pub async fn api_price_schedule_batch_import(
     let mut affected_keys: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
 
     for it in &validated {
+        // 价格统一四舍五入保留两位小数
+        let price = (it.price * 100.0).round() / 100.0;
         if policy == "upsert" {
             let result = sqlx::query(
                 "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
@@ -13728,7 +13813,7 @@ pub async fn api_price_schedule_batch_import(
             )
             .bind(it.product_id)
             .bind(&it.price_type)
-            .bind(it.price)
+            .bind(price)
             .bind(&it.effective_date)
             .bind(&it.source)
             .bind(&it.remark)
@@ -13764,7 +13849,7 @@ pub async fn api_price_schedule_batch_import(
             )
             .bind(it.product_id)
             .bind(&it.price_type)
-            .bind(it.price)
+            .bind(price)
             .bind(&it.effective_date)
             .bind(&it.source)
             .bind(&it.remark)
@@ -14343,8 +14428,9 @@ pub async fn api_price_schedule_backfill_sales_order(
     .fetch_one(crate::db::pool())
     .await
     .unwrap_or(0.0);
-    let amount_reduction = total_amount * (discount_rate / 100.0);
-    let final_amount = total_amount - amount_reduction;
+    let total_amount = ((total_amount) * 100.0).round() / 100.0;
+    let amount_reduction = ((total_amount * (discount_rate / 100.0)) * 100.0).round() / 100.0;
+    let final_amount = ((total_amount - amount_reduction) * 100.0).round() / 100.0;
     let _ = sqlx::query(
         "UPDATE sales_order SET total_amount = ?, amount_reduction = ?, final_amount = ? WHERE id = ?"
     )
@@ -14580,6 +14666,8 @@ pub async fn api_price_schedule_batch_import_excel(
     let mut affected_keys: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
 
     for it in &validated {
+        // 价格统一四舍五入保留两位小数
+        let price = (it.price * 100.0).round() / 100.0;
         let exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM product_price_schedule WHERE product_id = ? AND price_type = ? AND effective_date = ?"
         )
@@ -14594,7 +14682,7 @@ pub async fn api_price_schedule_batch_import_excel(
             let upd = sqlx::query(
                 "UPDATE product_price_schedule SET price = ?, source = ?, remark = ? WHERE product_id = ? AND price_type = ? AND effective_date = ?"
             )
-            .bind(it.price)
+            .bind(price)
             .bind(&it.source)
             .bind(&it.remark)
             .bind(it.product_id)
@@ -14615,7 +14703,7 @@ pub async fn api_price_schedule_batch_import_excel(
                 "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
                  VALUES (?, ?, ?, ?, NULL, ?, ?)"
             )
-            .bind(it.product_id).bind(&it.price_type).bind(it.price)
+            .bind(it.product_id).bind(&it.price_type).bind(price)
             .bind(&it.effective_date).bind(&it.source).bind(&it.remark)
             .execute(crate::db::pool()).await;
             match ins {

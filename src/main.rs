@@ -518,7 +518,8 @@ pub(crate) async fn batch_lookup_effective_prices(
         let pid = r.get::<i64, _>("product_id");
         let price = r.get::<f64, _>("price");
         if price > 0.0 {
-            map.insert(pid, price);
+            // 价格统一四舍五入保留两位小数
+            map.insert(pid, (price * 100.0).round() / 100.0);
         }
     }
     map
@@ -575,7 +576,7 @@ pub(crate) async fn recalc_base_price_by_markup(
 
         if auto_update == 0 || purchase_price <= 0.0 {
             eprintln!(
-                "[售价自动更新] 商品ID={} 跳过：auto_update_price={}, purchase_price={}",
+                "[售价自动更新] 商品ID={} 跳过：auto_update_price={}, purchase_price={:.2}",
                 product_id, auto_update, purchase_price
             );
             return;
@@ -623,8 +624,8 @@ pub(crate) async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq
         if item.product_id == 0 {
             continue;
         }
-        // 换算为基础单位单价
-        let base_unit_price = if let Some(bq) = item.base_quantity {
+        // 换算为基础单位单价（四舍五入保留两位小数，避免 amount/base_quantity 除法产生浮点长尾）
+        let base_unit_price = ((if let Some(bq) = item.base_quantity {
             if bq > 0.0 && item.quantity > 0.0 {
                 // amount / base_quantity 得到基础单位单价
                 if item.amount > 0.0 { item.amount / bq } else { item.unit_price }
@@ -633,7 +634,7 @@ pub(crate) async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq
             }
         } else {
             item.unit_price
-        };
+        }) * 100.0).round() / 100.0;
         if base_unit_price <= 0.0 {
             continue;
         }
@@ -652,9 +653,9 @@ pub(crate) async fn update_product_purchase_prices(items: &[PurchaseOrderItemReq
             let old_max: f64 = r.get::<f64, _>("max_purchase_price");
             let old_min: f64 = r.get::<f64, _>("min_purchase_price");
 
-            // 若历史最高/最低为0（新品或首次采购），则以本次价格初始化
-            let new_max = if old_max <= 0.0 { base_unit_price } else { old_max.max(base_unit_price) };
-            let new_min = if old_min <= 0.0 { base_unit_price } else { old_min.min(base_unit_price) };
+            // 若历史最高/最低为0（新品或首次采购），则以本次价格初始化（四舍五入保留两位小数）
+            let new_max = ((if old_max <= 0.0 { base_unit_price } else { old_max.max(base_unit_price) }) * 100.0).round() / 100.0;
+            let new_min = ((if old_min <= 0.0 { base_unit_price } else { old_min.min(base_unit_price) }) * 100.0).round() / 100.0;
 
             let _ = sqlx::query(
                 "UPDATE product SET purchase_price = ?, max_purchase_price = ?, min_purchase_price = ? WHERE id = ?"
@@ -726,9 +727,9 @@ pub(crate) async fn recalc_product_purchase_prices_from_history(product_id: i64)
         prices.push(base_unit_price);
     }
 
-    let new_purchase = latest_price;
-    let new_max = prices.iter().cloned().fold(0.0, f64::max);
-    let new_min = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+    let new_purchase = ((latest_price) * 100.0).round() / 100.0;
+    let new_max = ((prices.iter().cloned().fold(0.0, f64::max)) * 100.0).round() / 100.0;
+    let new_min = ((prices.iter().cloned().fold(f64::INFINITY, f64::min)) * 100.0).round() / 100.0;
     let new_min = if new_min.is_infinite() { 0.0 } else { new_min };
 
     let row = sqlx::query(
