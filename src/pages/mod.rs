@@ -3159,6 +3159,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         supplier_name: item.supplier_name || '',
                         base_unit: '',
                         base_price: 0,
+                        default_base_price: 0,
                         units: []
                     }};
                     items.push(itemData);
@@ -3169,13 +3170,16 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         if (product.id) {{
                             itemData.base_unit = product.base_unit || item.unit || '';
                             itemData.base_price = product.base_price || item.unit_price || 0;
+                            itemData.default_base_price = itemData.base_price;
                         }} else {{
                             itemData.base_unit = item.unit || '';
                             itemData.base_price = item.unit_price || 0;
+                            itemData.default_base_price = itemData.base_price;
                         }}
                     }} catch (e) {{
                         itemData.base_unit = item.unit || '';
                         itemData.base_price = item.unit_price || 0;
+                        itemData.default_base_price = itemData.base_price;
                     }}
                     
                     try {{
@@ -3573,7 +3577,13 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         if (item.product_id <= 0) return;
                         const p = getPrice(item.product_id);
                         if (!p) {{
-                            missingNames.push(item.product_name || ('ID ' + item.product_id));
+                            // 无策略记录：回退到商品编辑页面的默认基础单价
+                            if (item.default_base_price > 0 && item.unit_price !== item.default_base_price) {{
+                                item.unit_price = item.default_base_price;
+                                item.base_price = item.default_base_price;
+                                item.amount = Math.round(item.unit_price * (item.quantity || 0) * 100) / 100;
+                                filled += 1;
+                            }}
                             return;
                         }}
                         // 规则与 selectProduct/onOrderDateChange 一致：政采价(>0) 优先，否则商超1/2/3/AI 非零平均价
@@ -3588,6 +3598,12 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         if (sp > 0) {{
                             item.unit_price = sp;
                             item.base_price = sp;
+                            item.amount = Math.round(item.unit_price * (item.quantity || 0) * 100) / 100;
+                            filled += 1;
+                        }} else if (item.default_base_price > 0 && item.unit_price !== item.default_base_price) {{
+                            // 非策略时段：回退到商品编辑页面的默认基础单价
+                            item.unit_price = item.default_base_price;
+                            item.base_price = item.default_base_price;
                             item.amount = Math.round(item.unit_price * (item.quantity || 0) * 100) / 100;
                             filled += 1;
                         }} else {{
@@ -3630,19 +3646,26 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     items.forEach(function(it){{
                         if (it.product_id <= 0) return;
                         const p = prices[it.product_id] || prices[String(it.product_id)] || null;
-                        if (!p) return;
-                        const gov = p.gov_procurement || 0;
-                        const vals = [p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0, p.ai_realtime || 0].filter(function(v) {{ return v > 0; }});
                         let sp = 0;
-                        if (gov > 0) {{
-                            sp = gov;
-                        }} else if (vals.length > 0) {{
-                            sp = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
+                        if (p) {{
+                            const gov = p.gov_procurement || 0;
+                            const vals = [p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0, p.ai_realtime || 0].filter(function(v) {{ return v > 0; }});
+                            if (gov > 0) {{
+                                sp = gov;
+                            }} else if (vals.length > 0) {{
+                                sp = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
+                            }}
                         }}
                         if (sp > 0) {{
                             it.unit_price = sp;
                             it.base_price = sp;
                             it.amount = Math.round((it.quantity || 0) * sp * 100) / 100;
+                            updated += 1;
+                        }} else if (it.default_base_price > 0 && it.unit_price !== it.default_base_price) {{
+                            // 非价格策略时段（或无策略）：回退到商品编辑页面的默认基础单价
+                            it.unit_price = it.default_base_price;
+                            it.base_price = it.default_base_price;
+                            it.amount = Math.round((it.quantity || 0) * it.default_base_price * 100) / 100;
                             updated += 1;
                         }}
                     }});
@@ -3908,8 +3931,11 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].unit = li.getAttribute('data-base-unit');
                 items[index].base_unit = li.getAttribute('data-base-unit');
                 // 销售订单售价取基础单位对应的基础单价（基础单价=计算售价，在商品管理同步）
-                items[index].unit_price = parseFloat(li.getAttribute('data-base-price')) || parseFloat(li.getAttribute('data-price')) || 0;
-                items[index].base_price = items[index].unit_price;
+                const defaultBasePrice = parseFloat(li.getAttribute('data-base-price')) || parseFloat(li.getAttribute('data-price')) || 0;
+                // 保存商品编辑页面的默认基础单价：非价格策略时段/无策略时回退到该值
+                items[index].default_base_price = defaultBasePrice;
+                items[index].unit_price = defaultBasePrice;
+                items[index].base_price = defaultBasePrice;
                 if (items[index].quantity === undefined || items[index].quantity === null) items[index].quantity = 0;
                 if (items[index].base_quantity === undefined || items[index].base_quantity === null) items[index].base_quantity = 0;
                 items[index].amount = (items[index].quantity || 0) * (items[index].unit_price || 0);
@@ -4614,6 +4640,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         supplier_name: item.supplier_name || '',
                         base_unit: '',
                         base_price: 0,
+                        default_base_price: 0,
                         units: []
                     }};
                     items.push(itemData);
@@ -4624,13 +4651,16 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         if (product.id) {{
                             itemData.base_unit = product.base_unit || item.unit || '';
                             itemData.base_price = product.base_price || item.unit_price || 0;
+                            itemData.default_base_price = itemData.base_price;
                         }} else {{
                             itemData.base_unit = item.unit || '';
                             itemData.base_price = item.unit_price || 0;
+                            itemData.default_base_price = itemData.base_price;
                         }}
                     }} catch (e) {{
                         itemData.base_unit = item.unit || '';
                         itemData.base_price = item.unit_price || 0;
+                        itemData.default_base_price = itemData.base_price;
                     }}
                     
                     try {{
