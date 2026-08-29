@@ -1940,8 +1940,8 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
 pub async fn api_product_create(headers: axum::http::HeaderMap, Json(req): Json<ProductReq>) -> impl IntoResponse {
     // 进价仅超级管理员可设置：非 super_admin 创建商品时进价强制为 0
     let role = crate::auth::get_user_ctx(&headers).await.role;
-    let base_unit = req.base_unit.clone().unwrap_or_else(|| req.unit.clone().unwrap_or_else(|| "个".to_string()));
-    let unit = req.unit.clone().unwrap_or_else(|| "个".to_string());
+    let base_unit = req.base_unit.clone().unwrap_or_else(|| req.unit.clone().unwrap_or_else(|| "斤".to_string()));
+    let unit = req.unit.clone().unwrap_or_else(|| "".to_string());
     // 价格统一四舍五入保留两位小数
     let base_price = ((req.base_price.unwrap_or(0.0)) * 100.0).round() / 100.0;
     
@@ -2821,8 +2821,20 @@ pub async fn api_get_uploaded_image(
 
 pub async fn api_product_export() -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT p.id, p.name, p.alias1, p.alias2, p.spec, p.unit, p.base_unit, p.base_price, p.purchase_price, c.name as category_name 
-         FROM product p LEFT JOIN category c ON p.category_id = c.id ORDER BY p.id"
+        "SELECT p.id, p.name, p.alias1, p.alias2, p.spec, p.unit, p.base_unit, p.base_price, p.purchase_price, c.name as category_name,
+                COALESCE(gp.price, 0.0) as gov_price,
+                COALESCE(sp1.price, 0.0) as sm1_price,
+                COALESCE(sp2.price, 0.0) as sm2_price,
+                COALESCE(sp3.price, 0.0) as sm3_price,
+                COALESCE(ai.price, 0.0) as ai_price
+         FROM product p
+         LEFT JOIN category c ON p.category_id = c.id
+         LEFT JOIN product_price gp ON gp.product_id = p.id AND gp.price_type = 'gov_procurement'
+         LEFT JOIN product_price sp1 ON sp1.product_id = p.id AND sp1.price_type = 'supermarket_1'
+         LEFT JOIN product_price sp2 ON sp2.product_id = p.id AND sp2.price_type = 'supermarket_2'
+         LEFT JOIN product_price sp3 ON sp3.product_id = p.id AND sp3.price_type = 'supermarket_3'
+         LEFT JOIN product_price ai ON ai.product_id = p.id AND ai.price_type = 'ai_realtime'
+         ORDER BY p.id"
     )
     .fetch_all(crate::db::pool())
     .await
@@ -2837,23 +2849,51 @@ pub async fn api_product_export() -> impl IntoResponse {
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
         
-        let headers = ["ID", "名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "单位", "基本单位", "基准单价", "进价", "分类"];
+        let headers = ["ID", "名称", "下订名称(别称1)", "配单名称(别称2)", "规格", "显示单位", "基础单位", "基准单价", "进价", "分类", "政采价", "商超1", "商超2", "商超3", "AI实时采集价", "计算售价"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
         
         let mut row_idx = 1;
         for row in rows {
+            let gov = row.get::<f64, _>("gov_price");
+            let sm1 = row.get::<f64, _>("sm1_price");
+            let sm2 = row.get::<f64, _>("sm2_price");
+            let sm3 = row.get::<f64, _>("sm3_price");
+            let ai = row.get::<f64, _>("ai_price");
+            let base_price = row.get::<f64, _>("base_price");
+            let purchase_price = row.get::<f64, _>("purchase_price");
+            // 计算售价：政采价优先；否则商超1/2/3/AI 中非零价的平均（四舍五入保留 2 位）
+            let selling = if gov > 0.0 {
+                gov
+            } else {
+                let vals = [sm1, sm2, sm3, ai];
+                let (sum, cnt) = vals.iter().fold((0.0f64, 0usize), |(s, c), &v| if v > 0.0 { (s + v, c + 1) } else { (s, c) });
+                if cnt == 0 { 0.0 } else { ((sum / cnt as f64) * 100.0).round() / 100.0 }
+            };
+            // 基础单价：非零计算售价则同步为计算售价，否则取基础单价原值
+            let base_out = if selling > 0.0 { selling } else { base_price };
+            // 基础单位按实际导出
+            let base_unit = row.get::<Option<String>, _>("base_unit").unwrap_or_default();
+            
             worksheet.write(row_idx, 0, row.get::<i64, _>("id"))?;
             worksheet.write(row_idx, 1, row.get::<String, _>("name"))?;
             worksheet.write(row_idx, 2, row.get::<Option<String>, _>("alias1").unwrap_or_default())?;
             worksheet.write(row_idx, 3, row.get::<Option<String>, _>("alias2").unwrap_or_default())?;
             worksheet.write(row_idx, 4, row.get::<Option<String>, _>("spec").unwrap_or_default())?;
             worksheet.write(row_idx, 5, row.get::<String, _>("unit"))?;
-            worksheet.write(row_idx, 6, row.get::<Option<String>, _>("base_unit").unwrap_or("个".to_string()))?;
-            worksheet.write(row_idx, 7, row.get::<f64, _>("base_price"))?;
-            worksheet.write(row_idx, 8, row.get::<f64, _>("purchase_price"))?;
+            worksheet.write(row_idx, 6, &base_unit)?;
+            // 价格类值 <=0 时单元格留白
+            if base_out > 0.0 { worksheet.write(row_idx, 7, base_out)?; } else { worksheet.write(row_idx, 7, "")?; }
+            if purchase_price > 0.0 { worksheet.write(row_idx, 8, purchase_price)?; } else { worksheet.write(row_idx, 8, "")?; }
             worksheet.write(row_idx, 9, row.get::<Option<String>, _>("category_name").unwrap_or_default())?;
+            for (col, v) in [(10u16, gov), (11u16, sm1), (12u16, sm2), (13u16, sm3), (14u16, ai), (15u16, selling)] {
+                if v > 0.0 {
+                    worksheet.write(row_idx, col, v)?;
+                } else {
+                    worksheet.write(row_idx, col, "")?;
+                }
+            }
             row_idx += 1;
         }
         
@@ -2867,6 +2907,12 @@ pub async fn api_product_export() -> impl IntoResponse {
         worksheet.set_column_width(7, 12)?;
         worksheet.set_column_width(8, 10)?;
         worksheet.set_column_width(9, 12)?;
+        worksheet.set_column_width(10, 10)?;
+        worksheet.set_column_width(11, 10)?;
+        worksheet.set_column_width(12, 10)?;
+        worksheet.set_column_width(13, 10)?;
+        worksheet.set_column_width(14, 14)?;
+        worksheet.set_column_width(15, 12)?;
         
         workbook.save_to_buffer()
     })();
@@ -2930,6 +2976,7 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
     }
     
     let mut success = 0;
+    let mut updated = 0;
     let mut failed = 0;
     
     for (_i, row) in rows.iter().enumerate().skip(1) {
@@ -2964,37 +3011,137 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
         let raw_purchase: f64 = if row.len() > 8 { row[8].trim().parse().unwrap_or(0.0) } else { 0.0 };
         let base_price: f64 = (raw_base * 100.0).round() / 100.0;
         let purchase_price: f64 = (raw_purchase * 100.0).round() / 100.0;
+        let alias1 = if row.len() > 2 { row[2].trim() } else { "" };
+        let alias2 = if row.len() > 3 { row[3].trim() } else { "" };
+        let unit = if row.len() > 5 { row[5].trim() } else { "" };
+        let base_unit = if row.len() > 6 { row[6].trim() } else { "斤" };
         
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO product(name, alias1, alias2, spec, unit, base_unit, base_price, purchase_price, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(name)
-        .bind(if row.len() > 2 { row[2].trim() } else { "" })
-        .bind(if row.len() > 3 { row[3].trim() } else { "" })
-        .bind(spec)
-        .bind(if row.len() > 5 { row[5].trim() } else { "个" })
-        .bind(if row.len() > 6 { row[6].trim() } else { "个" })
-        .bind(base_price)
-        .bind(purchase_price)
-        .bind(category_id)
-        .execute(crate::db::pool())
-        .await;
+        // 商品写入成功后回填的目标商品 ID（用于后续价格列写入）
+        let mut target_pid: Option<i64> = None;
         
-        match result {
-            Ok(res) => {
-                if res.rows_affected() > 0 {
-                    success += 1;
-                } else {
+        // 第一列为商品 ID：ID 存在则更新对应商品；无 ID 或 ID 不存在则追加
+        let id_str = row[0].trim();
+        if !id_str.is_empty() {
+            if let Ok(pid) = id_str.parse::<i64>() {
+                if pid > 0 {
+                    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product WHERE id = ?")
+                        .bind(pid)
+                        .fetch_one(crate::db::pool())
+                        .await
+                        .unwrap_or(0);
+                    if exists > 0 {
+                        // 同 ID：更新对应商品（修改后置为待审核）
+                        let upd = sqlx::query(
+                            "UPDATE product SET name = ?, alias1 = ?, alias2 = ?, spec = ?, unit = ?, base_unit = ?, base_price = ?, purchase_price = ?, category_id = ?, audit_status = 'pending' WHERE id = ?"
+                        )
+                        .bind(name)
+                        .bind(alias1)
+                        .bind(alias2)
+                        .bind(spec)
+                        .bind(unit)
+                        .bind(base_unit)
+                        .bind(base_price)
+                        .bind(purchase_price)
+                        .bind(category_id)
+                        .bind(pid)
+                        .execute(crate::db::pool())
+                        .await;
+                        match upd {
+                            Ok(r) if r.rows_affected() > 0 => { updated += 1; target_pid = Some(pid); }
+                            Ok(_) => { failed += 1; }
+                            Err(_) => { failed += 1; }
+                        }
+                    }
+                    // exists == 0：该 ID 不存在 → 落到下方追加
+                }
+            }
+        }
+        
+        if target_pid.is_none() {
+            // 无 ID 或 ID 不存在：追加（按 name+spec 唯一约束去重）
+            // 文件带有效 ID 且库中不存在时，显式使用该 ID 创建，保持 ID 一致
+            let imported_pid: Option<i64> = id_str.parse::<i64>().ok().filter(|&v| v > 0);
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO product(id, name, alias1, alias2, spec, unit, base_unit, base_price, purchase_price, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(imported_pid)
+            .bind(name)
+            .bind(alias1)
+            .bind(alias2)
+            .bind(spec)
+            .bind(unit)
+            .bind(base_unit)
+            .bind(base_price)
+            .bind(purchase_price)
+            .bind(category_id)
+            .execute(crate::db::pool())
+            .await;
+            
+            match result {
+                Ok(res) => {
+                    if res.rows_affected() > 0 {
+                        success += 1;
+                        target_pid = Some(res.last_insert_rowid());
+                    } else {
+                        failed += 1;
+                    }
+                }
+                Err(_) => {
                     failed += 1;
                 }
             }
-            Err(_) => {
-                failed += 1;
+        }
+        
+        // 价格列写入（仅当商品写入成功）：政采价/商超1/商超2/商超3/AI实时采集价
+        // 写入 product_price_schedule（effective_date=今天，当天已有记录则覆盖）+ product_price 快照
+        if let Some(pid) = target_pid {
+            let today = Local::now().format("%Y-%m-%d").to_string();
+            let price_specs = [
+                ("gov_procurement", 10usize),
+                ("supermarket_1", 11usize),
+                ("supermarket_2", 12usize),
+                ("supermarket_3", 13usize),
+                ("ai_realtime", 14usize),
+            ];
+            for (pt, idx) in price_specs {
+                let raw = if row.len() > idx { row[idx].trim() } else { "" };
+                if raw.is_empty() { continue; }
+                if let Ok(pv) = raw.parse::<f64>() {
+                    let pv = (pv * 100.0).round() / 100.0;
+                    if pv > 0.0 {
+                        // 时段价：今天生效（同一天重复导入则覆盖价格）
+                        let _ = sqlx::query(
+                            "INSERT INTO product_price_schedule(product_id, price_type, price, effective_date, end_date, source, remark)
+                             VALUES (?, ?, ?, ?, NULL, ?, NULL)
+                             ON CONFLICT(product_id, price_type, effective_date) DO UPDATE SET price = excluded.price"
+                        )
+                        .bind(pid)
+                        .bind(pt)
+                        .bind(pv)
+                        .bind(&today)
+                        .bind("商品导入")
+                        .execute(crate::db::pool())
+                        .await;
+                        // 快照：商品编辑表单回显的当前价
+                        let _ = sqlx::query(
+                            "INSERT OR REPLACE INTO product_price(product_id, price_type, price, collected_at, source) VALUES (?, ?, ?, ?, ?)"
+                        )
+                        .bind(pid)
+                        .bind(pt)
+                        .bind(pv)
+                        .bind(&today)
+                        .bind("商品导入")
+                        .execute(crate::db::pool())
+                        .await;
+                        // 维护时段连续性
+                        let _ = crate::rebuild_price_schedule_end_dates(pid, pt).await;
+                    }
+                }
             }
         }
     }
     
-    (StatusCode::OK, format!("导入完成：成功 {} 条，失败 {} 条", success, failed)).into_response()
+    (StatusCode::OK, format!("导入完成：新增 {} 条，更新 {} 条，失败 {} 条", success, updated, failed)).into_response()
 }
 
 pub async fn api_product_unit_create(Json(req): Json<ProductUnitReq>) -> impl IntoResponse {

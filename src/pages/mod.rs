@@ -704,7 +704,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 <input type="text" name="unit" placeholder="显示单位" class="form-control">
                             </div>
                             <div class="col-md-1">
-                                <input type="text" name="base_unit" placeholder="基础单位" class="form-control">
+                                <input type="text" name="base_unit" placeholder="基础单位" value="斤" class="form-control">
                             </div>
                             <div class="col-md-2">
                                 <input type="number" step="0.01" name="base_price" placeholder="基础单价(售价)" class="form-control">
@@ -827,7 +827,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <h6>价格管理</h6>
                                 </div>
                                 <div class="alert alert-info py-2 mt-2 mb-2 small">
-                                    售价计算规则：若有政采平台价则以政采平台价为售价；否则取三个商超的最高价；若无任何价格则使用基础单价。
+                                    售价计算规则：若有政采平台价则以政采平台价为售价；否则取商超1/商超2/商超3/AI实时采集价的非零平均价（四舍五入保留2位）；若无任何价格则使用基础单价。
                                 </div>
                                 <div class="row mt-2">
                                     <div class="col-md-3">
@@ -850,7 +850,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 <div class="row mt-3">
                                     <div class="col-md-4">
                                         <label class="form-label">AI实时采集价（预留）</label>
-                                        <input type="number" step="0.01" name="ai_realtime" class="form-control">
+                                        <input type="number" step="0.01" name="ai_realtime" class="form-control" oninput="calcSellingPrice()">
                                     </div>
                                     <div class="col-md-4">
                                         <label class="form-label">计算售价（只读）</label>
@@ -1210,13 +1210,15 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 const sm1 = parseFloat(form.supermarket_1.value) || 0;
                 const sm2 = parseFloat(form.supermarket_2.value) || 0;
                 const sm3 = parseFloat(form.supermarket_3.value) || 0;
+                const ai = parseFloat(form.ai_realtime.value) || 0;
                 let sellingPrice = 0;
                 if (govPrice > 0) {{
                     sellingPrice = govPrice;
                 }} else {{
-                    const maxSm = Math.max(sm1, sm2, sm3);
-                    if (maxSm > 0) {{
-                        sellingPrice = maxSm;
+                    // 商超1/2/3/AI 非零价的平均（四舍五入保留 2 位）
+                    const vals = [sm1, sm2, sm3, ai].filter(function(v) {{ return v > 0; }});
+                    if (vals.length > 0) {{
+                        sellingPrice = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
                     }} else {{
                         sellingPrice = parseFloat(form.base_price.value) || 0;
                     }}
