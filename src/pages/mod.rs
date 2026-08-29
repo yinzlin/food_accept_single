@@ -6043,6 +6043,7 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
                     <label class="form-label">商品关键字</label>
                     <input type="text" id="filterKeyword" class="form-control" placeholder="商品名/别称模糊搜索" autocomplete="off">
                     <input type="hidden" id="filterProductId" value="">
+                    <div id="filterProductSuggest" class="ps-suggest" style="display:none"></div>
                 </div>
             </div>
 
@@ -6505,6 +6506,103 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
             }});
         }}
 
+        // 列表页「商品关键字」联想下拉：输入后显示商品列表，支持 ↑↓ 键盘导航 + Enter 确认
+        // 选择确认后回填商品ID并立即查询，仅显示该商品的相关内容
+        let fsSuggestTimer = null;
+        let fsActiveIndex = -1;
+        function bindFilterProductSuggest() {{
+            const kwInput = document.getElementById('filterKeyword');
+            const suggest = document.getElementById('filterProductSuggest');
+
+            function applyActive(idx) {{
+                const items = suggest.querySelectorAll('li[data-pid]');
+                if (items.length === 0) {{ fsActiveIndex = -1; return; }}
+                if (idx < 0) idx = items.length - 1;
+                if (idx >= items.length) idx = 0;
+                fsActiveIndex = idx;
+                items.forEach((li, i) => li.classList.toggle('active', i === idx));
+                items[idx].scrollIntoView({{ block: 'nearest' }});
+            }}
+
+            function pickActive(idx) {{
+                const items = suggest.querySelectorAll('li[data-pid]');
+                if (idx < 0 || idx >= items.length) return false;
+                const li = items[idx];
+                document.getElementById('filterProductId').value = li.dataset.pid;
+                kwInput.value = li.dataset.name;
+                suggest.style.display = 'none';
+                fsActiveIndex = -1;
+                loadList(1);
+                return true;
+            }}
+
+            kwInput.addEventListener('input', () => {{
+                clearTimeout(fsSuggestTimer);
+                const kw = kwInput.value.trim();
+                document.getElementById('filterProductId').value = '';
+                fsActiveIndex = -1;
+                if (!kw) {{ suggest.style.display = 'none'; return; }}
+                fsSuggestTimer = setTimeout(async () => {{
+                    const res = await fetch('/api/product/search?keyword=' + encodeURIComponent(kw));
+                    const data = await res.json();
+                    const list = Array.isArray(data) ? data : (data.products || data.data || []);
+                    if (!list || list.length === 0) {{
+                        suggest.innerHTML = '<ul><li class="text-muted" style="cursor:default">未找到匹配商品</li></ul>';
+                        suggest.style.display = 'block';
+                        fsActiveIndex = -1;
+                        return;
+                    }}
+                    suggest.innerHTML = '<ul>' + list.slice(0, 15).map(p => {{
+                        const aliases = [p.alias1, p.alias2].filter(a => a && a.trim());
+                        const aliasHtml = aliases.length
+                            ? ` <span class="ps-alias">（${{aliases.map(a => escapeHtml(a)).join(' / ')}}）</span>`
+                            : '';
+                        const metaParts = [p.spec, p.unit, p.category_name].filter(x => x && String(x).trim());
+                        const metaHtml = metaParts.length
+                            ? `<small>${{metaParts.map(x => escapeHtml(String(x))).join(' · ')}}</small>`
+                            : '';
+                        return `<li data-pid="${{p.id}}" data-name="${{escapeHtml(p.name)}}">
+                            <strong>${{escapeHtml(p.name)}}</strong>${{aliasHtml}}
+                            ${{metaHtml}}
+                        </li>`;
+                    }}).join('') + '</ul>';
+                    suggest.style.display = 'block';
+                    applyActive(0);
+                    suggest.querySelectorAll('li[data-pid]').forEach((li, i) => {{
+                        li.onclick = () => pickActive(i);
+                        li.onmouseenter = () => applyActive(i);
+                    }});
+                }}, 250);
+            }});
+
+            kwInput.addEventListener('keydown', (e) => {{
+                const visible = suggest.style.display !== 'none' && suggest.querySelectorAll('li[data-pid]').length > 0;
+                if (!visible) return;
+                if (e.key === 'ArrowDown') {{
+                    e.preventDefault();
+                    applyActive(fsActiveIndex + 1);
+                }} else if (e.key === 'ArrowUp') {{
+                    e.preventDefault();
+                    applyActive(fsActiveIndex - 1);
+                }} else if (e.key === 'Enter') {{
+                    if (fsActiveIndex >= 0) {{
+                        e.preventDefault();
+                        pickActive(fsActiveIndex);
+                    }}
+                }} else if (e.key === 'Escape') {{
+                    suggest.style.display = 'none';
+                    fsActiveIndex = -1;
+                }}
+            }});
+
+            document.addEventListener('click', (e) => {{
+                if (!suggest.contains(e.target) && e.target !== kwInput) {{
+                    suggest.style.display = 'none';
+                    fsActiveIndex = -1;
+                }}
+            }});
+        }}
+
         // 时段诊断：弹窗展示该商品下所有价格类型的完整时段链
         async function diagnose(productId) {{
             const res = await fetch('/api/price_schedule/diagnose?product_id=' + encodeURIComponent(productId));
@@ -6601,6 +6699,7 @@ pub async fn page_query_price_schedule(headers: axum::http::HeaderMap) -> Html<S
             applyProductPreset();
             loadList(1);
             bindProductSuggest();
+            bindFilterProductSuggest();
         }});
         </script>
     "#,
