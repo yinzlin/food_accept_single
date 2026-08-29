@@ -1138,22 +1138,11 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                             auditBtns += '<button class="btn btn-sm btn-success me-1" onclick="approveProduct(' + p.id + ')">审核</button>';
                         }}
                     }}
-                    // 售价列：优先取政采平台价（gov_procurement，非空且 >0），否则回退到商品基础单价 base_price
+                    // 售价列：显示基础单位对应的基础单价（基础单价由计算售价同步而来；多单位价格保持独立，见多单位表格）
                     let priceCell = '<span class="text-muted">-</span>';
-                    let govForSell = 0;
                     const pp = prices[String(p.id)] || prices[p.id];
-                    if (pp) {{
-                        govForSell = pp.gov_procurement || 0;
-                    }}
                     const basePrice = parseFloat(p.base_price) || 0;
-                    if (govForSell > 0) {{
-                        // 政采价优先：显示政采价 + 标注来源；若 base_price 存在且与政采价不同，附小字提示
-                        let extra = '';
-                        if (basePrice > 0 && Math.abs(basePrice - govForSell) > 0.001) {{
-                            extra = '<br><small class="text-muted" title="商品基础单价">基础 ¥' + basePrice.toFixed(2) + '</small>';
-                        }}
-                        priceCell = '<b class="text-primary">¥' + govForSell.toFixed(2) + '</b><span class="badge bg-primary ms-1" style="font-size:10px;">政采</span>' + extra;
-                    }} else if (basePrice > 0) {{
+                    if (basePrice > 0) {{
                         priceCell = '¥' + basePrice.toFixed(2);
                     }}
                     html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + priceCell + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
@@ -1225,28 +1214,15 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 }}
                 // 应用统一尾数规则
                 form.selling_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+                // 基础单价 = 计算售价（计算售价变化时同步基础单价）
+                if (sellingPrice > 0) {{
+                    form.base_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+                }}
             }}
 
-            // 基础单价快捷录入：基础单价变化时联动计算售价
-            // 规则：
-            //  - 若当前计算售价非空且 >0：将基础单价同步到计算售价（按尾数规则）
-            //  - 若计算售价为空或 0：用基础单价的快捷录入值回填计算售价（按尾数规则）
+            // 基础单价由计算售价驱动；手动修改基础单价不再反向联动计算售价
             function onBasePriceChange() {{
-                const form = document.getElementById('editForm');
-                if (!form || !form.base_price || !form.selling_price) return;
-                const baseRaw = parseFloat(form.base_price.value);
-                if (!isFinite(baseRaw) || baseRaw <= 0) {{
-                    // 基础单价也清空时不做强制覆盖（保持 selling_price 现状）
-                    return;
-                }}
-                const sellingRaw = parseFloat(form.selling_price.value);
-                if (isFinite(sellingRaw) && sellingRaw > 0) {{
-                    // 计算售价非空/非零：基础单价同步到计算售价
-                    form.selling_price.value = roundToAllowedLastDigit(baseRaw).toFixed(2);
-                }} else {{
-                    // 计算售价为空/零：用基础单价的快捷录入值回填
-                    form.selling_price.value = roundToAllowedLastDigit(baseRaw).toFixed(2);
-                }}
+                // 计算售价（政采/商超/AI）变化时会同步基础单价，这里不做任何反向覆盖
             }}
 
             // 加成率变更时的客户端预览（仅在自动更新开启且有进价时）
@@ -3600,20 +3576,19 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                             missingNames.push(item.product_name || ('ID ' + item.product_id));
                             return;
                         }}
+                        // 规则与 selectProduct/onOrderDateChange 一致：政采价(>0) 优先，否则商超1/2/3/AI 非零平均价
                         const gov = p.gov_procurement || 0;
-                        const sm1 = p.supermarket_1 || 0;
-                        const sm2 = p.supermarket_2 || 0;
-                        const sm3 = p.supermarket_3 || 0;
-                        const maxSm = Math.max(sm1, sm2, sm3);
+                        const vals = [p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0, p.ai_realtime || 0].filter(function(v) {{ return v > 0; }});
+                        let sp = 0;
                         if (gov > 0) {{
-                            item.unit_price = gov;
-                            item.base_price = gov;
-                            item.amount = item.unit_price * (item.quantity || 0);
-                            filled += 1;
-                        }} else if (maxSm > 0) {{
-                            item.unit_price = maxSm;
-                            item.base_price = maxSm;
-                            item.amount = item.unit_price * (item.quantity || 0);
+                            sp = gov;
+                        }} else if (vals.length > 0) {{
+                            sp = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
+                        }}
+                        if (sp > 0) {{
+                            item.unit_price = sp;
+                            item.base_price = sp;
+                            item.amount = Math.round(item.unit_price * (item.quantity || 0) * 100) / 100;
                             filled += 1;
                         }} else {{
                             missingNames.push(item.product_name || ('ID ' + item.product_id));
@@ -3634,7 +3609,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
             generateOrderNo('sales');
 
-            // 订单日期变化时：已选明细按新日期重新拉政采价/超市比价覆盖
+            // 订单日期变化时：已选明细按新日期重新拉政采价/超市比价覆盖（与 selectProduct 规则一致：政采优先 > 非零平均价）
             async function onOrderDateChange() {{
                 generateOrderNo('sales');
                 if (!items || items.length === 0) return;
@@ -3654,19 +3629,20 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     let updated = 0;
                     items.forEach(function(it){{
                         if (it.product_id <= 0) return;
-                        const p = prices[it.product_id];
+                        const p = prices[it.product_id] || prices[String(it.product_id)] || null;
                         if (!p) return;
                         const gov = p.gov_procurement || 0;
-                        const maxSm = Math.max(p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0);
+                        const vals = [p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0, p.ai_realtime || 0].filter(function(v) {{ return v > 0; }});
+                        let sp = 0;
                         if (gov > 0) {{
-                            it.unit_price = gov;
-                            it.base_price = gov;
-                            it.amount = (it.quantity || 0) * gov;
-                            updated += 1;
-                        }} else if (maxSm > 0) {{
-                            it.unit_price = maxSm;
-                            it.base_price = maxSm;
-                            it.amount = (it.quantity || 0) * maxSm;
+                            sp = gov;
+                        }} else if (vals.length > 0) {{
+                            sp = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
+                        }}
+                        if (sp > 0) {{
+                            it.unit_price = sp;
+                            it.base_price = sp;
+                            it.amount = Math.round((it.quantity || 0) * sp * 100) / 100;
                             updated += 1;
                         }}
                     }});
@@ -3931,8 +3907,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].spec = li.getAttribute('data-spec');
                 items[index].unit = li.getAttribute('data-base-unit');
                 items[index].base_unit = li.getAttribute('data-base-unit');
-                items[index].unit_price = parseFloat(li.getAttribute('data-price')) || parseFloat(li.getAttribute('data-base-price')) || 0;
-                items[index].base_price = parseFloat(li.getAttribute('data-price')) || parseFloat(li.getAttribute('data-base-price')) || items[index].unit_price;
+                // 销售订单售价取基础单位对应的基础单价（基础单价=计算售价，在商品管理同步）
+                items[index].unit_price = parseFloat(li.getAttribute('data-base-price')) || parseFloat(li.getAttribute('data-price')) || 0;
+                items[index].base_price = items[index].unit_price;
                 if (items[index].quantity === undefined || items[index].quantity === null) items[index].quantity = 0;
                 if (items[index].base_quantity === undefined || items[index].base_quantity === null) items[index].base_quantity = 0;
                 items[index].amount = (items[index].quantity || 0) * (items[index].unit_price || 0);
@@ -3941,8 +3918,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 dropdown.innerHTML = '';
                 dropdown.style.display = 'none';
 
-                // 按订单日期拉取该商品的政采价/超市比价，命中时用历史生效价覆盖默认 base_price
-                // 优先级：gov_procurement > supermarket_1/2/3 最大值
+                // 按订单日期拉取该商品的价格策略时段价，命中时用该时段策略价作为售价
+                // 规则与商品管理一致：政采价(>0) 优先，否则商超1/2/3/AI 非零平均价
                 const orderDate = document.getElementById('orderDateInput').value;
                 if (orderDate) {{
                     try {{
@@ -3956,20 +3933,22 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                             const p = (jd.prices || {{}})[items[index].product_id];
                             if (p) {{
                                 const gov = p.gov_procurement || 0;
-                                const maxSm = Math.max(p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0);
+                                const vals = [p.supermarket_1 || 0, p.supermarket_2 || 0, p.supermarket_3 || 0, p.ai_realtime || 0].filter(function(v) {{ return v > 0; }});
+                                let sp = 0;
                                 if (gov > 0) {{
-                                    items[index].unit_price = gov;
-                                    items[index].base_price = gov;
-                                    items[index].amount = (items[index].quantity || 0) * gov;
-                                }} else if (maxSm > 0) {{
-                                    items[index].unit_price = maxSm;
-                                    items[index].base_price = maxSm;
-                                    items[index].amount = (items[index].quantity || 0) * maxSm;
+                                    sp = gov;
+                                }} else if (vals.length > 0) {{
+                                    sp = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
+                                }}
+                                if (sp > 0) {{
+                                    items[index].unit_price = sp;
+                                    items[index].base_price = sp;
+                                    items[index].amount = Math.round((items[index].quantity || 0) * sp * 100) / 100;
                                 }}
                             }}
                         }}
                     }} catch (e) {{
-                        console.error('按日期加载价失败:', e);
+                        console.error('按日期加载时段价失败:', e);
                     }}
                 }}
 

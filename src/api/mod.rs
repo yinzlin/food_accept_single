@@ -1871,7 +1871,7 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
         
         let mut prices: Vec<serde_json::Value> = Vec::new();
         let mut gov_price: Option<f64> = None;
-        let mut supermarket_prices: Vec<f64> = Vec::new();
+        let mut other_prices: Vec<f64> = Vec::new();
         
         for pr in price_rows {
             let price_type: String = pr.get("price_type");
@@ -1883,19 +1883,25 @@ pub async fn api_product_list(headers: axum::http::HeaderMap, axum::extract::Que
             
             if price_type == "gov_procurement" {
                 gov_price = Some(price);
-            } else if price_type.starts_with("supermarket_") {
-                supermarket_prices.push(price);
+            } else if price_type == "supermarket_1" || price_type == "supermarket_2"
+                    || price_type == "supermarket_3" || price_type == "ai_realtime" {
+                if price > 0.0 {
+                    other_prices.push(price);
+                }
             }
         }
         
         let selling_price = if let Some(gp) = gov_price {
-            if gp > 0.0 { gp } else if !supermarket_prices.is_empty() {
-                *supermarket_prices.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap()
+            if gp > 0.0 {
+                gp
+            } else if !other_prices.is_empty() {
+                // 商超1/2/3/AI 非零价的平均（四舍五入保留 2 位，与前端 calcSellingPrice 一致）
+                (other_prices.iter().sum::<f64>() / other_prices.len() as f64 * 100.0).round() / 100.0
             } else {
                 row.get::<f64, _>("base_price")
             }
-        } else if !supermarket_prices.is_empty() {
-            *supermarket_prices.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap()
+        } else if !other_prices.is_empty() {
+            (other_prices.iter().sum::<f64>() / other_prices.len() as f64 * 100.0).round() / 100.0
         } else {
             row.get::<f64, _>("base_price")
         };
@@ -2014,7 +2020,7 @@ pub async fn api_product_by_id(headers: axum::http::HeaderMap, axum::extract::Qu
     let row = sqlx::query(
         "SELECT p.id, p.name, p.alias1, p.alias2, p.spec, p.unit, p.base_unit, p.base_price, p.purchase_price,
                 COALESCE(NULLIF((SELECT price FROM product_price WHERE product_id = p.id AND price_type = 'gov_procurement'), 0),
-                         (SELECT MAX(price) FROM product_price WHERE product_id = p.id AND price_type LIKE 'supermarket_%'),
+                         (SELECT AVG(price) FROM product_price WHERE product_id = p.id AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0),
                          p.base_price) as selling_price,
                 c.name as category_name
          FROM product p LEFT JOIN category c ON p.category_id = c.id
@@ -2064,7 +2070,7 @@ pub async fn api_product_search(headers: axum::http::HeaderMap, axum::extract::Q
     let sql = format!(
         "SELECT p.id, p.name, p.alias1, p.alias2, p.spec, p.unit, p.base_unit, p.base_price, p.purchase_price,
                 COALESCE(NULLIF((SELECT price FROM product_price WHERE product_id = p.id AND price_type = 'gov_procurement'), 0),
-                         (SELECT MAX(price) FROM product_price WHERE product_id = p.id AND price_type LIKE 'supermarket_%'),
+                         (SELECT AVG(price) FROM product_price WHERE product_id = p.id AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0),
                          p.base_price) as selling_price,
                 c.name as category_name
          FROM product p LEFT JOIN category c ON p.category_id = c.id
@@ -3357,29 +3363,28 @@ pub async fn api_product_sync_base_price(Json(req): Json<std::collections::HashM
         if gp > 0.0 {
             gp
         } else {
-            let max_row = sqlx::query("SELECT MAX(price) as max_price FROM product_price WHERE product_id = ? AND price_type LIKE 'supermarket_%'")
+            // 商超1/2/3/AI 非零价的平均值（与前端 calcSellingPrice 保持一致）
+            let avg_row = sqlx::query("SELECT COALESCE(AVG(price), 0.0) as avg_price FROM product_price WHERE product_id = ? AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0")
                 .bind(product_id)
                 .fetch_optional(crate::db::pool())
                 .await
                 .ok()
                 .flatten();
-            if let Some(row) = max_row {
-                let mp: Option<f64> = row.get("max_price");
-                mp.unwrap_or(0.0)
+            if let Some(row) = avg_row {
+                row.get::<f64, _>("avg_price")
             } else {
                 0.0
             }
         }
     } else {
-        let max_row = sqlx::query("SELECT MAX(price) as max_price FROM product_price WHERE product_id = ? AND price_type LIKE 'supermarket_%'")
+        let avg_row = sqlx::query("SELECT COALESCE(AVG(price), 0.0) as avg_price FROM product_price WHERE product_id = ? AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0")
             .bind(product_id)
             .fetch_optional(crate::db::pool())
             .await
             .ok()
             .flatten();
-        if let Some(row) = max_row {
-            let mp: Option<f64> = row.get("max_price");
-            mp.unwrap_or(0.0)
+        if let Some(row) = avg_row {
+            row.get::<f64, _>("avg_price")
         } else {
             0.0
         }
@@ -5301,15 +5306,27 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
                 let sup1_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_1", &order_date_short).await;
                 let sup2_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_2", &order_date_short).await;
                 let sup3_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_3", &order_date_short).await;
+                let ai_map = crate::batch_lookup_effective_prices(&product_ids, "ai_realtime", &order_date_short).await;
                 let mut auto_filled = 0;
                 for it in req.items.iter_mut() {
                     if it.product_id > 0 && it.unit_price <= 0.0 {
-                        let new_price = gov_map.get(&it.product_id).copied()
-                            .filter(|p| *p > 0.0)
-                            .or_else(|| sup1_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
-                            .or_else(|| sup2_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
-                            .or_else(|| sup3_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
-                            .unwrap_or(0.0);
+                        // 政采价(>0) 优先，否则商超1/2/3/AI 非零平均价
+                        let gov = gov_map.get(&it.product_id).copied().filter(|p| *p > 0.0);
+                        let new_price = if let Some(g) = gov {
+                            g
+                        } else {
+                            let vals: Vec<f64> = [
+                                sup1_map.get(&it.product_id).copied().unwrap_or(0.0),
+                                sup2_map.get(&it.product_id).copied().unwrap_or(0.0),
+                                sup3_map.get(&it.product_id).copied().unwrap_or(0.0),
+                                ai_map.get(&it.product_id).copied().unwrap_or(0.0),
+                            ].into_iter().filter(|v| *v > 0.0).collect();
+                            if vals.is_empty() {
+                                0.0
+                            } else {
+                                (vals.iter().sum::<f64>() / vals.len() as f64 * 100.0).round() / 100.0
+                            }
+                        };
                         if new_price > 0.0 {
                             it.unit_price = new_price;
                             if it.quantity > 0.0 && it.amount <= 0.0 {
@@ -9237,22 +9254,33 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
                 }
             }
             if !product_ids.is_empty() {
-                // 按 (gov_procurement, supermarket_*) 优先级查
-                // gov 优先，没有再回退到 supermarket_* 的 MAX
+                // 按 (gov_procurement, supermarket_*/ai_realtime) 时段价补价
+                // 规则与商品管理一致：政采价(>0) 优先，否则商超1/2/3/AI 非零平均价
                 let gov_map = crate::batch_lookup_effective_prices(&product_ids, "gov_procurement", &order_date_short).await;
                 let sup1_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_1", &order_date_short).await;
                 let sup2_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_2", &order_date_short).await;
                 let sup3_map = crate::batch_lookup_effective_prices(&product_ids, "supermarket_3", &order_date_short).await;
+                let ai_map = crate::batch_lookup_effective_prices(&product_ids, "ai_realtime", &order_date_short).await;
 
                 let mut auto_filled = 0;
                 for it in req.items.iter_mut() {
                     if it.product_id > 0 && it.unit_price <= 0.0 {
-                        let new_price = gov_map.get(&it.product_id).copied()
-                            .filter(|p| *p > 0.0)
-                            .or_else(|| sup1_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
-                            .or_else(|| sup2_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
-                            .or_else(|| sup3_map.get(&it.product_id).copied().filter(|p| *p > 0.0))
-                            .unwrap_or(0.0);
+                        let gov = gov_map.get(&it.product_id).copied().filter(|p| *p > 0.0);
+                        let new_price = if let Some(g) = gov {
+                            g
+                        } else {
+                            let vals: Vec<f64> = [
+                                sup1_map.get(&it.product_id).copied().unwrap_or(0.0),
+                                sup2_map.get(&it.product_id).copied().unwrap_or(0.0),
+                                sup3_map.get(&it.product_id).copied().unwrap_or(0.0),
+                                ai_map.get(&it.product_id).copied().unwrap_or(0.0),
+                            ].into_iter().filter(|v| *v > 0.0).collect();
+                            if vals.is_empty() {
+                                0.0
+                            } else {
+                                (vals.iter().sum::<f64>() / vals.len() as f64 * 100.0).round() / 100.0
+                            }
+                        };
                         if new_price > 0.0 {
                             it.unit_price = new_price;
                             // amount 同步：使用现 quantity 重新计算（避免前端传的 0 金额）
@@ -14229,7 +14257,7 @@ pub async fn api_price_schedule_lookup_batch(
     if date.is_empty() {
         return (StatusCode::BAD_REQUEST, "{\"success\":false,\"message\":\"date 不能为空\"}".to_string()).into_response();
     }
-    let types = ["gov_procurement", "supermarket_1", "supermarket_2", "supermarket_3"];
+    let types = ["gov_procurement", "supermarket_1", "supermarket_2", "supermarket_3", "ai_realtime"];
     // 用 serde_json::Map 显式以字符串为 key，避免 i64 数字 key 在不同 serde_json 版本下被当成 array index
     let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for &pid in &req.product_ids {
