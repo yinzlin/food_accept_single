@@ -10075,14 +10075,16 @@ pub async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> i
 
     match result {
         Ok(res) => {
-            // 所有操作类型（含 replace_remove 冲减负数）都更新分摊余额：
-            // 正数(换入/追加/新增)消耗余额，负数(冲减)释放余额，保证账目平衡
+            // 分摊余额口径：正数(换入/追加/新增)按金额全额消耗余额；
+            // replace_remove 冲减仅修改分摊账套明细，不释放余额
+            // （被冲减的原明细金额本身即待分摊的耗材来源，其额度由换入商品对冲）
+            let pool_delta = if req.operation_type == "replace_remove" { 0.0 } else { req.amount };
             let _ = sqlx::query(
                 "UPDATE consumable_allocation SET allocated_amount = allocated_amount + ?, remaining_balance = remaining_balance - ?, status = CASE WHEN remaining_balance - ? <= 0 THEN 2 ELSE 1 END WHERE source_order_id = ?"
             )
-            .bind(req.amount)
-            .bind(req.amount)
-            .bind(req.amount)
+            .bind(pool_delta)
+            .bind(pool_delta)
+            .bind(pool_delta)
             .bind(req.source_order_id)
             .execute(crate::db::pool())
             .await;
@@ -10299,7 +10301,9 @@ pub async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
     let r = row.unwrap();
     let source_order_id: i64 = r.get("source_order_id");
     let amount: f64 = r.get("amount");
-    let _operation_type: String = r.get("operation_type");
+    let operation_type: String = r.get("operation_type");
+    // 与创建时镜像：replace_remove 冲减创建时未消耗余额，回滚时也不释放
+    let pool_delta = if operation_type == "replace_remove" { 0.0 } else { amount };
 
     let result = sqlx::query("DELETE FROM order_supplement_item WHERE id = ?")
         .bind(id)
@@ -10309,15 +10313,14 @@ pub async fn api_supplement_delete(Path(id): Path<i64>) -> impl IntoResponse {
     match result {
         Ok(res) => {
             if res.rows_affected() > 0 {
-                // 所有操作类型（含 replace_remove 冲减负数）都回滚分摊金额：
                 // 正数(换入/追加/新增)回滚时 allocated 减回、remaining 加回；
-                // 负数(冲减)回滚时 allocated 加回、remaining 减回（与创建时反向）
+                // 冲减(replace_remove)回滚时不影响分摊余额
                 let _ = sqlx::query(
                     "UPDATE consumable_allocation SET allocated_amount = allocated_amount - ?, remaining_balance = remaining_balance + ?, status = CASE WHEN remaining_balance + ? < total_amount THEN 1 ELSE 0 END WHERE source_order_id = ? AND status != 3"
                 )
-                .bind(amount)
-                .bind(amount)
-                .bind(amount)
+                .bind(pool_delta)
+                .bind(pool_delta)
+                .bind(pool_delta)
                 .bind(source_order_id)
                 .execute(crate::db::pool())
                 .await;

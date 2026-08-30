@@ -12805,11 +12805,12 @@ pub async fn page_supplement() -> Html<String> {
             }
 
             function updateBalanceWarning() {
-                const pendingSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + s.amount, 0);
+                // 分摊余额口径：正数(换入/追加/新增)计入本次分摊消耗；冲减负数不释放余额
+                const pendingSum = pendingSupplements.filter(s => !s.id).reduce((sum, s) => sum + Math.max(s.amount, 0), 0);
                 const total = allocationSummary ? allocationSummary.total_amount : 0;
                 const allocated = allocationSummary ? allocationSummary.allocated_amount : 0;
                 const remainingBalance = allocationSummary ? allocationSummary.remaining_balance : 0;
-                // 预计总分摊 = 已分摊(历史已保存) + 本次待保存净额(含正负)
+                // 预计总分摊 = 已分摊(历史已保存) + 本次待保存消耗（冲减不计入）
                 const projected = allocated + pendingSum;
                 // 超额 = 预计总分摊 - 耗材总额（等价于 pendingSum - remaining_balance）
                 const over = projected - total;
@@ -12944,13 +12945,15 @@ pub async fn page_supplement() -> Html<String> {
                     return;
                 }
                 // 保存前校验分摊总额（上下 5 元尾差）
-                const pendingSum = toSave.reduce((sum, s) => sum + s.amount, 0);
+                // 分摊余额口径：正数(换入/追加/新增)计入本次分摊消耗；冲减负数不释放余额
+                const pendingSum = toSave.reduce((sum, s) => sum + Math.max(s.amount, 0), 0);
                 const total_amount = allocationSummary ? allocationSummary.total_amount : 0;
                 const allocated_amount = allocationSummary ? allocationSummary.allocated_amount : 0;
                 const remaining_balance = allocationSummary ? allocationSummary.remaining_balance : 0;
                 const projected = allocated_amount + pendingSum;  // 预计总分摊
                 const diff = projected - total_amount;            // 与耗材总额的差额
-                if (Math.abs(diff) > 5.0) {
+                // 仅拦截超额分摊（预计总分摊超出耗材总额±5元）；少分摊属正常"分摊中"状态，允许保存
+                if (diff > 5.0) {
                     await priceAlert(`保存失败：预计总分摊金额超出耗材总额 ${diff.toFixed(2)} 元（超出±5元限制）。` +
                           `\n\n耗材总额: ${total_amount.toFixed(2)} 元` +
                           `\n已分摊: ${allocated_amount.toFixed(2)} 元` +
