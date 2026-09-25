@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use axum::{
+    extract::DefaultBodyLimit,
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -1676,10 +1677,17 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
         product_to_key.entry(pid).or_insert(rid);
         let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
         let product_name = r.get::<String, _>("product_name");
-        let food_name = if alias2.is_empty() {
-            product_name
-        } else {
+        let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+        if spec.is_empty() {
+            spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
+        }
+        // 导出名称优先级：别称2 -> 规格 -> 名称（仅当别称2与规格都为空时才用名称）
+        let food_name = if !alias2.is_empty() {
             alias2
+        } else if !spec.is_empty() {
+            spec.clone()
+        } else {
+            product_name
         };
         let unit = r.get::<Option<String>, _>("unit").unwrap_or_default();
         // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
@@ -1689,12 +1697,15 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
         } else {
             r.get::<Option<String>, _>("product_base_unit").unwrap_or_default()
         };
-        let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
-        if spec.is_empty() {
-            spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
-        }
         let original_remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
-        let remark = if spec.is_empty() { original_remark } else if original_remark.is_empty() { spec.clone() } else { format!("{}; {}", spec, original_remark) };
+        // 名称优先级（别称2->规格->名称）三选一独立取值：名称已采用规格时，备注不再重复并入规格
+        let remark = if spec.is_empty() || food_name == spec {
+            original_remark
+        } else if original_remark.is_empty() {
+            spec.clone()
+        } else {
+            format!("{}; {}", spec, original_remark)
+        };
         let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
@@ -1745,7 +1756,18 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
             // new_item 或 replace_add：作为新明细导出，按商品类别归类排序
             let alias2 = r.get::<Option<String>, _>("alias2").unwrap_or_default();
             let product_name = r.get::<String, _>("product_name");
-            let food_name = if alias2.is_empty() { product_name } else { alias2 };
+            let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            if spec.is_empty() {
+                spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
+            }
+            // 导出名称优先级：别称2 -> 规格 -> 名称（仅当别称2与规格都为空时才用名称）
+            let food_name = if !alias2.is_empty() {
+                alias2
+            } else if !spec.is_empty() {
+                spec.clone()
+            } else {
+                product_name
+            };
             // 打印模板的"规格"列实际为真实订单的"单位"列（件/卷等）
             // 优先取分摊增项的 unit，为空时回退到商品表的基础单位 base_unit
             let unit = {
@@ -1756,20 +1778,21 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
                     r.get::<Option<String>, _>("product_base_unit").unwrap_or_default()
                 }
             };
-            let mut spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
-            if spec.is_empty() {
-                spec = r.get::<Option<String>, _>("product_spec").unwrap_or_default();
-            }
             let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
             let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
             let sort_key = get_category_sort_key(&category_name, &parent_name);
+            // 名称优先级（别称2->规格->名称）三选一独立取值：名称已采用规格时，备注不再重复并入规格
             let remark = if op_type == "replace_add" {
                 // 替换换入：按类别正常导出，不额外标记
-                spec.clone()
+                if food_name == spec { String::new() } else { spec.clone() }
             } else {
                 // 普通新增增项：保留标记
                 let source_remark = r.get::<Option<String>, _>("source_remark").unwrap_or_default();
-                if spec.is_empty() { format!("[增项] {}", source_remark) } else { format!("{}; [增项] {}", spec, source_remark) }
+                if spec.is_empty() || food_name == spec {
+                    format!("[增项] {}", source_remark)
+                } else {
+                    format!("{}; [增项] {}", spec, source_remark)
+                }
             };
             // 规格列（C列）填单位（打印模板的"规格"列实际是单位列）
             item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
@@ -2157,7 +2180,7 @@ fn build_router() -> Router {
         .route("/api/backup/download/{id}", get(api_backup_download))
         .route("/api/backup/delete/{id}", delete(api_backup_delete))
         .route("/api/restore/{id}", post(api_restore))
-        .route("/api/restore/file", post(api_restore_file))
+        .route("/api/restore/file", post(api_restore_file).layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
         .route("/api/clean_invalid_orders", post(api_clean_invalid_orders))
         .route("/api/inspect_corrupted_items", get(api_inspect_corrupted_items))
         .route("/api/clean_corrupted_items", post(api_clean_corrupted_items))

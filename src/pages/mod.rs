@@ -741,7 +741,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
         <div class="product-list-section">
         <table class="table table-bordered product-sticky-table">
-            <thead><tr><th>ID</th><th>图片</th><th>名称</th><th>规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>最新政采/比价</th><th>审核</th><th style="width:280px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>图片</th><th style="width:120px">名称</th><th style="min-width:180px">规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>最新政采/比价</th><th>审核</th><th style="width:280px">操作</th></tr></thead>
             <tbody id="productTableBody">
                 <tr><td colspan="14" class="text-center text-muted">加载中...</td></tr>
             </tbody>
@@ -1119,10 +1119,8 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                             + 'onerror="this.style.display=\'none\';this.parentElement.innerHTML=\'<span style=\\\'color:#ccc;font-size:12px\\\'>无图</span>\'">';
                     }}
                     imageHtml += '</div>';
+                    // 名称列仅显示商品名称（别称2内容已在导入时同步至规格列，不再拼接显示）
                     let nameDisplay = escapeHtml(p.name);
-                    if (p.alias2 && p.alias2.trim() !== '') {{
-                        nameDisplay += '(' + escapeHtml(p.alias2.trim()) + ')';
-                    }}
                     let statusBadge = p.status === 1 ? '<span class="badge bg-success">启用</span>' : '<span class="badge bg-secondary">停用</span>';
                     let toggleBtnClass = p.status === 1 ? 'btn-outline-warning' : 'btn-outline-success';
                     let toggleBtnText = p.status === 1 ? '停用' : '启用';
@@ -4694,8 +4692,19 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     items.forEach((item, idx) => {{
                         const newData = priceMap[item.product_id];
                         if (newData) {{
+                            // 后端返回基础单价（按基础单位）；按行当前单位换算后重算金额（与切换单位逻辑一致）
+                            const basePrice = newData.unit_price;
+                            let ratio = item.ratio;
+                            if (!ratio || ratio <= 0) {{
+                                ratio = 1;
+                                if (item.unit !== item.base_unit && item.units) {{
+                                    const u = item.units.find(x => x.name === item.unit);
+                                    if (u && u.ratio > 0) ratio = u.ratio;
+                                }}
+                            }}
+                            const isBaseUnit = item.unit === item.base_unit;
+                            const newPrice = isBaseUnit ? basePrice : Math.round(basePrice * ratio * 100) / 100;
                             const oldPrice = item.unit_price;
-                            const newPrice = newData.unit_price;
                             const diff = newPrice - oldPrice;
                             if (Math.abs(diff) > 0.001) {{
                                 changes.push({{
@@ -4706,7 +4715,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                 }});
                             }}
                             item.unit_price = newPrice;
-                            item.amount = newData.amount;
+                            item.ratio = ratio;
+                            item.base_quantity = Math.round((item.quantity || 0) * ratio * 100) / 100;
+                            item.amount = Math.round(item.unit_price * (item.quantity || 0) * 100) / 100;
                         }}
                     }});
                     renderItems();

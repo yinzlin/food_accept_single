@@ -569,7 +569,10 @@ pub async fn api_restore_file(mut multipart: Multipart) -> impl IntoResponse {
             continue;
         }
         
-        let bytes = field.bytes().await.unwrap_or_default();
+        let bytes = match field.bytes().await {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("文件读取失败：{}", e)),
+        };
         if bytes.is_empty() {
             return (StatusCode::BAD_REQUEST, "文件内容为空".to_string());
         }
@@ -2984,18 +2987,32 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
     let mut success = 0;
     let mut updated = 0;
     let mut failed = 0;
-    
+    // 失败明细：行号 + 商品名 + 原因（用于导入结果反馈）
+    let mut failures: Vec<String> = Vec::new();
+
     for (_i, row) in rows.iter().enumerate().skip(1) {
+        // Excel 行号（含表头行，_i 从 1 开始计第一条数据行）
+        let excel_row = _i + 1;
+        let row_no = format!("第{}行", excel_row);
         if row.len() < 2 {
             failed += 1;
+            failures.push(format!("{}：行数据不足2列，无法解析", row_no));
             continue;
         }
-        
+
         let name = row[1].trim();
         if name.is_empty() {
             failed += 1;
+            failures.push(format!("{}：商品名称为空", row_no));
             continue;
         }
+        // 明细中的商品名展示（截断避免弹窗过长）
+        let name_disp: String = if name.chars().count() > 20 {
+            let s: String = name.chars().take(20).collect();
+            format!("{}…", s)
+        } else {
+            name.to_string()
+        };
         
         let category_name = if row.len() > 9 { row[9].trim() } else { "" };
         let category_id = if !category_name.is_empty() {
@@ -3024,13 +3041,30 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
         
         // 商品写入成功后回填的目标商品 ID（用于后续价格列写入）
         let mut target_pid: Option<i64> = None;
-        
+
         // 第一列为商品 ID：ID 存在则更新对应商品；无 ID 或 ID 不存在则追加
+        // ID 解析容错：剔除零宽字符；兼容 "86.0" 式浮点文本；空串=无ID
+        let parse_pid = |s: &str| -> Option<i64> {
+            let cleaned: String = s.chars()
+                .filter(|c| !matches!(*c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'))
+                .collect::<String>().trim().to_string();
+            if cleaned.is_empty() { return None; }
+            if let Ok(v) = cleaned.parse::<i64>() { return if v > 0 { Some(v) } else { None }; }
+            if let Ok(f) = cleaned.parse::<f64>() {
+                if f.fract() == 0.0 && f > 0.0 && f <= i64::MAX as f64 { return Some(f as i64); }
+            }
+            None
+        };
         let id_str = row[0].trim();
-        if !id_str.is_empty() {
-            if let Ok(pid) = id_str.parse::<i64>() {
-                if pid > 0 {
-                    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product WHERE id = ?")
+        let parsed_id = parse_pid(id_str);
+        if !id_str.is_empty() && parsed_id.is_none() {
+            // 填了 ID 但无法识别为数字：明确报失败，避免静默落成"无ID新增"
+            failed += 1;
+            failures.push(format!("{} [{}]：ID列「{}」无法识别为有效数字ID（请填写纯数字ID，或留空由系统分配）", row_no, name_disp, id_str));
+            continue;
+        }
+        if let Some(pid) = parsed_id {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product WHERE id = ?")
                         .bind(pid)
                         .fetch_one(crate::db::pool())
                         .await
@@ -3054,19 +3088,32 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
                         .await;
                         match upd {
                             Ok(r) if r.rows_affected() > 0 => { updated += 1; target_pid = Some(pid); }
-                            Ok(_) => { failed += 1; }
-                            Err(_) => { failed += 1; }
+                            Ok(_) => { failed += 1; failures.push(format!("{} [{}]：更新失败（0 行受影响）", row_no, name_disp)); }
+                            Err(e) => {
+                                failed += 1;
+                                let es = e.to_string();
+                                if es.contains("UNIQUE constraint failed") {
+                                    // 名称+规格唯一约束冲突：定位占用该键的已有商品，便于合并/改名
+                                    let cpid: Option<i64> = sqlx::query("SELECT id FROM product WHERE name = ? AND spec = ? LIMIT 1")
+                                        .bind(name).bind(spec)
+                                        .fetch_optional(crate::db::pool()).await.ok().flatten().map(|r| r.get::<i64, _>("id"));
+                                    match cpid {
+                                        Some(c) => failures.push(format!("{} [{}]：更新失败，名称+规格与已有商品 ID {} 冲突（同名同规格唯一），请合并档案或修改名称/规格区分", row_no, name_disp, c)),
+                                        None => failures.push(format!("{} [{}]：更新失败，名称+规格与已有商品冲突（同名同规格唯一）", row_no, name_disp)),
+                                    }
+                                } else {
+                                    failures.push(format!("{} [{}]：更新失败：{}", row_no, name_disp, e));
+                                }
+                            }
                         }
                     }
                     // exists == 0：该 ID 不存在 → 落到下方追加
-                }
-            }
         }
-        
+
         if target_pid.is_none() {
             // 无 ID 或 ID 不存在：追加（按 name+spec 唯一约束去重）
             // 文件带有效 ID 且库中不存在时，显式使用该 ID 创建，保持 ID 一致
-            let imported_pid: Option<i64> = id_str.parse::<i64>().ok().filter(|&v| v > 0);
+            let imported_pid: Option<i64> = parsed_id;
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO product(id, name, alias1, alias2, spec, unit, base_unit, base_price, purchase_price, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
@@ -3090,10 +3137,19 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
                         target_pid = Some(res.last_insert_rowid());
                     } else {
                         failed += 1;
+                        // INSERT OR IGNORE 被忽略：名称+规格唯一约束冲突
+                        // ID 为唯一辨识：如需更新已有商品，请在 ID 列填写其商品ID；如为新商品，请修改名称/规格区分
+                        failures.push(format!("{} [{}]：未提供有效ID，且同名同规格商品已存在（请在ID列填写已有商品ID进行更新，或修改名称/规格区分）", row_no, name_disp));
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     failed += 1;
+                    let es = e.to_string();
+                    if es.contains("UNIQUE constraint failed") {
+                        failures.push(format!("{} [{}]：新增失败，名称+规格与已有商品冲突（同名同规格唯一），如需更新请填写该商品ID", row_no, name_disp));
+                    } else {
+                        failures.push(format!("{} [{}]：新增失败：{}", row_no, name_disp, e));
+                    }
                 }
             }
         }
@@ -3147,7 +3203,15 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
         }
     }
     
-    (StatusCode::OK, format!("导入完成：新增 {} 条，更新 {} 条，失败 {} 条", success, updated, failed)).into_response()
+    // 汇总结果 + 失败明细（明细最多展示 50 条，避免弹窗过长）
+    let summary = format!("导入完成：新增 {} 条，更新 {} 条，失败 {} 条", success, updated, failed);
+    if failures.is_empty() {
+        (StatusCode::OK, summary).into_response()
+    } else {
+        let detail: String = failures.iter().take(50).cloned().collect::<Vec<_>>().join("\n");
+        let more = if failures.len() > 50 { format!("\n……其余 {} 条失败明细已省略", failures.len() - 50) } else { String::new() };
+        (StatusCode::OK, format!("{}\n失败明细：\n{}{}", summary, detail, more)).into_response()
+    }
 }
 
 pub async fn api_product_unit_create(Json(req): Json<ProductUnitReq>) -> impl IntoResponse {
@@ -3345,12 +3409,10 @@ pub async fn api_product_price_delete_by_product(Json(req): Json<std::collection
     StatusCode::OK.into_response()
 }
 
-pub async fn api_product_sync_base_price(Json(req): Json<std::collections::HashMap<String, i64>>) -> impl IntoResponse {
-    let product_id = match req.get("product_id") {
-        Some(&id) => id,
-        None => return StatusCode::BAD_REQUEST,
-    };
-
+/// 按价格策略快照（product_price）同步商品基础单价：
+/// 政采价优先，否则商超1/2/3/AI 非零平均；应用尾数规则后写回 product.base_price。
+/// 价格策略导入/编辑后调用，保证商品列表售价与编辑页计算售价一致。
+pub(crate) async fn sync_product_base_price(product_id: i64) {
     let gov_row = sqlx::query("SELECT price FROM product_price WHERE product_id = ? AND price_type = 'gov_procurement'")
         .bind(product_id)
         .fetch_optional(crate::db::pool())
@@ -3359,35 +3421,20 @@ pub async fn api_product_sync_base_price(Json(req): Json<std::collections::HashM
         .flatten();
     let gov_price: Option<f64> = gov_row.map(|r| r.get("price"));
 
-    let selling_price: f64 = if let Some(gp) = gov_price {
-        if gp > 0.0 {
-            gp
-        } else {
-            // 商超1/2/3/AI 非零价的平均值（与前端 calcSellingPrice 保持一致）
-            let avg_row = sqlx::query("SELECT COALESCE(AVG(price), 0.0) as avg_price FROM product_price WHERE product_id = ? AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0")
-                .bind(product_id)
-                .fetch_optional(crate::db::pool())
-                .await
-                .ok()
-                .flatten();
-            if let Some(row) = avg_row {
-                row.get::<f64, _>("avg_price")
-            } else {
-                0.0
-            }
-        }
-    } else {
-        let avg_row = sqlx::query("SELECT COALESCE(AVG(price), 0.0) as avg_price FROM product_price WHERE product_id = ? AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0")
+    let avg_row = || async {
+        sqlx::query("SELECT COALESCE(AVG(price), 0.0) as avg_price FROM product_price WHERE product_id = ? AND price_type IN ('supermarket_1','supermarket_2','supermarket_3','ai_realtime') AND price > 0")
             .bind(product_id)
             .fetch_optional(crate::db::pool())
             .await
             .ok()
-            .flatten();
-        if let Some(row) = avg_row {
-            row.get::<f64, _>("avg_price")
-        } else {
-            0.0
-        }
+            .flatten()
+            .map(|r| r.get::<f64, _>("avg_price"))
+            .unwrap_or(0.0)
+    };
+
+    let selling_price: f64 = match gov_price {
+        Some(gp) if gp > 0.0 => gp,
+        _ => avg_row().await,
     };
 
     if selling_price > 0.0 {
@@ -3427,7 +3474,14 @@ pub async fn api_product_sync_base_price(Json(req): Json<std::collections::HashM
         // 若开启自动更新售价，则按加成率重算 base_price
         recalc_base_price_by_markup(product_id, "sync_base_price", None).await;
     }
+}
 
+pub async fn api_product_sync_base_price(Json(req): Json<std::collections::HashMap<String, i64>>) -> impl IntoResponse {
+    let product_id = match req.get("product_id") {
+        Some(&id) => id,
+        None => return StatusCode::BAD_REQUEST,
+    };
+    sync_product_base_price(product_id).await;
     StatusCode::OK
 }
 
@@ -4920,9 +4974,11 @@ pub async fn api_purchase_order_print_excel(
             ws.set_row_height(cur_row, 20)?;
             cur_row += 1;
             for it in group_items {
-                let name_spec = if let Some(spec) = it.spec.clone() {
-                    if spec.trim().is_empty() { it.product_name.clone() } else { format!("{} {}", it.product_name, spec) }
-                } else { it.product_name.clone() };
+                // 导出名称优先级：规格 -> 名称（独立取值不拼接，规格为空时才用名称）
+                let name_spec = match it.spec.as_deref().map(str::trim) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => it.product_name.clone(),
+                };
                 ws.write_with_format(cur_row, 0, name_spec, &cell_left)?;
                 ws.write_with_format(cur_row, 1, it.unit.clone().unwrap_or_default(), &cell_center)?;
                 ws.write_with_format(cur_row, 2, it.quantity, &cell_right)?;
@@ -10643,9 +10699,9 @@ pub async fn api_sales_order_sort_items_excel(axum::extract::Query(params): axum
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no
-         FROM sales_order_item soi 
+         FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          {}
@@ -10657,16 +10713,22 @@ pub async fn api_sales_order_sort_items_excel(axum::extract::Query(params): axum
     let rows = q.fetch_all(crate::db::pool())
     .await
     .unwrap_or_default();
-    
+
     let mut items_map: std::collections::HashMap<i64, serde_json::Value> = std::collections::HashMap::new();
-    
+
     for r in &rows {
         let product_id = r.get::<i64, _>("product_id");
+        // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
+        let display_name = {
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let spec = spec.trim().to_string();
+            if spec.is_empty() { r.get::<String, _>("product_name") } else { spec }
+        };
         let existing = items_map.entry(product_id).or_insert_with(|| {
             serde_json::json!({
                 "id": r.get::<i64, _>("id"),
                 "product_id": product_id,
-                "product_name": r.get::<String, _>("product_name"),
+                "product_name": display_name,
                 "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
                 "unit_price": r.get::<f64, _>("unit_price"),
                 "total_quantity": 0.0,
@@ -10910,9 +10972,9 @@ pub async fn api_sales_order_sort_items_by_category_excel(
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
+        "SELECT soi.product_id, soi.product_name, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
                 p.name as purchaser_name, so.order_no, c.name as category_name
-         FROM sales_order_item soi 
+         FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
@@ -10933,12 +10995,19 @@ pub async fn api_sales_order_sort_items_by_category_excel(
         let category_name = sanitize_xlsx_string(r.get::<Option<String>, _>("category_name").unwrap_or_else(|| "未分类".to_string()));
         let purchaser_name = sanitize_xlsx_string(r.get::<String, _>("purchaser_name"));
 
+        // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
+        let display_name = {
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let spec = spec.trim().to_string();
+            if spec.is_empty() { r.get::<String, _>("product_name") } else { spec }
+        };
+
         let purchaser_map = category_map.entry(category_name).or_insert_with(std::collections::HashMap::new);
         let purchaser_items = purchaser_map.entry(purchaser_name).or_insert_with(Vec::new);
 
         purchaser_items.push(serde_json::json!({
             "product_id": r.get::<i64, _>("product_id"),
-            "product_name": sanitize_xlsx_string(r.get::<String, _>("product_name")),
+            "product_name": sanitize_xlsx_string(display_name),
             "unit": sanitize_xlsx_string(r.get::<Option<String>, _>("unit").unwrap_or_default()),
             "quantity": r.get::<f64, _>("quantity"),
             "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
@@ -11256,7 +11325,7 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
+        "SELECT soi.product_id, soi.product_name, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
                 soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, so.order_no,
                 COALESCE(pr.purchase_price, 0.0) as purchase_price
          FROM sales_order_item soi
@@ -11270,9 +11339,9 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
     let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
     if has_date { q = q.bind(&date); }
     let rows = q.fetch_all(crate::db::pool()).await.unwrap_or_default();
-    
+
     let mut supplier_map: std::collections::HashMap<String, std::collections::HashMap<String, Vec<serde_json::Value>>> = std::collections::HashMap::new();
-    
+
     for r in &rows {
         let supplier_name = sanitize_xlsx_string(r.get::<Option<String>, _>("supplier_name").unwrap_or_else(|| {
             let supplier_id = r.get::<i64, _>("supplier_id");
@@ -11280,12 +11349,19 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
         }));
         let purchaser_name = sanitize_xlsx_string(r.get::<String, _>("purchaser_name"));
 
+        // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
+        let display_name = {
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let spec = spec.trim().to_string();
+            if spec.is_empty() { r.get::<String, _>("product_name") } else { spec }
+        };
+
         let purchaser_map = supplier_map.entry(supplier_name).or_insert_with(std::collections::HashMap::new);
         let purchaser_items = purchaser_map.entry(purchaser_name).or_insert_with(Vec::new);
 
         purchaser_items.push(serde_json::json!({
             "product_id": r.get::<i64, _>("product_id"),
-            "product_name": sanitize_xlsx_string(r.get::<String, _>("product_name")),
+            "product_name": sanitize_xlsx_string(display_name),
             "unit": sanitize_xlsx_string(r.get::<Option<String>, _>("unit").unwrap_or_default()),
             "quantity": r.get::<f64, _>("quantity"),
             "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity").unwrap_or(0.0),
@@ -11873,12 +11949,13 @@ pub async fn api_product_today_price_excel(
                 let mut grand_total_qty = 0.0;
                 let mut seq = 1i64;
                 for item in &items {
+                    // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
                     let product_name = item["product_name"].as_str().unwrap_or("");
-                    let spec = item["spec"].as_str().unwrap_or("");
+                    let spec = item["spec"].as_str().unwrap_or("").trim();
                     let name_with_spec = if spec.is_empty() {
                         product_name.to_string()
                     } else {
-                        format!("{} {}", product_name, spec)
+                        spec.to_string()
                     };
                     let base_unit = item["base_unit"].as_str().unwrap_or("");
                     let total_qty = item["total_qty"].as_f64().unwrap_or(0.0);
@@ -12077,8 +12154,9 @@ pub async fn api_product_today_price_a4(
         for (_sid, sname, items) in &supplier_list {
             for it in items {
                 let name = it["product_name"].as_str().unwrap_or("");
-                let spec = it["spec"].as_str().unwrap_or("");
-                let name_spec = if spec.is_empty() { name.to_string() } else { format!("{} {}", name, spec) };
+                // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
+                let spec = it["spec"].as_str().unwrap_or("").trim();
+                let name_spec = if spec.is_empty() { name.to_string() } else { spec.to_string() };
                 let price = if print_values {
                     let raw = it["purchase_price"].as_f64().unwrap_or(0.0);
                     Some((raw * 100.0).round() / 100.0)
@@ -12393,12 +12471,13 @@ pub async fn api_product_today_price_excel_by_category(
                 last_sort_key = sort_key;
             }
 
+            // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
             let product_name = item["product_name"].as_str().unwrap_or("");
-            let spec = item["spec"].as_str().unwrap_or("");
+            let spec = item["spec"].as_str().unwrap_or("").trim();
             let name_with_spec = if spec.is_empty() {
                 product_name.to_string()
             } else {
-                format!("{} {}", product_name, spec)
+                spec.to_string()
             };
             let base_unit = item["base_unit"].as_str().unwrap_or("");
             let total_qty = item["total_qty"].as_f64().unwrap_or(0.0);
@@ -12527,7 +12606,7 @@ pub async fn api_sales_order_sort_items_by_purchaser_excel(
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.spec, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
                 pc.name as category_name, pc.parent_id, pc2.name as parent_name
          FROM sales_order_item soi
@@ -12590,12 +12669,19 @@ pub async fn api_sales_order_sort_items_by_purchaser_excel(
         let sort_key = get_category_sort_key(&category_name, &parent_name);
         
         let (max_price, min_price, latest_price) = price_map.get(&product_id).copied().unwrap_or((0.0, 0.0, 0.0));
-        
+
+        // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
+        let display_name = {
+            let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+            let spec = spec.trim().to_string();
+            if spec.is_empty() { r.get::<String, _>("product_name") } else { spec }
+        };
+
         let items = purchaser["items"].as_array_mut().unwrap();
         items.push(serde_json::json!({
             "id": r.get::<i64, _>("id"),
             "product_id": product_id,
-            "product_name": r.get::<String, _>("product_name"),
+            "product_name": display_name,
             "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
             "unit_price": r.get::<f64, _>("unit_price"),
             "quantity": r.get::<f64, _>("quantity"),
@@ -12882,10 +12968,10 @@ pub async fn api_sales_order_sort_comprehensive_excel(
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.id, soi.product_id, soi.product_name, soi.unit, soi.quantity, soi.remark,
+        "SELECT soi.id, soi.product_id, soi.product_name, soi.spec, soi.unit, soi.quantity, soi.remark,
                 p.id as purchaser_id, p.name as purchaser_name, so.order_no,
                 c.name as category_name
-         FROM sales_order_item soi 
+         FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id
          LEFT JOIN purchaser p ON so.purchaser_id = p.id
          LEFT JOIN product pr ON soi.product_id = pr.id
@@ -12967,10 +13053,16 @@ pub async fn api_sales_order_sort_comprehensive_excel(
             }
         } else {
             let remark = r.get::<Option<String>, _>("remark").unwrap_or_default();
+            // 导出名称与采购单规则对齐：规格 -> 名称（独立取值不拼接）
+            let display_name = {
+                let spec = r.get::<Option<String>, _>("spec").unwrap_or_default();
+                let spec = spec.trim().to_string();
+                if spec.is_empty() { r.get::<String, _>("product_name") } else { spec }
+            };
             category_items.push(serde_json::json!({
                 "id": r.get::<i64, _>("id"),
                 "product_id": r.get::<i64, _>("product_id"),
-                "product_name": r.get::<String, _>("product_name"),
+                "product_name": display_name,
                 "unit": r.get::<Option<String>, _>("unit").unwrap_or_default(),
                 "quantity": r.get::<f64, _>("quantity"),
                 "order_nos": vec![r.get::<Option<String>, _>("order_no").unwrap_or_default()],
@@ -12978,7 +13070,7 @@ pub async fn api_sales_order_sort_comprehensive_excel(
             }));
         }
     }
-    
+
     let mut result: Vec<PurchaserData> = purchaser_map.into_values().collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
     for p in &mut result {
@@ -14063,6 +14155,12 @@ pub async fn api_price_schedule_batch_import(
         .await;
     }
 
+    // 同步受影响商品的基础单价（售价），保证商品列表售价 = 编辑页计算售价（政采价优先）
+    let affected_pids: std::collections::HashSet<i64> = affected_keys.iter().map(|(pid, _)| *pid).collect();
+    for pid in &affected_pids {
+        sync_product_base_price(*pid).await;
+    }
+
     let ctx = crate::auth::get_user_ctx(&headers).await;
     let detail = format!(
         "批量导入价格策略：inserted={}, skipped={}, errors={}",
@@ -14681,9 +14779,10 @@ pub async fn api_price_schedule_batch_import_excel(
     };
 
     // 期望表头：商品名称*、规格、别名1、别名2、单位、价格类型*、生效日期*、价格*、备注
-    // 从 row 0 找列位置（兼容 "商品名称*" / "商品名称" 等）
-    let header_row = range.rows().next();
-    let col_idx_of = |row: &[calamine::Data], name: &str| -> Option<usize> {
+    // 模板顶部有说明行（标题/说明在前几行，表头位于第 4 行），故在前 10 行内动态定位表头行，
+    // 兼容直接使用下载模板导入（此前只读第 1 行导致报"缺少「商品名称」列"）
+    let rows: Vec<Vec<calamine::Data>> = range.rows().map(|r| r.to_vec()).collect();
+    let find_col_exact = |row: &[calamine::Data], name: &str| -> Option<usize> {
         for (i, cell) in row.iter().enumerate() {
             let s = cell_to_string(cell);
             if s.replace('*', "").trim() == name {
@@ -14692,36 +14791,49 @@ pub async fn api_price_schedule_batch_import_excel(
         }
         None
     };
-    let header = match header_row {
-        Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"Excel 为空\"}".to_string()).into_response(),
+    let find_col_prefix = |row: &[calamine::Data], name: &str| -> Option<usize> {
+        for (i, cell) in row.iter().enumerate() {
+            let s = cell_to_string(cell);
+            if s.replace('*', "").trim().starts_with(name) {
+                return Some(i);
+            }
+        }
+        None
     };
-    let idx_name = match col_idx_of(header, "商品名称") {
+    let (header_idx, header) = match rows.iter().enumerate().take(10).find(|(_, r)| find_col_exact(r, "商品名称").is_some()) {
+        Some((i, r)) => (i, r),
+        None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「商品名称」列\"}".to_string()).into_response(),
+    };
+    // 先精确匹配，再前缀匹配（兼容"生效日期*(YYYY-MM-DD)"等带后缀表头）
+    let col_idx_of = |name: &str| -> Option<usize> {
+        find_col_exact(header, name).or_else(|| find_col_prefix(header, name))
+    };
+    let idx_name = match col_idx_of("商品名称") {
         Some(i) => i,
         None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「商品名称」列\"}".to_string()).into_response(),
     };
-    let idx_spec = col_idx_of(header, "规格");
-    let idx_alias1 = col_idx_of(header, "别名1");
-    let idx_alias2 = col_idx_of(header, "别名2");
-    let idx_unit = col_idx_of(header, "单位");
-    let idx_pt = match col_idx_of(header, "价格类型") {
+    let idx_spec = col_idx_of("规格");
+    let idx_alias1 = col_idx_of("别名1");
+    let idx_alias2 = col_idx_of("别名2");
+    let idx_unit = col_idx_of("单位");
+    let idx_pt = match col_idx_of("价格类型") {
         Some(i) => i,
         None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「价格类型」列\"}".to_string()).into_response(),
     };
-    let idx_eff = match col_idx_of(header, "生效日期") {
+    let idx_eff = match col_idx_of("生效日期") {
         Some(i) => i,
         None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「生效日期」列\"}".to_string()).into_response(),
     };
-    let idx_price = match col_idx_of(header, "价格") {
+    let idx_price = match col_idx_of("价格") {
         Some(i) => i,
         None => return (StatusCode::BAD_REQUEST, "{\"success\":false, \"message\":\"缺少「价格」列\"}".to_string()).into_response(),
     };
-    let idx_remark = col_idx_of(header, "备注");
+    let idx_remark = col_idx_of("备注");
 
-    // 解析行
+    // 解析行：从表头行的下一行开始（表头可能位于第 4 行而非第 1 行）
     let mut items: Vec<PriceScheduleReq> = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
-    for (row_idx, row) in range.rows().enumerate().skip(1) {
+    for (row_idx, row) in rows.iter().enumerate().skip(header_idx + 1) {
         // 跳过全空行
         if row.iter().all(|c| cell_to_string(c).trim().is_empty()) {
             continue;
@@ -14909,6 +15021,12 @@ pub async fn api_price_schedule_batch_import_excel(
         .execute(crate::db::pool()).await;
     }
 
+    // 同步受影响商品的基础单价（售价），保证商品列表售价 = 编辑页计算售价（政采价优先）
+    let affected_pids: std::collections::HashSet<i64> = affected_keys.iter().map(|(pid, _)| *pid).collect();
+    for pid in &affected_pids {
+        sync_product_base_price(*pid).await;
+    }
+
     let ctx = crate::auth::get_user_ctx(&headers).await;
     let detail = format!("Excel 批量导入价格策略：inserted={}, skipped={}, errors={}", inserted, skipped, errors.len());
     crate::auth::log_operation(&ctx, "Excel批量导入价格策略", "price_schedule", "0", &detail).await;
@@ -14940,7 +15058,17 @@ fn cell_to_string(cell: &calamine::Data) -> String {
         }
         calamine::Data::Int(i) => i.to_string(),
         calamine::Data::Bool(b) => b.to_string(),
-        calamine::Data::DateTime(dt) => dt.to_string(),
+        calamine::Data::DateTime(dt) => {
+            // Excel 日期单元格（WPS/Excel 会把 2026-9-1 自动转成真日期）：按序列号转 YYYY-MM-DD，忽略时间部分
+            let f = dt.as_f64();
+            let serial = f.floor() as i64;
+            if (30000..80000).contains(&serial) {
+                if let Some(d) = excel_serial_to_date(serial) {
+                    return d;
+                }
+            }
+            dt.to_string()
+        }
         calamine::Data::DateTimeIso(s) => s.clone(),
         calamine::Data::DurationIso(s) => s.clone(),
         calamine::Data::Error(e) => format!("{:?}", e),
