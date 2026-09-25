@@ -2111,7 +2111,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:110px">仓库</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
+                        <tr><th style="min-width:120px">商品名称</th><th style="min-width:170px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:110px">仓库</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -2171,6 +2171,28 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
         </table>
 
         <div id="pagination" class="mt-3"></div>
+
+        <style>
+            #itemsTable tr.row-focus > td {{ background-color: #b8d4fb !important; }}
+        </style>
+        <script>
+            // 行焦点高亮：明细行任意列获得焦点时整行高亮
+            (function() {{
+                var t = document.getElementById('itemsTable');
+                if (!t) return;
+                t.addEventListener('focusin', function(e) {{
+                    var tr = e.target.closest ? e.target.closest('tr') : null;
+                    if (!tr) return;
+                    var rows = t.querySelectorAll('tr.row-focus');
+                    for (var i = 0; i < rows.length; i++) rows[i].classList.remove('row-focus');
+                    tr.classList.add('row-focus');
+                }});
+                t.addEventListener('focusout', function(e) {{
+                    var tr = e.target.closest ? e.target.closest('tr') : null;
+                    if (tr) tr.classList.remove('row-focus');
+                }});
+            }})();
+        </script>
 
         <script>
             let suppliers = [];
@@ -2610,11 +2632,12 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                            onkeydown="handleProductNameKeydown(event, ${{index}}, this)"
                                            class="form-control-sm product-search-input" 
                                            placeholder="输入商品名称搜索"
+                                           style="width:100%"
                                            enterkeyhint="next">
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm"></td>
+                            <td style="min-width:170px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm" style="width:100%"></td>
                             <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
@@ -3314,7 +3337,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th style="min-width:180px">商品名称</th><th style="width:55px">规格</th><th style="width:75px">单位</th><th style="width:85px">预售数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">供应商</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
+                        <tr><th style="min-width:120px">商品名称</th><th style="min-width:170px">规格</th><th style="width:75px">单位</th><th style="width:85px">预售数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:120px">供应商</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -3422,6 +3445,28 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
         </table>
 
         <div id="pagination" class="mt-3"></div>
+
+        <style>
+            #itemsTable tr.row-focus > td {{ background-color: #b8d4fb !important; }}
+        </style>
+        <script>
+            // 行焦点高亮：明细行任意列获得焦点时整行高亮
+            (function() {{
+                var t = document.getElementById('itemsTable');
+                if (!t) return;
+                t.addEventListener('focusin', function(e) {{
+                    var tr = e.target.closest ? e.target.closest('tr') : null;
+                    if (!tr) return;
+                    var rows = t.querySelectorAll('tr.row-focus');
+                    for (var i = 0; i < rows.length; i++) rows[i].classList.remove('row-focus');
+                    tr.classList.add('row-focus');
+                }});
+                t.addEventListener('focusout', function(e) {{
+                    var tr = e.target.closest ? e.target.closest('tr') : null;
+                    if (tr) tr.classList.remove('row-focus');
+                }});
+            }})();
+        </script>
 
         <script>
             let purchasers = [];
@@ -3711,11 +3756,12 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                            onkeydown="handleProductNameKeydown(event, ${{index}}, this)"
                                            class="form-control-sm product-search-input" 
                                            placeholder="输入商品名称搜索"
+                                           style="width:100%"
                                            enterkeyhint="next">
                                     <div id="searchDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
-                            <td style="width:55px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm"></td>
+                            <td style="min-width:170px"><input type="text" value="${{item.spec}}" onchange="updateSpec(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'spec')" class="form-control-sm" style="width:100%"></td>
                             <td style="width:75px">
                                 <select onchange="updateUnit(${{index}}, this)" class="form-control-sm">
                                     ${{unitOptions}}
@@ -4996,7 +5042,7 @@ pub async fn page_query_purchase_order(headers: axum::http::HeaderMap) -> Html<S
                             </div>
                         </div>
                         <table class="table table-striped table-bordered">
-                            <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>订购数量</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
+                            <thead><tr><th style="min-width:120px">商品名称</th><th style="min-width:170px">规格</th><th>单位</th><th>订购数量</th><th>数量</th><th>单价</th><th>金额</th></tr></thead>
                             <tbody id="modalItems"></tbody>
                         </table>
                     </div>
