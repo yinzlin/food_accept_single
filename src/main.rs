@@ -2391,7 +2391,7 @@ fn main() {
         rt.block_on(async {
             init_pool().await;
             let app = build_router();
-            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 3000));
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 80));
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             axum::serve(listener, app).await.unwrap();
         });
