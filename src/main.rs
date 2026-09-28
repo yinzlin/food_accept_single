@@ -2213,6 +2213,7 @@ fn build_router() -> Router {
         .route("/api/product/export", get(api_product_export))
         .route("/api/product/import", post(api_product_import))
         .route("/api/product/upload_image", post(api_product_upload_image))
+        .route("/api/product/image/url", post(api_product_image_from_url))
         .route("/api/product/delete_image", get(api_product_delete_image))
         .route("/api/product/image/{filename}", get(api_product_get_image))
         .route("/api/uploads/{folder}/{filename}", get(api_get_uploaded_image))

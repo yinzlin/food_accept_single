@@ -1474,6 +1474,6 @@ pub fn make_app_icon() -> Icon {
 
 pub fn open_browser() {
     let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", "http://127.0.0.1:3000"])
+        .args(["/C", "start", "", "http://127.0.0.1/"])
         .spawn();
 }

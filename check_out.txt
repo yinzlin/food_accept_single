@@ -1,0 +1,18 @@
+﻿[1m[92m    Updating[0m crates.io index
+[1m[93mwarning[0m: spurious network error (3 tries remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+[1m[93mwarning[0m: spurious network error (2 tries remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+[1m[93mwarning[0m: spurious network error (1 try remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+[1m[91merror[0m: failed to get `web-sys` as a dependency of package `reqwest v0.12.28`
+    ... which satisfies dependency `reqwest = "^0.12"` of package `food_accept_single v3.6.0 (D:\projects\food_accept_single)`
+System.Management.Automation.RemoteException
+Caused by:
+  failed to load source for dependency `web-sys`
+System.Management.Automation.RemoteException
+Caused by:
+  unable to update registry `crates-io`
+System.Management.Automation.RemoteException
+Caused by:
+  download of we/b-/web-sys failed
+System.Management.Automation.RemoteException
+Caused by:
+  transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)

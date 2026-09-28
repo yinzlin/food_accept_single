@@ -878,6 +878,10 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                     <button type="button" class="btn btn-sm btn-outline-primary" onclick="document.getElementById('productImageInput').click()">📷 上传图片</button>
                                     <span class="text-muted small ml-2">支持 JPG、PNG、GIF、WebP 格式，最大5MB</span>
                                 </div>
+                                <div class="mt-2 d-flex" style="gap:8px;">
+                                    <input type="text" id="productImageUrlInput" class="form-control form-control-sm" placeholder="粘贴网络图片URL（http/https），自动下载转存到本系统" style="max-width:420px;">
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="applyProductImageUrl()">🌐 应用URL图片</button>
+                                </div>
                             </div>
                         </div>
 
@@ -1500,6 +1504,35 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     alert('上传失败: ' + e.message);
                 }}
                 input.value = '';
+            }}
+
+            // 应用网络图片URL：服务端下载转存到本地后回填
+            async function applyProductImageUrl() {{
+                const input = document.getElementById('productImageUrlInput');
+                const url = (input.value || '').trim();
+                if (!url) {{ alert('请先粘贴图片URL'); return; }}
+                try {{
+                    const res = await fetch('/api/product/image/url', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ product_id: editingProductId, url: url }})
+                    }});
+                    const j = await res.json();
+                    if (res.ok && j.url) {{
+                        const imagePlaceholder = document.getElementById('imagePlaceholder');
+                        const imageActions = document.getElementById('imageActions');
+                        imagePlaceholder.innerHTML = '<img src="' + j.url + '" class="product-thumb" data-viewer-url="' + j.url + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;cursor:pointer;" alt="商品图片">';
+                        imagePlaceholder.style.border = 'none';
+                        imageActions.style.display = 'block';
+                        const p = allProducts.find(x => x.id === editingProductId);
+                        if (p) {{ p.image_url = j.url; }}
+                        input.value = '';
+                    }} else {{
+                        alert('应用失败: ' + (j.error || '未知错误'));
+                    }}
+                }} catch(e) {{
+                    alert('应用失败: ' + e.message);
+                }}
             }}
 
             async function deleteProductImage() {{

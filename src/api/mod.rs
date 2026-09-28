@@ -2389,6 +2389,157 @@ pub async fn api_product_delete_image(
     (StatusCode::OK, "删除成功".to_string())
 }
 
+/// 下载网络图片并转存到本地 uploads/products/，返回本地访问 URL
+/// 文件命名与手动上传一致：{商品名前缀}_{时间戳}_{随机数}.{扩展名}
+/// 使用 Windows 自带 curl.exe 下载，避免引入额外 HTTP 依赖
+pub(crate) async fn save_remote_image_to_local(url: &str, name_prefix: &str) -> Result<String, String> {
+    let url_trim = url.trim();
+    if url_trim.is_empty() {
+        return Err("图片URL为空".to_string());
+    }
+    if !url_trim.starts_with("http://") && !url_trim.starts_with("https://") {
+        return Err("URL必须以 http:// 或 https:// 开头".to_string());
+    }
+
+    tokio::fs::create_dir_all("uploads/products")
+        .await
+        .map_err(|e| format!("创建图片目录失败: {}", e))?;
+
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let random: u32 = rand::random();
+    let tmp_path = format!("uploads/products/_tmp_{}_{}.bin", timestamp, random);
+
+    let output = tokio::process::Command::new("curl.exe")
+        .args([
+            "-L",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "20",
+            "--max-filesize",
+            "5242880",
+            // 伪 UA：部分图站对非浏览器 UA 返回 403
+            "-A",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "-o",
+            &tmp_path,
+            "-w",
+            "%{content_type}",
+            url_trim,
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("调用 curl.exe 失败（系统缺少 curl）: {}", e))?;
+
+    let content_type = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let reason = if stderr.is_empty() {
+            format!("curl 退出码 {:?}", output.status.code())
+        } else {
+            stderr
+        };
+        return Err(format!("下载图片失败: {}", reason));
+    }
+
+    let meta = tokio::fs::metadata(&tmp_path)
+        .await
+        .map_err(|e| format!("读取下载文件失败: {}", e))?;
+    if meta.len() == 0 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err("下载的图片内容为空".to_string());
+    }
+    if meta.len() > 5 * 1024 * 1024 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err("图片大小不能超过5MB".to_string());
+    }
+
+    let ext: String = if content_type.contains("png") {
+        "png".to_string()
+    } else if content_type.contains("gif") {
+        "gif".to_string()
+    } else if content_type.contains("webp") {
+        "webp".to_string()
+    } else if content_type.contains("jpeg") || content_type.contains("jpg") {
+        "jpg".to_string()
+    } else {
+        // Content-Type 不可用时回退：从 URL 路径取扩展名
+        let path_part = url_trim.split(['?', '#']).next().unwrap_or("");
+        let from_url = path_part
+            .rsplit('.')
+            .next()
+            .map(|e| e.to_lowercase())
+            .filter(|e| ["jpg", "jpeg", "png", "gif", "webp"].contains(&e.as_str()));
+        match from_url {
+            Some(e) => e,
+            None => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(format!("无法识别图片类型 (Content-Type: {})", content_type));
+            }
+        }
+    };
+
+    let filename = format!("{}_{}.{}.{}", name_prefix, timestamp, random, ext);
+    let final_path = format!("uploads/products/{}", filename);
+    tokio::fs::rename(&tmp_path, &final_path)
+        .await
+        .map_err(|e| format!("保存图片失败: {}", e))?;
+    Ok(format!("/api/uploads/products/{}", filename))
+}
+
+/// 通过网络图片 URL 设置商品图片：下载转存到本地后回填 image_url
+pub async fn api_product_image_from_url(
+    axum::Json(req): axum::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let product_id = req.get("product_id").and_then(|v| v.as_i64());
+    let url = req
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let Some(pid) = product_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "缺少 product_id" })),
+        );
+    };
+
+    // 商品名作为文件名前缀
+    let product_name: String = sqlx::query_scalar("SELECT name FROM product WHERE id = ?")
+        .bind(pid)
+        .fetch_optional(crate::db::pool())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "product".to_string());
+    let name_prefix = sanitize_filename_prefix(&product_name);
+
+    match save_remote_image_to_local(&url, &name_prefix).await {
+        Ok(local_url) => {
+            match sqlx::query("UPDATE product SET image_url = ? WHERE id = ?")
+                .bind(&local_url)
+                .bind(pid)
+                .execute(crate::db::pool())
+                .await
+            {
+                Ok(_) => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({ "url": local_url })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": format!("更新数据库失败: {}", e) })),
+                ),
+            }
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "error": e }))),
+    }
+}
+
 pub async fn api_sales_order_upload_image(
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -3154,6 +3305,26 @@ pub async fn api_product_import(content: Bytes) -> impl IntoResponse {
             }
         }
         
+        // 图片URL列（第16列，可选）：下载网络图片转存到本地并回填 image_url
+        // 转存失败不阻断该行商品写入，仅记入失败明细
+        if let Some(pid) = target_pid {
+            let img_url_raw = if row.len() > 15 { row[15].trim() } else { "" };
+            if !img_url_raw.is_empty() {
+                match save_remote_image_to_local(img_url_raw, &sanitize_filename_prefix(name)).await {
+                    Ok(local_url) => {
+                        let _ = sqlx::query("UPDATE product SET image_url = ? WHERE id = ?")
+                            .bind(&local_url)
+                            .bind(pid)
+                            .execute(crate::db::pool())
+                            .await;
+                    }
+                    Err(e) => {
+                        failures.push(format!("{} [{}]：图片转存失败：{}", row_no, name_disp, e));
+                    }
+                }
+            }
+        }
+
         // 价格列写入（仅当商品写入成功）：政采价/商超1/商超2/商超3/AI实时采集价
         // 写入 product_price_schedule（effective_date=今天，当天已有记录则覆盖）+ product_price 快照
         if let Some(pid) = target_pid {
