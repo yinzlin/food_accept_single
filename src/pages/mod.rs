@@ -5605,12 +5605,19 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
                 });
             }
             async function viewFlow(productId) {
-                const url = '/api/query/stock_flow?product_id=' + productId;
-                const res = await fetch(url);
-                const data = await res.json();
-                let detail = '库存流水:\n';
-                data.forEach(flow => {
-                    detail += flow.type + ' ' + flow.quantity.toFixed(2) + ' ' + flow.create_time + '\n';
+                let page = 1, flows = [], total = 0;
+                do {
+                    const url = '/api/query/stock_flow?product_id=' + productId + '&page=' + page + '&page_size=1000';
+                    const res = await fetch(url);
+                    const data = await res.json();
+                    total = data.total || 0;
+                    flows = flows.concat(data.items || []);
+                    page++;
+                } while (flows.length < total);
+                let detail = '库存流水(共' + flows.length + '条):\n';
+                flows.forEach(flow => {
+                    const qty = (flow.in_quantity || 0) > 0 ? '+' + flow.in_quantity.toFixed(2) : '-' + (flow.out_quantity || 0).toFixed(2);
+                    detail += flow.type + ' ' + qty + (flow.unit || '') + ' ' + flow.create_time + '\n';
                 });
                 await priceAlert(detail, '库存流水');
             }
@@ -8007,26 +8014,47 @@ pub async fn page_query_stock_flow() -> Html<String> {
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>日期</th><th>类型</th><th>商品名称</th><th>规格</th><th>入库数量</th><th>出库数量</th><th>余额</th><th>备注</th></tr></thead>
+                <thead><tr><th>日期</th><th>类型</th><th>商品名称</th><th>规格</th><th>单位</th><th>入库数量</th><th>出库数量</th><th>余额</th><th>备注</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
+            <div id="stockFlowPager" class="mt-2 text-muted"></div>
         </div>
         <script>
-            async function searchStockFlow() {
-                const url = '/api/query/stock_flow?product_name=' + encodeURIComponent(document.getElementById('productName').value) + 
-                    '&start_date=' + document.getElementById('startDate').value + 
-                    '&end_date=' + document.getElementById('endDate').value;
+            let stockFlowPage = 1, stockFlowPageSize = 200, stockFlowTotal = 0;
+            function sfEsc(s) {
+                return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            }
+            async function searchStockFlow(page) {
+                if (page === undefined) page = 1;
+                stockFlowPage = page;
+                const url = '/api/query/stock_flow?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
+                    '&start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value +
+                    '&page=' + stockFlowPage + '&page_size=' + stockFlowPageSize;
                 const res = await fetch(url);
                 const data = await res.json();
-                const tbody = document.getElementById('resultTable');
-                tbody.innerHTML = '';
-                let balance = 0;
-                data.forEach(item => {
-                    balance += (item.in_quantity || 0) - (item.out_quantity || 0);
-                    tbody.innerHTML += '<tr><td>' + item.create_time + '</td><td>' + item.type + '</td><td>' + item.product_name + '</td><td>' + (item.spec || '') + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + balance.toFixed(2) + '</td><td>' + (item.remark || '') + '</td></tr>';
+                stockFlowTotal = data.total || 0;
+                const rows = [];
+                (data.items || []).forEach(item => {
+                    // 原始下单单位与基础单位不一致时，在备注中标注原始数量，方便与订单对账
+                    let remark = sfEsc(item.remark);
+                    if (item.orig_unit && item.orig_unit !== item.unit) {
+                        remark = (remark ? remark + ' ' : '') + '（原 ' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit) + '）';
+                    }
+                    rows.push('<tr><td>' + sfEsc(item.create_time) + '</td><td>' + sfEsc(item.type) + '</td><td>' + sfEsc(item.product_name) + '</td><td>' + sfEsc(item.spec) + '</td><td>' + sfEsc(item.unit) + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + (item.balance || 0).toFixed(2) + '</td><td>' + remark + '</td></tr>');
                 });
+                // 一次性写入，避免逐行 innerHTML 拼接导致页面卡死
+                document.getElementById('resultTable').innerHTML = rows.join('');
+                renderStockFlowPager();
             }
-            searchStockFlow();
+            function renderStockFlowPager() {
+                const pages = Math.max(1, Math.ceil(stockFlowTotal / stockFlowPageSize));
+                let html = '共 ' + stockFlowTotal + ' 条，第 ' + stockFlowPage + ' / ' + pages + ' 页';
+                html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage <= 1 ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage - 1) + ')">上一页</button>';
+                html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage >= pages ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage + 1) + ')">下一页</button>';
+                document.getElementById('stockFlowPager').innerHTML = html;
+            }
+            searchStockFlow(1);
         </script>
     "#;
     Html(crate::layout_html("库存明细台账", "/query/stock_flow", &content))
