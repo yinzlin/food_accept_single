@@ -455,16 +455,78 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     .execute(pool)
     .await?;
 
-    sqlx::query("ALTER TABLE inventory ADD COLUMN IF NOT EXISTS warehouse_id INTEGER DEFAULT 1")
-        .execute(pool)
-        .await
-        .ok();
+    // SQLite 不支持 `ADD COLUMN IF NOT EXISTS` 语法，需要先检查列是否存在再 ALTER
+    let inv_has_wh: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('inventory') WHERE name='warehouse_id'"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if inv_has_wh == 0 {
+        let _ = sqlx::query("ALTER TABLE inventory ADD COLUMN warehouse_id INTEGER DEFAULT 1")
+            .execute(pool)
+            .await;
+        // 旧表迁移：把所有现存行的 warehouse_id 显式置为 1（ALTER 加列时默认值已生效，
+        // 但 SQLite 某些版本对已有行的默认值处理不一致，显式 UPDATE 保险）
+        let _ = sqlx::query("UPDATE inventory SET warehouse_id = 1 WHERE warehouse_id IS NULL")
+            .execute(pool)
+            .await;
+    }
+    // 为 (product_id, warehouse_id) 建唯一索引：审核流程中的 UPSERT
+    // `ON CONFLICT(product_id, warehouse_id) DO UPDATE` 需要唯一约束才能生效，
+    // 旧表 CREATE TABLE 里的 UNIQUE 约束只对新表生效，老库要靠这个索引补齐。
+    // 幂等：IF NOT EXISTS。若历史存在重复 (product_id, warehouse_id) 行会失败，
+    // 先做一次去重（保留 id 最小的一行）。
+    let _ = sqlx::query(
+        "DELETE FROM inventory WHERE id NOT IN (
+            SELECT MIN(id) FROM inventory GROUP BY product_id, warehouse_id
+        )"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_product_warehouse ON inventory(product_id, warehouse_id)"
+    ).execute(pool).await;
 
     sqlx::query(
         "INSERT OR IGNORE INTO warehouse (id, name, code, status) VALUES (1, '默认仓库', 'WH001', 1)"
     )
     .execute(pool)
     .await?;
+
+    // 库存流水表（Append-Only）：订单审核时写入一条流水，并同步更新 inventory.quantity
+    // 设计要点：
+    //   - 只增不改：反审核写冲销流水（direction 相反、base_quantity 取负），不删除原流水
+    //   - base_quantity 统一基础单位口径；orig_quantity/orig_unit 保留原始下单单位以便展示
+    //   - balance_after 为快照：写入时算好的当前余额，台账直接 SELECT，无需窗口函数反算
+    //   - ref_type/ref_id 关联到 purchase_order / sales_order 等
+    //   - movement_type: purchase(采购入库) / sales(销售出库) / adjust_in / adjust_out / transfer_in / transfer_out / opening
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS stock_movement (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            warehouse_id INTEGER NOT NULL DEFAULT 1,
+            direction TEXT NOT NULL CHECK(direction IN ('in','out')),
+            movement_type TEXT NOT NULL,
+            base_quantity REAL NOT NULL,
+            orig_quantity REAL NOT NULL DEFAULT 0,
+            orig_unit TEXT,
+            balance_after REAL NOT NULL,
+            ref_type TEXT,
+            ref_id INTEGER,
+            remark TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(product_id) REFERENCES product(id),
+            FOREIGN KEY(warehouse_id) REFERENCES warehouse(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_product ON stock_movement(product_id, created_at)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_ref ON stock_movement(ref_type, ref_id)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_type ON stock_movement(movement_type, created_at)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_warehouse ON stock_movement(warehouse_id, product_id, created_at)").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -1120,6 +1182,228 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
 
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_supplier_category_id ON supplier(category_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_purchaser_category_id ON purchaser(category_id)").execute(pool).await;
+
+    // 一次性补录：把历史已生效的采购/销售订单明细回填到 stock_movement。
+    // user_version >= 9 作为闸门，仅运行一次。
+    // 版本历史：
+    //   - v7：初版补录 SQL 引用了 inventory.warehouse_id 列，但旧库无此列导致 SQL 静默失败；
+    //         错误被 .ok() 吞掉，user_version 仍被升到 7，stock_movement 实际为空。
+    //   - v8：修复 inventory 表 warehouse_id 列后重跑补录，但只匹配 status IN
+    //         ('confirmed','received')，漏掉销售状态机后续的 accepted(已验收)/settled(已结算)，
+    //         且未处理 base_quantity=0 的历史明细，台账仍严重不完整。
+    //   - v9：①状态范围覆盖采购 confirmed、销售 confirmed/accepted/settled；
+    //         ②base_quantity 缺失时用 quantity × product_unit.ratio 现算；
+    //         ③整体重算（清除旧补录流水后重新全量生成），保证余额时序自洽。
+    //   - v10：业务口径调整——销售出库时点从「审核」后移到「确认验收」，
+    //          历史补录销售单状态范围收窄为 accepted/settled（confirmed 不再补出库），
+    //          inventory 按全部流水带符号求和重算。
+    // 补录策略：
+    //   - balance_after = SUM(带符号有效数量) OVER (PARTITION BY product_id ORDER BY 日期)
+    //     即从 0 开始的累计余额；最后一条 = 该商品历史净流入量
+    //   - 补录完成后，UPSERT inventory.quantity = 各 product 的最新 balance_after
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if version < 9 {
+        // 保护：若已存在「非历史补录」的真实流水（用户已用新版审核过订单），
+        // 不能整体清除重算（会破坏真实流水的时序），跳过，由更精细的迁移处理。
+        let real_cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stock_movement WHERE remark NOT LIKE '历史补录%'"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if real_cnt == 0 {
+            // 清除 v7/v8 遗留的补录流水与库存，整体重算
+            let _ = sqlx::query("DELETE FROM stock_movement WHERE remark LIKE '历史补录%'")
+                .execute(pool).await;
+            let _ = sqlx::query("DELETE FROM inventory").execute(pool).await;
+
+            // 全量补录：eff_base 为有效基础单位数量（base_quantity 优先，缺失则现算）
+            let _ = sqlx::query(
+                r#"
+                WITH all_movements AS (
+                    SELECT
+                        poi.product_id AS product_id,
+                        'in' AS direction,
+                        CASE WHEN poi.base_quantity > 0 THEN poi.base_quantity
+                             ELSE poi.quantity * COALESCE(
+                                 (SELECT pu.ratio FROM product_unit pu
+                                  WHERE pu.product_id = poi.product_id AND pu.unit_name = poi.unit), 1)
+                        END AS eff_base,
+                        poi.quantity AS orig_quantity,
+                        poi.unit AS orig_unit,
+                        po.order_date AS order_date,
+                        po.id AS order_id,
+                        poi.id AS item_seq
+                    FROM purchase_order_item poi
+                    JOIN purchase_order po ON po.id = poi.order_id
+                    WHERE po.status = 'confirmed'
+                    UNION ALL
+                    SELECT
+                        soi.product_id,
+                        'out',
+                        CASE WHEN soi.base_quantity > 0 THEN soi.base_quantity
+                             ELSE soi.quantity * COALESCE(
+                                 (SELECT pu.ratio FROM product_unit pu
+                                  WHERE pu.product_id = soi.product_id AND pu.unit_name = soi.unit), 1)
+                        END,
+                        soi.quantity,
+                        soi.unit,
+                        so.order_date,
+                        so.id,
+                        soi.id
+                    FROM sales_order_item soi
+                    JOIN sales_order so ON so.id = soi.order_id
+                    WHERE so.status IN ('confirmed','accepted','settled')
+                )
+                INSERT INTO stock_movement (
+                    product_id, warehouse_id, direction, movement_type,
+                    base_quantity, orig_quantity, orig_unit, balance_after,
+                    ref_type, ref_id, remark, created_at
+                )
+                SELECT
+                    am.product_id,
+                    1,
+                    am.direction,
+                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS movement_type,
+                    am.eff_base,
+                    am.orig_quantity,
+                    am.orig_unit,
+                    -- balance_after = 截至本条累计的带符号有效数量（从 0 开始）
+                    SUM(CASE WHEN am.direction='in' THEN am.eff_base ELSE -am.eff_base END)
+                        OVER (PARTITION BY am.product_id
+                              ORDER BY am.order_date, am.order_id, am.item_seq)
+                    AS balance_after,
+                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS ref_type,
+                    am.order_id AS ref_id,
+                    CASE WHEN am.direction='in' THEN '历史补录-采购入库'
+                         ELSE '历史补录-销售出库' END AS remark,
+                    am.order_date AS created_at
+                FROM all_movements am
+                ORDER BY am.order_date, am.order_id, am.item_seq
+                "#,
+            )
+            .execute(pool)
+            .await;
+
+            // 用每个 product 的最新 balance_after UPSERT 到 inventory.quantity，
+            // 后续审核流程从正确的初始余额继续累加
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
+                SELECT product_id, 1, balance_after, CURRENT_TIMESTAMP
+                FROM stock_movement
+                WHERE id IN (SELECT MAX(id) FROM stock_movement GROUP BY product_id)
+                ON CONFLICT(product_id, warehouse_id) DO UPDATE
+                    SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP
+                "#,
+            )
+            .execute(pool)
+            .await;
+        }
+        let _ = sqlx::query("PRAGMA user_version = 9").execute(pool).await;
+    }
+
+    // v10：销售出库口径从「审核」改为「确认验收」，重算历史补录。
+    if version < 10 {
+        // 与 v9 相同的保护：存在真实运行时流水时不整体重算，避免补录/真实流水重复。
+        let real_cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stock_movement WHERE remark NOT LIKE '历史补录%'"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if real_cnt == 0 {
+            let _ = sqlx::query("DELETE FROM stock_movement WHERE remark LIKE '历史补录%'")
+                .execute(pool).await;
+            let _ = sqlx::query("DELETE FROM inventory").execute(pool).await;
+
+            let _ = sqlx::query(
+                r#"
+                WITH all_movements AS (
+                    SELECT
+                        poi.product_id AS product_id,
+                        'in' AS direction,
+                        CASE WHEN poi.base_quantity > 0 THEN poi.base_quantity
+                             ELSE poi.quantity * COALESCE(
+                                 (SELECT pu.ratio FROM product_unit pu
+                                  WHERE pu.product_id = poi.product_id AND pu.unit_name = poi.unit), 1)
+                        END AS eff_base,
+                        poi.quantity AS orig_quantity,
+                        poi.unit AS orig_unit,
+                        po.order_date AS order_date,
+                        po.id AS order_id,
+                        poi.id AS item_seq
+                    FROM purchase_order_item poi
+                    JOIN purchase_order po ON po.id = poi.order_id
+                    WHERE po.status = 'confirmed'
+                    UNION ALL
+                    SELECT
+                        soi.product_id,
+                        'out',
+                        CASE WHEN soi.base_quantity > 0 THEN soi.base_quantity
+                             ELSE soi.quantity * COALESCE(
+                                 (SELECT pu.ratio FROM product_unit pu
+                                  WHERE pu.product_id = soi.product_id AND pu.unit_name = soi.unit), 1)
+                        END,
+                        soi.quantity,
+                        soi.unit,
+                        so.order_date,
+                        so.id,
+                        soi.id
+                    FROM sales_order_item soi
+                    JOIN sales_order so ON so.id = soi.order_id
+                    -- v10 口径：仅已验收/已结算的销售单视为已出库
+                    WHERE so.status IN ('accepted','settled')
+                )
+                INSERT INTO stock_movement (
+                    product_id, warehouse_id, direction, movement_type,
+                    base_quantity, orig_quantity, orig_unit, balance_after,
+                    ref_type, ref_id, remark, created_at
+                )
+                SELECT
+                    am.product_id,
+                    1,
+                    am.direction,
+                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS movement_type,
+                    am.eff_base,
+                    am.orig_quantity,
+                    am.orig_unit,
+                    SUM(CASE WHEN am.direction='in' THEN am.eff_base ELSE -am.eff_base END)
+                        OVER (PARTITION BY am.product_id
+                              ORDER BY am.order_date, am.order_id, am.item_seq)
+                    AS balance_after,
+                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS ref_type,
+                    am.order_id AS ref_id,
+                    CASE WHEN am.direction='in' THEN '历史补录-采购入库'
+                         ELSE '历史补录-销售出库' END AS remark,
+                    am.order_date AS created_at
+                FROM all_movements am
+                ORDER BY am.order_date, am.order_id, am.item_seq
+                "#,
+            )
+            .execute(pool)
+            .await;
+
+            // inventory 按全部流水带符号求和重算（不依赖 balance_after/MAX(id)，口径最稳）
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
+                SELECT product_id, 1,
+                       SUM(CASE WHEN direction='in' THEN base_quantity ELSE -base_quantity END),
+                       CURRENT_TIMESTAMP
+                FROM stock_movement GROUP BY product_id
+                ON CONFLICT(product_id, warehouse_id) DO UPDATE
+                    SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP
+                "#,
+            )
+            .execute(pool)
+            .await;
+        }
+        let _ = sqlx::query("PRAGMA user_version = 10").execute(pool).await;
+    }
 
     Ok(())
 }

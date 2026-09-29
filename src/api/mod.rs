@@ -4766,6 +4766,133 @@ pub async fn api_purchase_order_settle(headers: axum::http::HeaderMap, Path(id):
     }
 }
 
+/// 审核订单时为每个明细写一条 stock_movement + 同步 inventory.quantity。
+/// - direction: "in"（采购入库）/"out"（销售出库），决定 base_quantity 符号
+/// - movement_type/ref_type: 例如 "purchase"/"purchase" 或 "sales"/"sales"
+/// - remark_prefix: 备注前缀，例如 "采购入库"
+/// - action_label: 动作标签，拼在 prefix 后，例如 "审核" → "采购入库-审核"、"确认验收" → "销售出库-确认验收"
+/// 必须在已开始的事务内调用。
+async fn write_stock_movements_for_audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    order_id: i64,
+    item_table: &str,
+    direction: &str,
+    movement_type: &str,
+    ref_type: &str,
+    remark_prefix: &str,
+    action_label: &str,
+) -> Result<(), sqlx::Error> {
+    // base_quantity 缺失（老数据/部分开单入口未计算）时，用 quantity × product_unit.ratio 现算
+    let sql = format!(
+        "SELECT items.product_id,
+                CASE WHEN items.base_quantity > 0 THEN items.base_quantity
+                     ELSE items.quantity * COALESCE(
+                         (SELECT pu.ratio FROM product_unit pu
+                          WHERE pu.product_id = items.product_id AND pu.unit_name = items.unit), 1)
+                END AS eff_base,
+                items.quantity, items.unit
+         FROM {} items WHERE items.order_id = ?",
+        item_table
+    );
+    let items: Vec<(i64, f64, f64, String)> = sqlx::query_as(AssertSqlSafe(sql))
+        .bind(order_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let sign: f64 = if direction == "in" { 1.0 } else { -1.0 };
+    for (product_id, base_qty, orig_qty, unit) in items {
+        if base_qty == 0.0 { continue; }
+        // 当前余额（事务内）
+        let cur: f64 = sqlx::query_scalar(
+            "SELECT quantity FROM inventory WHERE product_id=? AND warehouse_id=1"
+        )
+        .bind(product_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(0.0);
+        let new_balance = cur + sign * base_qty;
+        // UPSERT inventory
+        let _ = sqlx::query(
+            "INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
+             VALUES (?, 1, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP"
+        )
+        .bind(product_id).bind(new_balance)
+        .execute(&mut **tx).await?;
+        // 写流水
+        let _ = sqlx::query(
+            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(product_id).bind(direction).bind(movement_type)
+        .bind(base_qty).bind(orig_qty).bind(&unit).bind(new_balance)
+        .bind(ref_type).bind(order_id)
+        .bind(format!("{}-{}", remark_prefix, action_label))
+        .execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// 反审核/撤销时为每个明细写一条冲销流水（direction 与原方向相反）+ 同步 inventory.quantity。
+/// 必须在已开始的事务内调用。
+async fn write_stock_movements_for_unaudit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    order_id: i64,
+    item_table: &str,
+    original_direction: &str,  // "in" 或 "out" — 原审核时的方向
+    movement_type: &str,      // 保持原 movement_type，台账按 direction 区分正/冲销
+    ref_type: &str,
+    remark_prefix: &str,
+    action_label: &str,       // 例如 "反审核冲销"/"撤销验收冲销"
+) -> Result<(), sqlx::Error> {
+    // base_quantity 缺失时同样用 quantity × product_unit.ratio 现算
+    let sql = format!(
+        "SELECT items.product_id,
+                CASE WHEN items.base_quantity > 0 THEN items.base_quantity
+                     ELSE items.quantity * COALESCE(
+                         (SELECT pu.ratio FROM product_unit pu
+                          WHERE pu.product_id = items.product_id AND pu.unit_name = items.unit), 1)
+                END AS eff_base,
+                items.quantity, items.unit
+         FROM {} items WHERE items.order_id = ?",
+        item_table
+    );
+    let items: Vec<(i64, f64, f64, String)> = sqlx::query_as(AssertSqlSafe(sql))
+        .bind(order_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    // 冲销方向：原 in → out，原 out → in
+    let reversal_direction = if original_direction == "in" { "out" } else { "in" };
+    let sign: f64 = if reversal_direction == "in" { 1.0 } else { -1.0 };
+    for (product_id, base_qty, orig_qty, unit) in items {
+        if base_qty == 0.0 { continue; }
+        let cur: f64 = sqlx::query_scalar(
+            "SELECT quantity FROM inventory WHERE product_id=? AND warehouse_id=1"
+        )
+        .bind(product_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(0.0);
+        let new_balance = cur + sign * base_qty;
+        let _ = sqlx::query(
+            "INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
+             VALUES (?, 1, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP"
+        )
+        .bind(product_id).bind(new_balance)
+        .execute(&mut **tx).await?;
+        let _ = sqlx::query(
+            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(product_id).bind(reversal_direction).bind(movement_type)
+        .bind(base_qty).bind(orig_qty).bind(&unit).bind(new_balance)
+        .bind(ref_type).bind(order_id)
+        .bind(format!("{}-{}", remark_prefix, action_label))
+        .execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 pub async fn api_purchase_order_approve(headers: axum::http::HeaderMap, Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
     match crate::auth::check_api_permission(&headers, "/api/purchase_order/approve").await {
         Err(e) => return e,
@@ -4796,18 +4923,38 @@ pub async fn api_purchase_order_approve(headers: axum::http::HeaderMap, Path(id)
     }
 
     let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
-    let result = sqlx::query("UPDATE purchase_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
+    // 用 BEGIN IMMEDIATE 事务：主表 UPDATE + 写库存流水 + 更新 inventory.quantity 三步原子化
+    let mut tx = match crate::db::pool().begin_with("BEGIN IMMEDIATE").await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "审核失败：事务启动失败".to_string()),
+    };
+    let upd = sqlx::query("UPDATE purchase_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
         .bind(id)
-        .execute(crate::db::pool())
+        .execute(&mut *tx)
         .await;
 
-    match result {
+    match upd {
         Ok(res) if res.rows_affected() > 0 => {
-            crate::auth::log_operation(&ctx, "purchase_order.approve", "purchase_order", &id.to_string(),
-                &format!("审核通过采购单 ID={}（{}）", id, if reason.is_empty() { "无备注" } else { &reason })).await;
-            (StatusCode::OK, "审核成功，订单已锁定".to_string())
+            // 写库存流水 + 更新 inventory
+            if let Err(e) = write_stock_movements_for_audit(
+                &mut tx, id, "purchase_order_item", "in", "purchase", "purchase", "采购入库", "审核"
+            ).await {
+                let _ = tx.rollback().await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("审核失败：写库存流水失败 {}", e));
+            }
+            match tx.commit().await {
+                Ok(_) => {
+                    crate::auth::log_operation(&ctx, "purchase_order.approve", "purchase_order", &id.to_string(),
+                        &format!("审核通过采购单 ID={}（{}）", id, if reason.is_empty() { "无备注" } else { &reason })).await;
+                    (StatusCode::OK, "审核成功，订单已锁定".to_string())
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("审核失败：提交事务失败 {}", e)),
+            }
         }
-        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
+        _ => {
+            let _ = tx.rollback().await;
+            (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string())
+        }
     }
 }
 
@@ -4849,18 +4996,38 @@ pub async fn api_purchase_order_unapprove(headers: axum::http::HeaderMap, Path(i
     } else {
         "UPDATE purchase_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
     };
-    let result = sqlx::query(update_sql)
+    // 用 BEGIN IMMEDIATE 事务：主表 UPDATE + 写冲销流水 + 回滚 inventory.quantity 三步原子化
+    let mut tx = match crate::db::pool().begin_with("BEGIN IMMEDIATE").await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "反审核失败：事务启动失败".to_string()),
+    };
+    let result = sqlx::query(AssertSqlSafe(update_sql.to_string()))
         .bind(id)
-        .execute(crate::db::pool())
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(res) if res.rows_affected() > 0 => {
-            crate::auth::log_operation(&ctx, "purchase_order.unapprove", "purchase_order", &id.to_string(),
-                &format!("反审核采购单 ID={}，原因：{}", id, reason)).await;
-            (StatusCode::OK, "反审核成功，订单已解锁".to_string())
+            // 写冲销流水（原方向 in → 冲销方向 out）+ 同步 inventory
+            if let Err(e) = write_stock_movements_for_unaudit(
+                &mut tx, id, "purchase_order_item", "in", "purchase", "purchase", "采购入库", "反审核冲销"
+            ).await {
+                let _ = tx.rollback().await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("反审核失败：写冲销流水失败 {}", e));
+            }
+            match tx.commit().await {
+                Ok(_) => {
+                    crate::auth::log_operation(&ctx, "purchase_order.unapprove", "purchase_order", &id.to_string(),
+                        &format!("反审核采购单 ID={}，原因：{}", id, reason)).await;
+                    (StatusCode::OK, "反审核成功，订单已解锁".to_string())
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("反审核失败：提交事务失败 {}", e)),
+            }
         }
-        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
+        _ => {
+            let _ = tx.rollback().await;
+            (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string())
+        }
     }
 }
 
@@ -8485,38 +8652,34 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
 /// 余额按商品分区累计（PARTITION BY product_id），单位显示商品基础单位。
 /// src/sid 作为稳定排序键：0=采购、1=销售，同日内先入后出。
 /// 返回的 SQL 不含外层 ORDER BY / LIMIT，由调用方追加。
-fn stock_flow_base_sql(where_clause: &str, sales_where_clause: &str) -> String {
+fn stock_flow_base_sql(where_clause: &str) -> String {
+    // 直接从 stock_movement 表读取：balance_after 已在写入时算好快照，
+    // 无需窗口函数反算；movement_type + direction 组合判断正/冲销。
     format!(
-        "SELECT t.create_time, t.type, t.product_id, t.product_name, t.spec, t.unit,
-                t.in_quantity, t.out_quantity, t.remark, t.orig_quantity, t.orig_unit, t.src, t.sid,
-                SUM(t.in_quantity - t.out_quantity) OVER (
-                    PARTITION BY t.product_id
-                    ORDER BY t.create_time, t.src, t.sid
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                ) AS balance
-         FROM (
-            SELECT po.order_date as create_time, '采购入库' as type, p.id as product_id, p.name as product_name, p.spec,
-                   COALESCE(NULLIF(p.base_unit, ''), p.unit) as unit,
-                   CASE WHEN poi.base_quantity IS NULL OR poi.base_quantity = 0 THEN poi.quantity ELSE poi.base_quantity END as in_quantity,
-                   0 as out_quantity, poi.remark, 0 as src, poi.id as sid,
-                   poi.quantity as orig_quantity, poi.unit as orig_unit
-            FROM purchase_order_item poi
-            JOIN purchase_order po ON poi.order_id = po.id
-            JOIN product p ON poi.product_id = p.id
-            {}
-            UNION ALL
-            SELECT so.order_date as create_time, '销售出库' as type, p.id as product_id, p.name as product_name, p.spec,
-                   COALESCE(NULLIF(p.base_unit, ''), p.unit) as unit,
-                   0 as in_quantity,
-                   CASE WHEN soi.base_quantity IS NULL OR soi.base_quantity = 0 THEN soi.quantity ELSE soi.base_quantity END as out_quantity,
-                   soi.remark, 1 as src, soi.id as sid,
-                   soi.quantity as orig_quantity, soi.unit as orig_unit
-            FROM sales_order_item soi
-            JOIN sales_order so ON soi.order_id = so.id
-            JOIN product p ON soi.product_id = p.id
-            {}
-         ) t",
-        where_clause, sales_where_clause
+        "SELECT sm.created_at AS create_time,
+                CASE
+                    WHEN sm.movement_type='purchase' AND sm.direction='in'  THEN '采购入库'
+                    WHEN sm.movement_type='purchase' AND sm.direction='out' THEN '采购入库冲销'
+                    WHEN sm.movement_type='sales'    AND sm.direction='out' THEN '销售出库'
+                    WHEN sm.movement_type='sales'    AND sm.direction='in'  THEN '销售出库冲销'
+                    ELSE sm.movement_type
+                END AS type,
+                sm.product_id,
+                p.name AS product_name,
+                p.spec,
+                COALESCE(NULLIF(p.base_unit, ''), p.unit) AS unit,
+                CASE WHEN sm.direction='in'  THEN sm.base_quantity ELSE 0 END AS in_quantity,
+                CASE WHEN sm.direction='out' THEN sm.base_quantity ELSE 0 END AS out_quantity,
+                sm.remark,
+                sm.orig_quantity,
+                sm.orig_unit,
+                CASE WHEN sm.movement_type='purchase' THEN 0 ELSE 1 END AS src,
+                sm.id AS sid,
+                sm.balance_after AS balance
+         FROM stock_movement sm
+         JOIN product p ON sm.product_id = p.id
+         {}",
+        where_clause
     )
 }
 
@@ -8531,46 +8694,41 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
 
     let pattern = format!("%{}%", product_name);
 
+    // 直接从 stock_movement 读取：单一 where 子句即可（不再分别拼采购/销售）
+    // 日期比较用 DATE() 抹平 created_at（旧数据是 'YYYY-MM-DD'，新数据是 'YYYY-MM-DD HH:MM:SS'）
     let mut where_clause = String::from("WHERE 1=1");
-    let mut sales_where_clause = String::from("WHERE 1=1");
     if let Some(pid) = product_id {
-        where_clause.push_str(&format!(" AND p.id = {}", pid));
-        sales_where_clause.push_str(&format!(" AND p.id = {}", pid));
+        where_clause.push_str(&format!(" AND sm.product_id = {}", pid));
     } else if !product_name.is_empty() {
         where_clause.push_str(" AND p.name LIKE ?");
-        sales_where_clause.push_str(" AND p.name LIKE ?");
     }
     if !start_date.is_empty() {
-        where_clause.push_str(&format!(" AND po.order_date >= '{}'", start_date));
-        sales_where_clause.push_str(&format!(" AND so.order_date >= '{}'", start_date));
+        where_clause.push_str(&format!(" AND DATE(sm.created_at) >= '{}'", start_date));
     }
     if !end_date.is_empty() {
-        where_clause.push_str(&format!(" AND po.order_date <= '{}'", end_date));
-        sales_where_clause.push_str(&format!(" AND so.order_date <= '{}'", end_date));
+        where_clause.push_str(&format!(" AND DATE(sm.created_at) <= '{}'", end_date));
     }
 
-    // 采购入库 + 销售出库（src/sid 作为稳定排序键：0=采购、1=销售，同日内先入后出）
-    // 总条数
+    // 总条数：直接 COUNT stock_movement
     let count_sql = format!(
-        "SELECT (SELECT COUNT(*) FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN product p ON poi.product_id = p.id {})
-         + (SELECT COUNT(*) FROM sales_order_item soi JOIN sales_order so ON soi.order_id = so.id JOIN product p ON soi.product_id = p.id {})",
-        where_clause, sales_where_clause
+        "SELECT COUNT(*) FROM stock_movement sm JOIN product p ON sm.product_id = p.id {}",
+        where_clause
     );
 
-    // 分页查询：余额按商品分区在全量明细上累计，按商品分组展示，再取当前页
-    let purchase_sql = format!(
+    // 分页查询：balance_after 已写入快照，外层直接 ORDER BY 取当前页
+    let data_sql = format!(
         "SELECT create_time, type, product_name, spec, unit, in_quantity, out_quantity, remark, orig_quantity, orig_unit, balance
          FROM ({})
          ORDER BY product_name, create_time, src, sid LIMIT {} OFFSET {}",
-        stock_flow_base_sql(&where_clause, &sales_where_clause), page_size, offset
+        stock_flow_base_sql(&where_clause), page_size, offset
     );
 
     let needs_bind = product_id.is_none() && !product_name.is_empty();
     let mut count_q = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()));
-    let mut data_q = sqlx::query(AssertSqlSafe(purchase_sql.as_str()));
+    let mut data_q = sqlx::query(AssertSqlSafe(data_sql.as_str()));
     if needs_bind {
-        count_q = count_q.bind(&pattern).bind(&pattern);
-        data_q = data_q.bind(&pattern).bind(&pattern);
+        count_q = count_q.bind(&pattern);
+        data_q = data_q.bind(&pattern);
     }
     let total = count_q.fetch_one(crate::db::pool()).await.unwrap_or(0);
     let rows = data_q.fetch_all(crate::db::pool()).await.unwrap_or_default();
@@ -9234,12 +9392,12 @@ pub async fn api_query_stock_balance_export(axum::extract::Query(params): axum::
 
 pub async fn api_query_stock_flow_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");let product_id=params.get("product_id").and_then(|s|s.parse::<i64>().ok());
-    let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");let mut swc=String::from("WHERE 1=1");
-    if let Some(pid)=product_id{wc.push_str(&format!(" AND p.id={}",pid));swc.push_str(&format!(" AND p.id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");swc.push_str(" AND p.name LIKE ?");}
-    if!start_date.is_empty(){wc.push_str(&format!(" AND po.order_date>='{}'",start_date));swc.push_str(&format!(" AND so.order_date>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND po.order_date<='{}'",end_date));swc.push_str(&format!(" AND so.order_date<='{}'",end_date));}
-    // 与台账查询同一口径：数量换算为基础单位，余额按商品分区累计
-    let sql=format!("SELECT create_time,type,product_name,spec,unit,in_quantity,out_quantity,remark,orig_quantity,orig_unit,balance FROM ({}) ORDER BY product_name,create_time,src,sid",stock_flow_base_sql(&wc,&swc));
-    let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()};
+    let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");
+    if let Some(pid)=product_id{wc.push_str(&format!(" AND sm.product_id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");}
+    if!start_date.is_empty(){wc.push_str(&format!(" AND DATE(sm.created_at)>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND DATE(sm.created_at)<='{}'",end_date));}
+    // 与台账查询同一口径：直接读 stock_movement，balance_after 已是快照
+    let sql=format!("SELECT create_time,type,product_name,spec,unit,in_quantity,out_quantity,remark,orig_quantity,orig_unit,balance FROM ({}) ORDER BY product_name,create_time,src,sid",stock_flow_base_sql(&wc));
+    let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()};
     let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
     for(c,h)in["日期","类型","商品名称","规格","单位","入库数量","出库数量","余额","原始数量","原始单位","备注"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
     ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,10).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,12).unwrap();ws.set_column_width(7,12).unwrap();ws.set_column_width(8,12).unwrap();ws.set_column_width(9,10).unwrap();ws.set_column_width(10,20).unwrap();
@@ -13588,24 +13746,58 @@ pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(
         return (StatusCode::BAD_REQUEST, format!("状态不允许从 {} 转换到 {}", current_status, new_status));
     }
     
-    // 原子状态转换 + 版本递增：WHERE 校验当前状态，防止并发重复流转
+    // 原子状态转换 + 版本递增：WHERE 校验当前状态，防止并发重复流转。
+    // 用 BEGIN IMMEDIATE 事务，在「审核/反审核」这两个真正影响库存的节点同步写流水+更新库存。
+    let mut tx = match crate::db::pool().begin_with("BEGIN IMMEDIATE").await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "状态更新失败：事务启动失败".to_string()),
+    };
     let result = sqlx::query("UPDATE sales_order SET status = ?, version = version + 1 WHERE id = ? AND status = ?")
-        .bind(new_status)
+        .bind(&new_status)
         .bind(id)
         .bind(&current_status)
-        .execute(crate::db::pool())
+        .execute(&mut *tx)
         .await;
-    
-    match result {
-        Ok(res) if res.rows_affected() == 0 => {
-            (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string())
+
+    let updated = match result {
+        Ok(res) => res.rows_affected() > 0,
+        Err(_) => {
+            let _ = tx.rollback().await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, "状态更新失败".to_string());
         }
+    };
+    if !updated {
+        let _ = tx.rollback().await;
+        return (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string());
+    }
+
+    // 出库时点口径：库存变动发生在「确认验收」而非「审核」：
+    //   进入 accepted（confirmed/delivered -> accepted）：写销售出库（out）
+    //   离开 accepted（accepted -> delivered，撤销验收）  ：写冲销（in）
+    // pending -> confirmed（审核）、confirmed -> pending（反审核）均不动库存。
+    let mv_res: Result<(), sqlx::Error> = if new_status == "accepted" {
+        write_stock_movements_for_audit(
+            &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "确认验收"
+        ).await
+    } else if current_status == "accepted" {
+        write_stock_movements_for_unaudit(
+            &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "撤销验收冲销"
+        ).await
+    } else {
+        Ok(())
+    };
+    if let Err(e) = mv_res {
+        let _ = tx.rollback().await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("状态更新失败：写库存流水失败 {}", e));
+    }
+
+    match tx.commit().await {
         Ok(_) => {
             crate::auth::log_operation(&ctx, "sales_order.update_status", "sales_order", &id.to_string(),
                 &format!("销售单 {} 状态 {} -> {}", id, current_status, new_status)).await;
             (StatusCode::OK, "状态更新成功".to_string())
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "状态更新失败".to_string()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("状态更新失败：提交事务失败 {}", e)),
     }
 }
 
@@ -13639,6 +13831,7 @@ pub async fn api_sales_order_approve(headers: axum::http::HeaderMap, Path(id): P
     }
 
     let reason = data["reason"].as_str().unwrap_or("").trim().to_string();
+    // 出库时点已后移到「确认验收」，审核只做状态原子转换，不写库存流水、不动 inventory。
     let result = sqlx::query("UPDATE sales_order SET status = 'confirmed', version = version + 1 WHERE id = ? AND status = 'pending'")
         .bind(id)
         .execute(crate::db::pool())
@@ -13648,7 +13841,7 @@ pub async fn api_sales_order_approve(headers: axum::http::HeaderMap, Path(id): P
         Ok(res) if res.rows_affected() > 0 => {
             crate::auth::log_operation(&ctx, "sales_order.approve", "sales_order", &id.to_string(),
                 &format!("审核通过销售单 ID={}（{}）", id, if reason.is_empty() { "无备注" } else { &reason })).await;
-            (StatusCode::OK, "审核成功，订单已锁定".to_string())
+            (StatusCode::OK, "审核成功，订单已锁定；确认验收时出库".to_string())
         }
         _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
     }
@@ -13692,18 +13885,41 @@ pub async fn api_sales_order_unapprove(headers: axum::http::HeaderMap, Path(id):
     } else {
         "UPDATE sales_order SET status = 'pending', version = version + 1 WHERE id = ? AND status = 'confirmed'"
     };
-    let result = sqlx::query(update_sql)
+    // 用 BEGIN IMMEDIATE 事务：主表 UPDATE + （仅已出库时）写冲销流水 + 回滚 inventory
+    let mut tx = match crate::db::pool().begin_with("BEGIN IMMEDIATE").await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "反审核失败：事务启动失败".to_string()),
+    };
+    let result = sqlx::query(AssertSqlSafe(update_sql.to_string()))
         .bind(id)
-        .execute(crate::db::pool())
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(res) if res.rows_affected() > 0 => {
-            crate::auth::log_operation(&ctx, "sales_order.unapprove", "sales_order", &id.to_string(),
-                &format!("反审核销售单 ID={}，原因：{}", id, reason)).await;
-            (StatusCode::OK, "反审核成功，订单已解锁".to_string())
+            // 出库时点在验收：只有原状态为 accepted（已出库）才需写冲销（in）；
+            // confirmed 等未出库状态反审核只改状态，不动库存。
+            if order_status == "accepted" {
+                if let Err(e) = write_stock_movements_for_unaudit(
+                    &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "反审核冲销"
+                ).await {
+                    let _ = tx.rollback().await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("反审核失败：写冲销流水失败 {}", e));
+                }
+            }
+            match tx.commit().await {
+                Ok(_) => {
+                    crate::auth::log_operation(&ctx, "sales_order.unapprove", "sales_order", &id.to_string(),
+                        &format!("反审核销售单 ID={}，原因：{}", id, reason)).await;
+                    (StatusCode::OK, "反审核成功，订单已解锁".to_string())
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("反审核失败：提交事务失败 {}", e)),
+            }
         }
-        _ => (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string()),
+        _ => {
+            let _ = tx.rollback().await;
+            (StatusCode::CONFLICT, "订单状态已变化，请刷新后重试".to_string())
+        }
     }
 }
 
