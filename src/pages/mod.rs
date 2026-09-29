@@ -5576,15 +5576,17 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
                 </div>
             </div>
             <button onclick="searchStock()" class="btn btn-primary">查询</button>
-            <a href="/api/query/stock_balance/export" class="btn btn-success ml-2">导出Excel</a>
+            <button onclick="exportStock()" class="btn btn-success ml-2">导出Excel</button>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
                 <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>库存数量</th><th>库存金额</th><th>操作</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
+            <div id="stockBalPager" class="mt-2 text-muted"></div>
         </div>
         <script>
+            let balPage = 1, balPageSize = 20, balTotal = 0;
             async function loadCategories() {
                 const res = await fetch('/api/category/list');
                 const categories = await res.json();
@@ -5593,16 +5595,34 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
                     select.innerHTML += '<option value="' + c.id + '">' + c.name + '</option>';
                 });
             }
-            async function searchStock() {
-                const url = '/api/query/stock_balance?product_name=' + encodeURIComponent(document.getElementById('productName').value) + 
-                    '&category_id=' + document.getElementById('categoryId').value;
+            async function searchStock(page) {
+                if (page === undefined) page = 1;
+                balPage = page;
+                const url = '/api/query/stock_balance?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
+                    '&category_id=' + document.getElementById('categoryId').value +
+                    '&page=' + balPage + '&page_size=' + balPageSize;
                 const res = await fetch(url);
                 const data = await res.json();
+                balTotal = data.total || 0;
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
-                data.forEach(item => {
+                (data.items || []).forEach(item => {
                     tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '') + '</td><td>' + (item.unit || '') + '</td><td>' + item.quantity.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td><td><button onclick="viewFlow(' + item.product_id + ')" class="btn btn-info btn-sm">查看流水</button></td></tr>';
                 });
+                renderBalPager();
+            }
+            function renderBalPager() {
+                const pages = Math.max(1, Math.ceil(balTotal / balPageSize));
+                let html = '共 ' + balTotal + ' 条，第 ' + balPage + ' / ' + pages + ' 页';
+                html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (balPage <= 1 ? ' disabled' : '') + ' onclick="searchStock(' + (balPage - 1) + ')">上一页</button>';
+                html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (balPage >= pages ? ' disabled' : '') + ' onclick="searchStock(' + (balPage + 1) + ')">下一页</button>';
+                document.getElementById('stockBalPager').innerHTML = html;
+            }
+            function exportStock() {
+                // 导出当前查询条件命中的全部结果（不受分页限制）
+                const url = '/api/query/stock_balance/export?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
+                    '&category_id=' + document.getElementById('categoryId').value;
+                window.location.href = url;
             }
             async function viewFlow(productId) {
                 let page = 1, flows = [], total = 0;
@@ -7991,8 +8011,18 @@ pub async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
     Html(crate::layout_html("订单调整与同屏比对", "/query/order_adjust", &content))
 }
 
-pub async fn page_query_stock_flow() -> Html<String> {
-    let content = r#"
+pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<String> {
+    let role = crate::auth::get_user_role(&headers).await;
+    // 台账维护按钮（清空/重新生成）仅管理员可见；接口本身也有 manage.admin 权限校验
+    let admin_buttons = if role == "admin" || role == "super_admin" {
+        r#"
+            <button onclick="clearStockMovement()" class="btn btn-danger ml-2">清空台账</button>
+            <button onclick="regenerateStockMovement()" class="btn btn-warning ml-2">重新生成记录</button>
+        "#
+    } else {
+        ""
+    };
+    let content = format!(r#"
         <div class="card p-4">
             <h3>库存明细台账</h3>
             <div class="row mb-3">
@@ -8010,7 +8040,7 @@ pub async fn page_query_stock_flow() -> Html<String> {
                 </div>
             </div>
             <button onclick="searchStockFlow()" class="btn btn-primary">查询</button>
-            <a href="/api/query/stock_flow/export" class="btn btn-success ml-2">导出Excel</a>
+            <button onclick="exportStockFlow()" class="btn btn-success ml-2">导出Excel</button>{admin_buttons}
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -8021,10 +8051,10 @@ pub async fn page_query_stock_flow() -> Html<String> {
         </div>
         <script>
             let stockFlowPage = 1, stockFlowPageSize = 200, stockFlowTotal = 0;
-            function sfEsc(s) {
+            function sfEsc(s) {{
                 return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            }
-            async function searchStockFlow(page) {
+            }}
+            async function searchStockFlow(page) {{
                 if (page === undefined) page = 1;
                 stockFlowPage = page;
                 const url = '/api/query/stock_flow?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
@@ -8035,28 +8065,55 @@ pub async fn page_query_stock_flow() -> Html<String> {
                 const data = await res.json();
                 stockFlowTotal = data.total || 0;
                 const rows = [];
-                (data.items || []).forEach(item => {
+                (data.items || []).forEach(item => {{
                     // 原始下单单位与基础单位不一致时，在备注中标注原始数量，方便与订单对账
                     let remark = sfEsc(item.remark);
-                    if (item.orig_unit && item.orig_unit !== item.unit) {
+                    if (item.orig_unit && item.orig_unit !== item.unit) {{
                         remark = (remark ? remark + ' ' : '') + '（原 ' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit) + '）';
-                    }
+                    }}
                     rows.push('<tr><td>' + sfEsc(item.create_time) + '</td><td>' + sfEsc(item.type) + '</td><td>' + sfEsc(item.product_name) + '</td><td>' + sfEsc(item.spec) + '</td><td>' + sfEsc(item.unit) + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + (item.balance || 0).toFixed(2) + '</td><td>' + remark + '</td></tr>');
-                });
+                }});
                 // 一次性写入，避免逐行 innerHTML 拼接导致页面卡死
                 document.getElementById('resultTable').innerHTML = rows.join('');
                 renderStockFlowPager();
-            }
-            function renderStockFlowPager() {
+            }}
+            function renderStockFlowPager() {{
                 const pages = Math.max(1, Math.ceil(stockFlowTotal / stockFlowPageSize));
                 let html = '共 ' + stockFlowTotal + ' 条，第 ' + stockFlowPage + ' / ' + pages + ' 页';
                 html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage <= 1 ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage - 1) + ')">上一页</button>';
                 html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage >= pages ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage + 1) + ')">下一页</button>';
                 document.getElementById('stockFlowPager').innerHTML = html;
-            }
+            }}
+            function exportStockFlow() {{
+                // 导出当前查询条件命中的全部结果（不受分页限制）
+                const url = '/api/query/stock_flow/export?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
+                    '&start_date=' + document.getElementById('startDate').value +
+                    '&end_date=' + document.getElementById('endDate').value;
+                window.location.href = url;
+            }}
+            async function clearStockMovement() {{
+                if (!await priceConfirm('确定要清空库存台账吗？\n将删除全部流水记录，并把库存数量清零。\n此操作不可恢复！')) return;
+                if (!await priceConfirm('再次确认：清空后流水记录无法找回，确定继续？')) return;
+                const res = await fetch('/api/stock_movement/clear');
+                const text = await res.text();
+                let msg = text;
+                try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
+                await priceAlert(msg, res.ok ? '清空完成' : '清空失败');
+                if (res.ok) searchStockFlow(1);
+            }}
+            async function regenerateStockMovement() {{
+                if (!await priceConfirm('确定要重新生成库存台账吗？\n将清空现有流水，并按订单状态重新生成：\n已审核采购单 → 入库流水；已验收/已结算销售单 → 出库流水。\n库存余额将按流水重新计算。')) return;
+                if (!await priceConfirm('再次确认：现有流水记录将被全部替换，确定继续？')) return;
+                const res = await fetch('/api/stock_movement/regenerate');
+                const text = await res.text();
+                let msg = text;
+                try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
+                await priceAlert(msg, res.ok ? '重新生成完成' : '重新生成失败');
+                if (res.ok) searchStockFlow(1);
+            }}
             searchStockFlow(1);
         </script>
-    "#;
+    "#);
     Html(crate::layout_html("库存明细台账", "/query/stock_flow", &content))
 }
 

@@ -400,7 +400,7 @@ pub async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::V
     }
     
     if role.is_empty() {
-        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, supplier_id = ?, purchaser_id = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, supplier_id = ?, purchaser_id = ?, update_at = datetime('now','localtime') WHERE id = ?")
             .bind(username)
             .bind(nickname)
             .bind(supplier_id)
@@ -410,7 +410,7 @@ pub async fn api_user_update(Path(id): Path<i64>, Json(data): Json<serde_json::V
             .await
             .ok();
     } else {
-        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, supplier_id = ?, purchaser_id = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE user_account SET username = ?, nickname = ?, role = ?, supplier_id = ?, purchaser_id = ?, update_at = datetime('now','localtime') WHERE id = ?")
             .bind(username)
             .bind(nickname)
             .bind(role)
@@ -444,7 +444,7 @@ pub async fn api_user_delete(Path(id): Path<i64>) -> impl IntoResponse {
 pub async fn api_user_status(Path(id): Path<i64>, Json(data): Json<serde_json::Value>) -> impl IntoResponse {
     let status = data["status"].as_i64().unwrap_or(0);
     
-    sqlx::query("UPDATE user_account SET status = ?, update_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE user_account SET status = ?, update_at = datetime('now','localtime') WHERE id = ?")
         .bind(status)
         .bind(id)
         .execute(crate::db::pool())
@@ -1062,7 +1062,7 @@ pub async fn api_login(Json(data): Json<LoginReq>) -> impl IntoResponse {
     
     let session_token = format!("{}:{:x}", user_id, rand::random::<u128>());
     
-    sqlx::query("UPDATE user_account SET last_login_time = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE user_account SET last_login_time = datetime('now','localtime') WHERE id = ?")
         .bind(user_id)
         .execute(crate::db::pool())
         .await
@@ -3886,7 +3886,7 @@ pub async fn api_warehouse_update(Json(req): Json<WarehouseUpdateReq>) -> (Statu
         return (code, msg);
     }
     let result = sqlx::query(
-        "UPDATE warehouse SET name = ?, code = ?, address = ?, contact = ?, phone = ?, status = ?, sort_order = ?, audit_status='pending', update_at = CURRENT_TIMESTAMP WHERE id = ?"
+        "UPDATE warehouse SET name = ?, code = ?, address = ?, contact = ?, phone = ?, status = ?, sort_order = ?, audit_status='pending', update_at = datetime('now','localtime') WHERE id = ?"
     )
     .bind(&req.name)
     .bind(req.code)
@@ -4813,8 +4813,8 @@ async fn write_stock_movements_for_audit(
         // UPSERT inventory
         let _ = sqlx::query(
             "INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
-             VALUES (?, 1, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP"
+             VALUES (?, 1, ?, datetime('now','localtime'))
+             ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity, last_update = datetime('now','localtime')"
         )
         .bind(product_id).bind(new_balance)
         .execute(&mut **tx).await?;
@@ -4875,8 +4875,8 @@ async fn write_stock_movements_for_unaudit(
         let new_balance = cur + sign * base_qty;
         let _ = sqlx::query(
             "INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
-             VALUES (?, 1, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP"
+             VALUES (?, 1, ?, datetime('now','localtime'))
+             ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity, last_update = datetime('now','localtime')"
         )
         .bind(product_id).bind(new_balance)
         .execute(&mut **tx).await?;
@@ -8593,42 +8593,59 @@ pub async fn api_query_document_summary(axum::extract::Query(params): axum::extr
 pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
     let category_id = params.get("category_id").map(|s| s.as_str()).unwrap_or("");
-    
-    let sql = if category_id.is_empty() {
-        format!(
-            "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
-                    p.name as product_name, p.spec, p.unit, p.base_price,
-                    (i.quantity * p.base_price) as amount
-             FROM inventory i JOIN product p ON i.product_id = p.id
-             WHERE p.name LIKE ? ORDER BY p.name"
-        )
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let where_sql = if category_id.is_empty() {
+        "WHERE p.name LIKE ?"
     } else {
-        format!(
-            "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
-                    p.name as product_name, p.spec, p.unit, p.base_price,
-                    (i.quantity * p.base_price) as amount
-             FROM inventory i JOIN product p ON i.product_id = p.id
-             WHERE p.name LIKE ? AND p.category_id = ? ORDER BY p.name"
-        )
+        "WHERE p.name LIKE ? AND p.category_id = ?"
     };
-    
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM inventory i JOIN product p ON i.product_id = p.id {}",
+        where_sql
+    );
+    let data_sql = format!(
+        "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
+                p.name as product_name, p.spec, p.unit, p.base_price,
+                (i.quantity * p.base_price) as amount
+         FROM inventory i JOIN product p ON i.product_id = p.id
+         {} ORDER BY p.name LIMIT {} OFFSET {}",
+        where_sql, page_size, offset
+    );
+
     let pattern = format!("%{}%", product_name);
-    let rows = if category_id.is_empty() {
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+    let (total, rows) = if category_id.is_empty() {
+        let total = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()))
+            .bind(&pattern)
+            .fetch_one(crate::db::pool())
+            .await
+            .unwrap_or(0);
+        let rows = sqlx::query(AssertSqlSafe(data_sql.as_str()))
             .bind(&pattern)
             .fetch_all(crate::db::pool())
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (total, rows)
     } else {
         let cat_id: i64 = category_id.parse().unwrap_or(0);
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+        let total = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()))
+            .bind(&pattern)
+            .bind(cat_id)
+            .fetch_one(crate::db::pool())
+            .await
+            .unwrap_or(0);
+        let rows = sqlx::query(AssertSqlSafe(data_sql.as_str()))
             .bind(&pattern)
             .bind(cat_id)
             .fetch_all(crate::db::pool())
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (total, rows)
     };
-    
+
     let items: Vec<serde_json::Value> = rows.iter().map(|row| {
         let qty = row.try_get::<f64, _>("quantity").unwrap_or(0.0);
         let amt = row.try_get::<f64, _>("amount").unwrap_or(0.0);
@@ -8643,8 +8660,15 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
             "max_stock": row.try_get::<f64, _>("max_stock").unwrap_or(0.0),
         })
     }).collect();
-    
-    (StatusCode::OK, serde_json::to_string(&items).unwrap())
+
+    let result = serde_json::json!({
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    });
+
+    (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
 /// 库存流水基础查询：采购入库 + 销售出库 UNION ALL。
@@ -8759,6 +8783,115 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
     });
 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
+}
+
+/// 清空库存台账：删除全部 stock_movement 流水，并将 inventory 数量清零（保留 min/max 配置）。
+/// 管理维护操作，事务包裹，需 manage.admin 权限，写操作审计日志。
+pub async fn api_stock_movement_clear(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if let Err(e) = crate::auth::check_api_permission(&headers, "/api/stock_movement/clear").await {
+        return e;
+    }
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+
+    let mut tx = match crate::db::pool().begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("清空库存台账开启事务失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "清空失败：无法开启事务".to_string());
+        }
+    };
+
+    let deleted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_movement")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or(0);
+
+    if let Err(e) = sqlx::query("DELETE FROM stock_movement").execute(&mut *tx).await {
+        eprintln!("清空 stock_movement 失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "清空失败：删除流水出错".to_string());
+    }
+    if let Err(e) = sqlx::query("UPDATE inventory SET quantity = 0, last_update = datetime('now','localtime')")
+        .execute(&mut *tx)
+        .await
+    {
+        eprintln!("清零 inventory 失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "清空失败：重置库存出错".to_string());
+    }
+    if let Err(e) = tx.commit().await {
+        eprintln!("清空库存台账提交事务失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "清空失败：提交事务出错".to_string());
+    }
+
+    crate::auth::log_operation(&ctx, "stock_movement.clear", "stock_movement", "-",
+        &format!("清空库存台账：删除流水 {} 条，库存数量全部清零", deleted)).await;
+
+    (StatusCode::OK, serde_json::json!({
+        "success": true,
+        "message": format!("已清空 {} 条流水记录，库存数量已清零", deleted)
+    }).to_string())
+}
+
+/// 重新生成库存台账：清空流水后，按业务口径重放——
+/// 已审核采购单(confirmed)写入库流水、已验收/已结算销售单(accepted/settled)写出库流水，
+/// balance_after 按商品分区累计，最后按流水代数和重算 inventory（保留 min/max 配置）。
+/// 管理维护操作，事务包裹，需 manage.admin 权限，写操作审计日志。
+pub async fn api_stock_movement_regenerate(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if let Err(e) = crate::auth::check_api_permission(&headers, "/api/stock_movement/regenerate").await {
+        return e;
+    }
+    let ctx = crate::auth::get_user_ctx(&headers).await;
+
+    let mut tx = match crate::db::pool().begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("重新生成台账开启事务失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "重新生成失败：无法开启事务".to_string());
+        }
+    };
+
+    let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_movement")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or(0);
+
+    if let Err(e) = sqlx::query("DELETE FROM stock_movement").execute(&mut *tx).await {
+        eprintln!("重新生成台账-清空流水失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "重新生成失败：清空流水出错".to_string());
+    }
+    if let Err(e) = sqlx::query(crate::db::STOCK_MOVEMENT_REPLAY_SQL).execute(&mut *tx).await {
+        eprintln!("重新生成台账-重放流水失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("重新生成失败：重放流水出错（{}）", e));
+    }
+    // 库存数量先清零再按流水重算，保留 min_stock/max_stock 等配置
+    if let Err(e) = sqlx::query("UPDATE inventory SET quantity = 0, last_update = datetime('now','localtime')")
+        .execute(&mut *tx)
+        .await
+    {
+        eprintln!("重新生成台账-清零库存失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "重新生成失败：重置库存出错".to_string());
+    }
+    if let Err(e) = sqlx::query(crate::db::INVENTORY_RECALC_SQL).execute(&mut *tx).await {
+        eprintln!("重新生成台账-重算库存失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("重新生成失败：重算库存出错（{}）", e));
+    }
+
+    let new_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_movement")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or(0);
+
+    if let Err(e) = tx.commit().await {
+        eprintln!("重新生成台账提交事务失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "重新生成失败：提交事务出错".to_string());
+    }
+
+    crate::auth::log_operation(&ctx, "stock_movement.regenerate", "stock_movement", "-",
+        &format!("重新生成库存台账：原流水 {} 条 → 重放生成 {} 条，库存按流水重算", old_count, new_count)).await;
+
+    (StatusCode::OK, serde_json::json!({
+        "success": true,
+        "message": format!("已重新生成 {} 条流水记录（原有 {} 条），库存余额已按流水重算", new_count, old_count)
+    }).to_string())
 }
 
 pub async fn api_query_stock_summary(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
@@ -10253,7 +10386,7 @@ pub async fn api_allocation_create(Json(req): Json<serde_json::Value>) -> impl I
     let item_ids_str = item_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
 
     let result = sqlx::query(
-        "INSERT INTO consumable_allocation(source_order_id, total_amount, allocated_amount, remaining_balance, status, remark, created_at, source_item_ids) VALUES (?, ?, 0, ?, 0, ?, datetime('now'), ?)"
+        "INSERT INTO consumable_allocation(source_order_id, total_amount, allocated_amount, remaining_balance, status, remark, created_at, source_item_ids) VALUES (?, ?, 0, ?, 0, ?, datetime('now','localtime'), ?)"
     )
     .bind(source_order_id)
     .bind(total_amount)
@@ -10344,7 +10477,7 @@ pub async fn api_allocation_terminate(Json(req): Json<serde_json::Value>) -> imp
     let remark = req.get("remark").and_then(|v| v.as_str()).unwrap_or("");
 
     let result = sqlx::query(
-        "UPDATE consumable_allocation SET status = 3, remark = ?, completed_at = datetime('now') WHERE source_order_id = ? AND status != 2"
+        "UPDATE consumable_allocation SET status = 3, remark = ?, completed_at = datetime('now','localtime') WHERE source_order_id = ? AND status != 2"
     )
     .bind(remark)
     .bind(source_order_id)
@@ -10471,7 +10604,7 @@ pub async fn api_allocation_complete(Json(req): Json<serde_json::Value>) -> impl
     }
 
     let result = sqlx::query(
-        "UPDATE consumable_allocation SET status = 2, completed_at = datetime('now'), remaining_balance = 0 WHERE id = ?"
+        "UPDATE consumable_allocation SET status = 2, completed_at = datetime('now','localtime'), remaining_balance = 0 WHERE id = ?"
     )
     .bind(alloc_id)
     .execute(crate::db::pool())
@@ -10524,7 +10657,7 @@ pub async fn api_supplement_create(Json(req): Json<OrderSupplementItemReq>) -> i
 
             // 冲减后若余额回升（remaining>0），需从"已完成"回退到"分摊中"并清空完结时间
             let _ = sqlx::query(
-                "UPDATE consumable_allocation SET completed_at = datetime('now') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
+                "UPDATE consumable_allocation SET completed_at = datetime('now','localtime') WHERE source_order_id = ? AND status = 2 AND completed_at IS NULL"
             )
             .bind(req.source_order_id)
             .execute(crate::db::pool())

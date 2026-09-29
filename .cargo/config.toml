@@ -1,2 +1,15 @@
+# 默认编译 Win7 兼容目标（该二进制在 Win7/10/11 上均可运行）
+# 需 nightly 工具链：rustup override set nightly（已在本项目目录设置）
+[build]
+target = "x86_64-win7-windows-msvc"
+
+# win7 目标为 Tier 3，无预编译 std，需从源码构建
+[unstable]
+build-std = ["std", "panic_abort"]
+
 [target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Win7 兼容目标（Tier 3，需 nightly + build-std 编译）
+[target.x86_64-win7-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

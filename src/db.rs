@@ -5,6 +5,84 @@ use std::sync::OnceLock;
 
 pub static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 
+/// 库存流水重放 SQL：从已审核采购单（confirmed）与已验收/已结算销售单（accepted/settled）
+/// 全量重建 stock_movement。balance_after 用窗口函数按商品分区累计（从 0 开始）。
+/// 供 v10 迁移与「重新生成台账」接口共用，保证口径一致。
+pub const STOCK_MOVEMENT_REPLAY_SQL: &str = r#"
+                WITH all_movements AS (
+                    SELECT
+                        poi.product_id AS product_id,
+                        'in' AS direction,
+                        CASE WHEN poi.base_quantity > 0 THEN poi.base_quantity
+                             ELSE poi.quantity * COALESCE(
+                                 (SELECT pu.ratio FROM product_unit pu
+                                  WHERE pu.product_id = poi.product_id AND pu.unit_name = poi.unit), 1)
+                        END AS eff_base,
+                        poi.quantity AS orig_quantity,
+                        poi.unit AS orig_unit,
+                        po.order_date AS order_date,
+                        po.id AS order_id,
+                        poi.id AS item_seq
+                    FROM purchase_order_item poi
+                    JOIN purchase_order po ON po.id = poi.order_id
+                    WHERE po.status = 'confirmed'
+                    UNION ALL
+                    SELECT
+                        soi.product_id,
+                        'out',
+                        CASE WHEN soi.base_quantity > 0 THEN soi.base_quantity
+                             ELSE soi.quantity * COALESCE(
+                                 (SELECT pu.ratio FROM product_unit pu
+                                  WHERE pu.product_id = soi.product_id AND pu.unit_name = soi.unit), 1)
+                        END,
+                        soi.quantity,
+                        soi.unit,
+                        so.order_date,
+                        so.id,
+                        soi.id
+                    FROM sales_order_item soi
+                    JOIN sales_order so ON so.id = soi.order_id
+                    -- v10 口径：仅已验收/已结算的销售单视为已出库
+                    WHERE so.status IN ('accepted','settled')
+                )
+                INSERT INTO stock_movement (
+                    product_id, warehouse_id, direction, movement_type,
+                    base_quantity, orig_quantity, orig_unit, balance_after,
+                    ref_type, ref_id, remark, created_at
+                )
+                SELECT
+                    am.product_id,
+                    1,
+                    am.direction,
+                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS movement_type,
+                    am.eff_base,
+                    am.orig_quantity,
+                    am.orig_unit,
+                    SUM(CASE WHEN am.direction='in' THEN am.eff_base ELSE -am.eff_base END)
+                        OVER (PARTITION BY am.product_id
+                              ORDER BY am.order_date, am.order_id, am.item_seq)
+                    AS balance_after,
+                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS ref_type,
+                    am.order_id AS ref_id,
+                    CASE WHEN am.direction='in' THEN '历史补录-采购入库'
+                         ELSE '历史补录-销售出库' END AS remark,
+                    am.order_date AS created_at
+                FROM all_movements am
+                ORDER BY am.order_date, am.order_id, am.item_seq
+                "#;
+
+/// 按 stock_movement 全部流水带符号求和重算 inventory（不依赖 balance_after/MAX(id)，口径最稳）。
+/// 供 v10 迁移与「重新生成台账」接口共用。
+pub const INVENTORY_RECALC_SQL: &str = r#"
+                INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
+                SELECT product_id, 1,
+                       SUM(CASE WHEN direction='in' THEN base_quantity ELSE -base_quantity END),
+                       datetime('now','localtime')
+                FROM stock_movement GROUP BY product_id
+                ON CONFLICT(product_id, warehouse_id) DO UPDATE
+                    SET quantity = excluded.quantity, last_update = datetime('now','localtime')
+                "#;
+
 pub async fn repair_db_corruption(pool: &SqlitePool) {
     // 1. 先尝试 REINDEX + VACUUM
     let _ = sqlx::query("REINDEX").execute(pool).await;
@@ -218,7 +296,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             parent_id INTEGER,
             entity_type TEXT NOT NULL,
             sort_order INTEGER DEFAULT 0,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(parent_id) REFERENCES category(id)
         )
         "#,
@@ -236,7 +314,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             address TEXT,
             category_id INTEGER REFERENCES category(id),
             audit_status TEXT NOT NULL DEFAULT 'pending',
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -253,7 +331,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             address TEXT,
             category_id INTEGER REFERENCES category(id),
             audit_status TEXT NOT NULL DEFAULT 'pending',
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -274,7 +352,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             min_purchase_price REAL DEFAULT 0,
             category_id INTEGER REFERENCES category(id),
             audit_status TEXT NOT NULL DEFAULT 'pending',
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
             UNIQUE(name, spec)
         )
         "#,
@@ -337,7 +415,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             source TEXT,
             ref_id INTEGER,
             remark TEXT,
-            changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            changed_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(product_id) REFERENCES product(id)
         )
         "#,
@@ -428,8 +506,8 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             status INTEGER DEFAULT 1,
             sort_order INTEGER DEFAULT 0,
             audit_status TEXT NOT NULL DEFAULT 'pending',
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            update_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
+            update_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -445,7 +523,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             quantity REAL NOT NULL DEFAULT 0,
             min_stock REAL DEFAULT 0,
             max_stock REAL DEFAULT 1000,
-            last_update DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_update DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(product_id) REFERENCES product(id),
             FOREIGN KEY(warehouse_id) REFERENCES warehouse(id),
             UNIQUE(product_id, warehouse_id)
@@ -514,7 +592,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             ref_type TEXT,
             ref_id INTEGER,
             remark TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(product_id) REFERENCES product(id),
             FOREIGN KEY(warehouse_id) REFERENCES warehouse(id)
         )
@@ -538,7 +616,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             total_amount REAL NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'pending',
             remark TEXT,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(supplier_id) REFERENCES supplier(id)
         )
         "#,
@@ -599,7 +677,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             remark TEXT,
             customer_order_image TEXT,
             signed_order_image TEXT,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(purchaser_id) REFERENCES purchaser(id)
         )
         "#,
@@ -694,7 +772,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             document_date TEXT NOT NULL,
             image_url TEXT NOT NULL,
             remark TEXT,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -799,7 +877,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             target_type TEXT DEFAULT '',
             target_id TEXT DEFAULT '',
             detail TEXT DEFAULT '',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -894,7 +972,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             discount_rate REAL NOT NULL DEFAULT 0,
             final_price REAL NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'pending',
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(supplier_id) REFERENCES supplier(id),
             FOREIGN KEY(purchaser_id) REFERENCES purchaser(id)
         )
@@ -932,8 +1010,8 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         CREATE TABLE IF NOT EXISTS system_config (
             key TEXT PRIMARY KEY,
             value TEXT,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            update_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
+            update_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -947,7 +1025,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             backup_time TEXT NOT NULL,
             file_name TEXT NOT NULL,
             size INTEGER NOT NULL,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -964,8 +1042,8 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             role TEXT DEFAULT 'user',
             status INTEGER DEFAULT 1,
             last_login_time DATETIME,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            update_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
+            update_at DATETIME DEFAULT (datetime('now','localtime'))
         )
         "#,
     )
@@ -1153,7 +1231,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             end_date TEXT,
             source TEXT,
             remark TEXT,
-            create_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            create_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(product_id) REFERENCES product(id),
             UNIQUE(product_id, price_type, effective_date)
         )
@@ -1293,11 +1371,11 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             let _ = sqlx::query(
                 r#"
                 INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
-                SELECT product_id, 1, balance_after, CURRENT_TIMESTAMP
+                SELECT product_id, 1, balance_after, datetime('now','localtime')
                 FROM stock_movement
                 WHERE id IN (SELECT MAX(id) FROM stock_movement GROUP BY product_id)
                 ON CONFLICT(product_id, warehouse_id) DO UPDATE
-                    SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP
+                    SET quantity = excluded.quantity, last_update = datetime('now','localtime')
                 "#,
             )
             .execute(pool)
@@ -1320,89 +1398,56 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
                 .execute(pool).await;
             let _ = sqlx::query("DELETE FROM inventory").execute(pool).await;
 
-            let _ = sqlx::query(
-                r#"
-                WITH all_movements AS (
-                    SELECT
-                        poi.product_id AS product_id,
-                        'in' AS direction,
-                        CASE WHEN poi.base_quantity > 0 THEN poi.base_quantity
-                             ELSE poi.quantity * COALESCE(
-                                 (SELECT pu.ratio FROM product_unit pu
-                                  WHERE pu.product_id = poi.product_id AND pu.unit_name = poi.unit), 1)
-                        END AS eff_base,
-                        poi.quantity AS orig_quantity,
-                        poi.unit AS orig_unit,
-                        po.order_date AS order_date,
-                        po.id AS order_id,
-                        poi.id AS item_seq
-                    FROM purchase_order_item poi
-                    JOIN purchase_order po ON po.id = poi.order_id
-                    WHERE po.status = 'confirmed'
-                    UNION ALL
-                    SELECT
-                        soi.product_id,
-                        'out',
-                        CASE WHEN soi.base_quantity > 0 THEN soi.base_quantity
-                             ELSE soi.quantity * COALESCE(
-                                 (SELECT pu.ratio FROM product_unit pu
-                                  WHERE pu.product_id = soi.product_id AND pu.unit_name = soi.unit), 1)
-                        END,
-                        soi.quantity,
-                        soi.unit,
-                        so.order_date,
-                        so.id,
-                        soi.id
-                    FROM sales_order_item soi
-                    JOIN sales_order so ON so.id = soi.order_id
-                    -- v10 口径：仅已验收/已结算的销售单视为已出库
-                    WHERE so.status IN ('accepted','settled')
-                )
-                INSERT INTO stock_movement (
-                    product_id, warehouse_id, direction, movement_type,
-                    base_quantity, orig_quantity, orig_unit, balance_after,
-                    ref_type, ref_id, remark, created_at
-                )
-                SELECT
-                    am.product_id,
-                    1,
-                    am.direction,
-                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS movement_type,
-                    am.eff_base,
-                    am.orig_quantity,
-                    am.orig_unit,
-                    SUM(CASE WHEN am.direction='in' THEN am.eff_base ELSE -am.eff_base END)
-                        OVER (PARTITION BY am.product_id
-                              ORDER BY am.order_date, am.order_id, am.item_seq)
-                    AS balance_after,
-                    CASE WHEN am.direction='in' THEN 'purchase' ELSE 'sales' END AS ref_type,
-                    am.order_id AS ref_id,
-                    CASE WHEN am.direction='in' THEN '历史补录-采购入库'
-                         ELSE '历史补录-销售出库' END AS remark,
-                    am.order_date AS created_at
-                FROM all_movements am
-                ORDER BY am.order_date, am.order_id, am.item_seq
-                "#,
-            )
+            let _ = sqlx::query(STOCK_MOVEMENT_REPLAY_SQL)
             .execute(pool)
             .await;
 
             // inventory 按全部流水带符号求和重算（不依赖 balance_after/MAX(id)，口径最稳）
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO inventory (product_id, warehouse_id, quantity, last_update)
-                SELECT product_id, 1,
-                       SUM(CASE WHEN direction='in' THEN base_quantity ELSE -base_quantity END),
-                       CURRENT_TIMESTAMP
-                FROM stock_movement GROUP BY product_id
-                ON CONFLICT(product_id, warehouse_id) DO UPDATE
-                    SET quantity = excluded.quantity, last_update = CURRENT_TIMESTAMP
-                "#,
-            )
+            let _ = sqlx::query(INVENTORY_RECALC_SQL)
             .execute(pool)
             .await;
         }
         let _ = sqlx::query("PRAGMA user_version = 10").execute(pool).await;
+    }
+
+    // v11：历史时间戳 UTC → 本地时间（北京时间）一次性校正。
+    // 此前所有 DEFAULT CURRENT_TIMESTAMP / CURRENT_TIMESTAMP 写入均为 UTC（慢 8 小时）；
+    // 代码已统一切换为 datetime('now','localtime')，此处仅校正存量数据，幂等由 user_version 闸门保证。
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if version < 11 {
+        let fixes: [(&str, &str); 20] = [
+            ("category", "create_at"),
+            ("supplier", "create_at"),
+            ("purchaser", "create_at"),
+            ("product", "create_at"),
+            ("product_price_log", "changed_at"),
+            ("warehouse", "create_at"),
+            ("warehouse", "update_at"),
+            ("inventory", "last_update"),
+            ("stock_movement", "created_at"),
+            ("purchase_order", "create_at"),
+            ("sales_order", "create_at"),
+            ("purchase_document", "create_at"),
+            ("operation_log", "created_at"),
+            ("food_accept", "create_at"),
+            ("system_config", "create_at"),
+            ("system_config", "update_at"),
+            ("backup_record", "create_at"),
+            ("user_account", "create_at"),
+            ("user_account", "update_at"),
+            ("user_account", "last_login_time"),
+        ];
+        for (table, col) in fixes {
+            let sql = format!(
+                "UPDATE {} SET {} = datetime({}, '+8 hours') WHERE {} IS NOT NULL",
+                table, col, col, col
+            );
+            let _ = sqlx::query(AssertSqlSafe(sql)).execute(pool).await;
+        }
+        let _ = sqlx::query("PRAGMA user_version = 11").execute(pool).await;
     }
 
     Ok(())

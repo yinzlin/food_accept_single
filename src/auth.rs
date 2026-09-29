@@ -275,6 +275,9 @@ pub fn check_api_route_permission(path: &str) -> Option<&str> {
         Some("query.view")
     } else if path.starts_with("/api/query/stock") || path.starts_with("/api/query/income") || path.starts_with("/api/query/profit") || path.starts_with("/api/query/overview") || path.starts_with("/api/query/category") || path.starts_with("/api/query/document") {
         Some("manage.admin")
+    } else if path.starts_with("/api/stock_movement/") {
+        // 库存台账维护（清空/重新生成）：仅管理员
+        Some("manage.admin")
     } else if path.starts_with("/api/query/") {
         Some("query.view")
     } else if path.starts_with("/api/user/") {

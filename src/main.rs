@@ -2353,6 +2353,8 @@ fn build_router() -> Router {
         .route("/api/query/stock_balance/export", get(api_query_stock_balance_export))
         .route("/api/query/stock_flow", get(api_query_stock_flow))
         .route("/api/query/stock_flow/export", get(api_query_stock_flow_export))
+        .route("/api/stock_movement/clear", get(api_stock_movement_clear))
+        .route("/api/stock_movement/regenerate", get(api_stock_movement_regenerate))
         .route("/api/query/stock_summary", get(api_query_stock_summary))
         .route("/api/query/stock_summary/export", get(api_query_stock_summary_export))
         .route("/api/query/stock_summary_reimburse", get(api_query_stock_summary_reimburse))
