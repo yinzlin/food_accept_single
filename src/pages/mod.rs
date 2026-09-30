@@ -8096,18 +8096,7 @@ pub async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
 }
 
 pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<String> {
-    let role = crate::auth::get_user_role(&headers).await;
-    // 台账维护按钮（清空/重新生成）仅管理员可见；接口本身也有 manage.admin 权限校验
-    let admin_buttons = if role == "admin" || role == "super_admin" {
-        // 台账维护按钮与查询/导出同一行展示；接口本身也有 manage.admin 权限校验
-        r#"
-            <button onclick="clearStockMovement()" class="btn btn-danger ml-2">清空台账</button>
-            <button onclick="regenerateStockMovement()" class="btn btn-warning ml-2">重新生成记录</button>
-        "#
-    } else {
-        ""
-    };
-    let content = format!(r#"
+    let content = r#"
         <div class="card p-4">
             <h3>库存明细台账</h3>
             <div class="row mb-3">
@@ -8126,7 +8115,7 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
             </div>
             <div>
                 <button onclick="searchStockFlow()" class="btn btn-primary">查询</button>
-                <button onclick="exportStockFlow()" class="btn btn-success ml-2">导出Excel</button>{admin_buttons}
+                <button onclick="exportStockFlow()" class="btn btn-success ml-2">导出Excel</button>
             </div>
         </div>
         <div class="card p-4 mt-4">
@@ -8138,10 +8127,10 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
         </div>
         <script>
             let stockFlowPage = 1, stockFlowPageSize = 200, stockFlowTotal = 0;
-            function sfEsc(s) {{
+            function sfEsc(s) {
                 return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            }}
-            async function searchStockFlow(page) {{
+            }
+            async function searchStockFlow(page) {
                 if (page === undefined) page = 1;
                 stockFlowPage = page;
                 const url = '/api/query/stock_flow?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
@@ -8152,64 +8141,37 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
                 const data = await res.json();
                 stockFlowTotal = data.total || 0;
                 const rows = [];
-                (data.items || []).forEach(item => {{
+                (data.items || []).forEach(item => {
                     // 备注统一规则：仅大单位（与基础单位不同）出入库时标注原始数量，如"原2.00件"；
-                    // 基础单位出入库（含冲销）备注一律留空
+                    // 基础单位出入库备注一律留空
                     let remark = '';
-                    if (item.orig_unit && item.orig_unit !== item.unit) {{
+                    if (item.orig_unit && item.orig_unit !== item.unit) {
                         remark = '原' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit);
-                    }}
+                    }
                     rows.push('<tr><td>' + sfEsc(item.create_time) + '</td><td>' + sfEsc(item.type) + '</td><td>' + sfEsc(item.product_name) + '</td><td>' + sfEsc(item.spec) + '</td><td>' + sfEsc(item.unit) + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + (item.balance || 0).toFixed(2) + '</td><td>' + remark + '</td></tr>');
-                }});
+                });
                 // 一次性写入，避免逐行 innerHTML 拼接导致页面卡死
                 document.getElementById('resultTable').innerHTML = rows.join('');
                 renderStockFlowPager();
-            }}
-            function renderStockFlowPager() {{
+            }
+            function renderStockFlowPager() {
                 const pages = Math.max(1, Math.ceil(stockFlowTotal / stockFlowPageSize));
                 let html = '共 ' + stockFlowTotal + ' 条，第 ' + stockFlowPage + ' / ' + pages + ' 页';
                 html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage <= 1 ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage - 1) + ')">上一页</button>';
                 html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage >= pages ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage + 1) + ')">下一页</button>';
                 document.getElementById('stockFlowPager').innerHTML = html;
-            }}
-            function exportStockFlow() {{
+            }
+            function exportStockFlow() {
                 // 导出当前查询条件命中的全部结果（不受分页限制）
                 const url = '/api/query/stock_flow/export?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
                     '&start_date=' + document.getElementById('startDate').value +
                     '&end_date=' + document.getElementById('endDate').value;
                 window.location.href = url;
-            }}
-            async function clearStockMovement() {{
-                if (!await priceConfirm('确定要清空库存台账吗？\n将删除全部流水记录，并把库存数量清零。\n此操作不可恢复！')) return;
-                if (!await priceConfirm('再次确认：清空后流水记录无法找回，确定继续？')) return;
-                try {{
-                    const res = await fetch('/api/stock_movement/clear');
-                    const text = await res.text();
-                    let msg = text;
-                    try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
-                    await priceAlert(msg, res.ok ? '清空完成' : '清空失败');
-                    if (res.ok) searchStockFlow(1);
-                }} catch (e) {{
-                    await priceAlert('请求失败：服务可能未运行，请检查程序后重试', '清空失败');
-                }}
-            }}
-            async function regenerateStockMovement() {{
-                if (!await priceConfirm('确定要重新生成库存台账吗？\n将清空现有流水，并按订单状态重新生成：\n已审核采购单 → 入库流水；已验收/已结算销售单 → 出库流水。\n库存余额将按流水重新计算。')) return;
-                if (!await priceConfirm('再次确认：现有流水记录将被全部替换，确定继续？')) return;
-                try {{
-                    const res = await fetch('/api/stock_movement/regenerate');
-                    const text = await res.text();
-                    let msg = text;
-                    try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
-                    await priceAlert(msg, res.ok ? '重新生成完成' : '重新生成失败');
-                    if (res.ok) searchStockFlow(1);
-                }} catch (e) {{
-                    await priceAlert('请求失败：服务可能未运行，请检查程序后重试', '重新生成失败');
-                }}
-            }}
-            searchStockFlow(1);
+            }
+            // 不默认加载数据，避免全表查询影响性能
+            document.getElementById('resultTable').innerHTML = '<tr><td colspan="9" class="text-center text-muted">请设置查询条件后点击"查询"</td></tr>';
         </script>
-    "#);
+    "#;
     Html(crate::layout_html("库存明细台账", "/query/stock_flow", &content))
 }
 
