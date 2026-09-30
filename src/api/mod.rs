@@ -4832,6 +4832,52 @@ pub(crate) async fn fifo_earliest_batch(product_id: i64) -> (Option<String>, Opt
     (None, None)
 }
 
+/// 按 product_unit.ratio 在服务端统一计算明细的基础单位数量，不依赖前端传入的 base_quantity。
+/// 入参每项：(product_id, unit, quantity, 前端传入 base_quantity)，返回同序的基础数量。
+/// - 命中辅助单位比例：quantity × ratio（保留 2 位小数）
+/// - 未命中（基础单位/无单位配置）：前端值 > 0 用前端值，否则用 quantity 兜底
+pub(crate) async fn compute_base_quantities(
+    items: &[(i64, String, f64, f64)],
+) -> Vec<f64> {
+    let mut unique_pids: Vec<i64> = items.iter().map(|x| x.0).filter(|id| *id > 0).collect();
+    unique_pids.sort_unstable();
+    unique_pids.dedup();
+
+    let mut ratio_map: std::collections::HashMap<(i64, String), f64> = std::collections::HashMap::new();
+    if !unique_pids.is_empty() {
+        let placeholders = unique_pids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT product_id, unit_name, ratio FROM product_unit WHERE product_id IN ({})",
+            placeholders
+        );
+        let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+        for pid in &unique_pids {
+            q = q.bind(pid);
+        }
+        if let Ok(rows) = q.fetch_all(crate::db::pool()).await {
+            for r in rows {
+                let pid: i64 = r.get("product_id");
+                let uname: String = r.get("unit_name");
+                let ratio: f64 = r.get("ratio");
+                ratio_map.insert((pid, uname), ratio);
+            }
+        }
+    }
+
+    items
+        .iter()
+        .map(|(pid, unit, qty, client_bq)| {
+            if let Some(ratio) = ratio_map.get(&(*pid, unit.clone())) {
+                (*qty * ratio * 100.0).round() / 100.0
+            } else if *client_bq > 0.0 {
+                *client_bq
+            } else {
+                *qty
+            }
+        })
+        .collect()
+}
+
 /// 审核订单时为每个明细写一条 stock_movement + 同步 inventory.quantity。
 /// - direction: "in"（采购入库）/"out"（销售出库），决定 base_quantity 符号
 /// - movement_type/ref_type: 例如 "purchase"/"purchase" 或 "sales"/"sales"
@@ -4864,6 +4910,14 @@ async fn write_stock_movements_for_audit(
         .bind(order_id)
         .fetch_all(&mut **tx)
         .await?;
+    // 业务归属日期取单据日期（定量），与实际审核时间分离
+    let order_table = if movement_type == "purchase" { "purchase_order" } else { "sales_order" };
+    let order_date: String = sqlx::query_scalar(AssertSqlSafe(
+        format!("SELECT order_date FROM {} WHERE id = ?", order_table)
+    ))
+    .bind(order_id)
+    .fetch_one(&mut **tx)
+    .await?;
     let sign: f64 = if direction == "in" { 1.0 } else { -1.0 };
     for (product_id, base_qty, orig_qty, unit) in items {
         if base_qty == 0.0 { continue; }
@@ -4886,13 +4940,14 @@ async fn write_stock_movements_for_audit(
         .execute(&mut **tx).await?;
         // 写流水
         let _ = sqlx::query(
-            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark)
-             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark, order_date)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(product_id).bind(direction).bind(movement_type)
         .bind(base_qty).bind(orig_qty).bind(&unit).bind(new_balance)
         .bind(ref_type).bind(order_id)
         .bind(format!("{}-{}", remark_prefix, action_label))
+        .bind(&order_date)
         .execute(&mut **tx).await?;
     }
     Ok(())
@@ -4926,6 +4981,14 @@ async fn write_stock_movements_for_unaudit(
         .bind(order_id)
         .fetch_all(&mut **tx)
         .await?;
+    // 冲销归属原单据日期：同月审核又反审核时净影响为 0
+    let order_table = if movement_type == "purchase" { "purchase_order" } else { "sales_order" };
+    let order_date: String = sqlx::query_scalar(AssertSqlSafe(
+        format!("SELECT order_date FROM {} WHERE id = ?", order_table)
+    ))
+    .bind(order_id)
+    .fetch_one(&mut **tx)
+    .await?;
     // 冲销方向：原 in → out，原 out → in
     let reversal_direction = if original_direction == "in" { "out" } else { "in" };
     let sign: f64 = if reversal_direction == "in" { 1.0 } else { -1.0 };
@@ -4947,13 +5010,14 @@ async fn write_stock_movements_for_unaudit(
         .bind(product_id).bind(new_balance)
         .execute(&mut **tx).await?;
         let _ = sqlx::query(
-            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark)
-             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark, order_date)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(product_id).bind(reversal_direction).bind(movement_type)
         .bind(base_qty).bind(orig_qty).bind(&unit).bind(new_balance)
         .bind(ref_type).bind(order_id)
         .bind(format!("{}-{}", remark_prefix, action_label))
+        .bind(&order_date)
         .execute(&mut **tx).await?;
     }
     Ok(())
@@ -5874,8 +5938,27 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
         );
 
         let order_id = req.id;
+        // 服务端按当前单位换算比例统一计算基础数量，不信任前端值
+        let base_inputs: Vec<(i64, String, f64, f64)> = req.items
+            .iter()
+            .map(|item| {
+                let quantity = if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
+                    item.pre_sale_quantity.unwrap()
+                } else {
+                    item.quantity
+                };
+                (
+                    item.product_id,
+                    item.unit.clone().unwrap_or_default(),
+                    quantity,
+                    item.base_quantity.unwrap_or(0.0),
+                )
+            })
+            .collect();
+        let base_qtys = compute_base_quantities(&base_inputs).await;
+
         let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-        for mut item in req.items {
+        for (idx, mut item) in req.items.into_iter().enumerate() {
             // 数量同步：保存时若销售数量为 0 而预售数量 > 0，
             // 用预售数量兜底，避免后续生成采购时数量为 0 的空明细
             if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
@@ -5891,7 +5974,7 @@ pub async fn api_sales_order_update(headers: axum::http::HeaderMap, Json(req): J
                 .bind(&item.unit)
                 .bind(item.unit_price)
                 .bind(item.quantity)
-                .bind(item.base_quantity.unwrap_or(0.0))
+                .bind(base_qtys[idx])
                 .bind(item.amount)
                 .bind(item.pre_sale_quantity.unwrap_or(0.0))
                 .bind(item.supplier_id)
@@ -8659,79 +8742,172 @@ pub async fn api_query_document_summary(axum::extract::Query(params): axum::extr
 pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
     let category_id = params.get("category_id").map(|s| s.as_str()).unwrap_or("");
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * page_size;
 
-    let where_sql = if category_id.is_empty() {
-        "WHERE p.name LIKE ?"
-    } else {
-        "WHERE p.name LIKE ? AND p.category_id = ?"
-    };
-
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM inventory i JOIN product p ON i.product_id = p.id {}",
-        where_sql
-    );
-    let data_sql = format!(
-        "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
-                p.name as product_name, p.spec, p.unit, p.base_price,
-                (i.quantity * p.base_price) as amount
-         FROM inventory i JOIN product p ON i.product_id = p.id
-         {} ORDER BY p.name LIMIT {} OFFSET {}",
-        where_sql, page_size, offset
-    );
-
+    // 日期非法直接报错，避免时间边界静默出错
+    if (!start_date.is_empty() && !crate::is_valid_date_str(start_date))
+        || (!end_date.is_empty() && !crate::is_valid_date_str(end_date))
+    {
+        return (StatusCode::BAD_REQUEST, "日期格式不正确，应为 YYYY-MM-DD".to_string());
+    }
+    let history = !start_date.is_empty() || !end_date.is_empty();
     let pattern = format!("%{}%", product_name);
+
+    let (count_sql, data_sql);
+    let start_bound;
+    let end_bound;
+    if history {
+        // 时间归属按单据日期（order_date 快照）：纯日期比较。
+        // 缺省下界 1970（期初=0），缺省上界 2999（期末=当前实时余额）
+        start_bound = if start_date.is_empty() {
+            "1970-01-01".to_string()
+        } else {
+            start_date.to_string()
+        };
+        end_bound = if end_date.is_empty() {
+            "2999-12-31".to_string()
+        } else {
+            end_date.to_string()
+        };
+        let cat_cond = if category_id.is_empty() {
+            String::new()
+        } else {
+            " AND p.category_id = ?".to_string()
+        };
+        // 历史时点余额 = 当前 inventory 余额 − 单据日期在时点之后的净流水（in 正 / out 负）；
+        // 冲销流水 direction 与原方向相反且归属同一单据日期，自动计入。相关子查询走 idx_sm_order_date 索引。
+        let inner = format!(
+            "SELECT i.product_id, p.name AS product_name, p.spec, p.unit, p.base_price,
+                    (i.quantity - COALESCE((SELECT SUM(CASE WHEN sm2.direction='in' THEN sm2.base_quantity ELSE -sm2.base_quantity END) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.order_date >= ?), 0)) AS opening_qty,
+                    COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='in' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_in,
+                    COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='out' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_out,
+                    (i.quantity - COALESCE((SELECT SUM(CASE WHEN sm2.direction='in' THEN sm2.base_quantity ELSE -sm2.base_quantity END) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.order_date > ?), 0)) AS closing_qty
+             FROM inventory i JOIN product p ON i.product_id=p.id
+             WHERE p.name LIKE ?{}",
+            cat_cond
+        );
+        // 过滤掉期初/期间入出/期末全为 0 的商品，减少噪音
+        let nonzero = "ABS(opening_qty)>0.001 OR ABS(period_in)>0.001 OR ABS(period_out)>0.001 OR ABS(closing_qty)>0.001";
+        count_sql = format!("SELECT COUNT(*) FROM ({}) t WHERE {}", inner, nonzero);
+        data_sql = format!(
+            "SELECT * FROM ({}) t WHERE {} ORDER BY product_name LIMIT ? OFFSET ?",
+            inner, nonzero
+        );
+    } else {
+        start_bound = String::new();
+        end_bound = String::new();
+        let where_sql = if category_id.is_empty() {
+            "WHERE p.name LIKE ?"
+        } else {
+            "WHERE p.name LIKE ? AND p.category_id = ?"
+        };
+        count_sql = format!(
+            "SELECT COUNT(*) FROM inventory i JOIN product p ON i.product_id = p.id {}",
+            where_sql
+        );
+        data_sql = format!(
+            "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
+                    p.name as product_name, p.spec, p.unit, p.base_price,
+                    (i.quantity * p.base_price) as amount
+             FROM inventory i JOIN product p ON i.product_id=p.id
+             {} ORDER BY p.name LIMIT ? OFFSET ?",
+            where_sql
+        );
+    }
+
+    // ? 绑定顺序（历史）：opening start、pin start/end、pout start/end、closing end、pattern、[cat]、limit、offset
     let (total, rows) = if category_id.is_empty() {
-        let total = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()))
-            .bind(&pattern)
-            .fetch_one(crate::db::pool())
-            .await
-            .unwrap_or(0);
-        let rows = sqlx::query(AssertSqlSafe(data_sql.as_str()))
-            .bind(&pattern)
-            .fetch_all(crate::db::pool())
-            .await
-            .unwrap_or_default();
+        let mut cq = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()));
+        let mut dq = sqlx::query(AssertSqlSafe(data_sql.as_str()));
+        if history {
+            cq = cq
+                .bind(&start_bound).bind(&start_bound).bind(&end_bound)
+                .bind(&start_bound).bind(&end_bound).bind(&end_bound)
+                .bind(&pattern);
+            dq = dq
+                .bind(&start_bound).bind(&start_bound).bind(&end_bound)
+                .bind(&start_bound).bind(&end_bound).bind(&end_bound)
+                .bind(&pattern).bind(page_size).bind(offset);
+        } else {
+            cq = cq.bind(&pattern);
+            dq = dq.bind(&pattern).bind(page_size).bind(offset);
+        }
+        let total = cq.fetch_one(crate::db::pool()).await.unwrap_or(0);
+        let rows = dq.fetch_all(crate::db::pool()).await.unwrap_or_default();
         (total, rows)
     } else {
-        let cat_id: i64 = category_id.parse().unwrap_or(0);
-        let total = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()))
-            .bind(&pattern)
-            .bind(cat_id)
-            .fetch_one(crate::db::pool())
-            .await
-            .unwrap_or(0);
-        let rows = sqlx::query(AssertSqlSafe(data_sql.as_str()))
-            .bind(&pattern)
-            .bind(cat_id)
-            .fetch_all(crate::db::pool())
-            .await
-            .unwrap_or_default();
+        let cat: i64 = category_id.parse().unwrap_or(0);
+        let mut cq = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()));
+        let mut dq = sqlx::query(AssertSqlSafe(data_sql.as_str()));
+        if history {
+            cq = cq
+                .bind(&start_bound).bind(&start_bound).bind(&end_bound)
+                .bind(&start_bound).bind(&end_bound).bind(&end_bound)
+                .bind(&pattern).bind(cat);
+            dq = dq
+                .bind(&start_bound).bind(&start_bound).bind(&end_bound)
+                .bind(&start_bound).bind(&end_bound).bind(&end_bound)
+                .bind(&pattern).bind(cat).bind(page_size).bind(offset);
+        } else {
+            cq = cq.bind(&pattern).bind(cat);
+            dq = dq.bind(&pattern).bind(cat).bind(page_size).bind(offset);
+        }
+        let total = cq.fetch_one(crate::db::pool()).await.unwrap_or(0);
+        let rows = dq.fetch_all(crate::db::pool()).await.unwrap_or_default();
         (total, rows)
     };
 
-    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
-        let qty = row.try_get::<f64, _>("quantity").unwrap_or(0.0);
-        let amt = row.try_get::<f64, _>("amount").unwrap_or(0.0);
-        serde_json::json!({
-            "product_id": row.get::<i64, _>("product_id"),
-            "product_name": row.get::<String, _>("product_name"),
-            "spec": row.get::<Option<String>, _>("spec"),
-            "unit": row.get::<Option<String>, _>("unit"),
-            "quantity": qty,
-            "amount": amt,
-            "min_stock": row.try_get::<f64, _>("min_stock").unwrap_or(0.0),
-            "max_stock": row.try_get::<f64, _>("max_stock").unwrap_or(0.0),
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let product_id = row.get::<i64, _>("product_id");
+            let product_name = row.get::<String, _>("product_name");
+            let spec = row.get::<Option<String>, _>("spec");
+            let unit = row.get::<Option<String>, _>("unit");
+            if history {
+                let opening = row.try_get::<f64, _>("opening_qty").unwrap_or(0.0);
+                let pin = row.try_get::<f64, _>("period_in").unwrap_or(0.0);
+                let pout = row.try_get::<f64, _>("period_out").unwrap_or(0.0);
+                let closing = row.try_get::<f64, _>("closing_qty").unwrap_or(0.0);
+                let base_price = row.try_get::<f64, _>("base_price").unwrap_or(0.0);
+                serde_json::json!({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "spec": spec,
+                    "unit": unit,
+                    "opening_qty": opening,
+                    "period_in": pin,
+                    "period_out": pout,
+                    "closing_qty": closing,
+                    "amount": closing * base_price,
+                })
+            } else {
+                let qty = row.try_get::<f64, _>("quantity").unwrap_or(0.0);
+                let amt = row.try_get::<f64, _>("amount").unwrap_or(0.0);
+                serde_json::json!({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "spec": spec,
+                    "unit": unit,
+                    "quantity": qty,
+                    "amount": amt,
+                    "min_stock": row.try_get::<f64, _>("min_stock").unwrap_or(0.0),
+                    "max_stock": row.try_get::<f64, _>("max_stock").unwrap_or(0.0),
+                })
+            }
         })
-    }).collect();
+        .collect();
 
     let result = serde_json::json!({
         "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
+        "mode": if history { "history" } else { "realtime" },
     });
 
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
@@ -8746,7 +8922,7 @@ fn stock_flow_base_sql(where_clause: &str) -> String {
     // 直接从 stock_movement 表读取：balance_after 已在写入时算好快照，
     // 无需窗口函数反算；movement_type + direction 组合判断正/冲销。
     format!(
-        "SELECT sm.created_at AS create_time,
+        "SELECT sm.order_date AS create_time,
                 CASE
                     WHEN sm.movement_type='purchase' AND sm.direction='in'  THEN '采购入库'
                     WHEN sm.movement_type='purchase' AND sm.direction='out' THEN '采购入库冲销'
@@ -8785,7 +8961,7 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
     let pattern = format!("%{}%", product_name);
 
     // 直接从 stock_movement 读取：单一 where 子句即可（不再分别拼采购/销售）
-    // 日期比较用 DATE() 抹平 created_at（旧数据是 'YYYY-MM-DD'，新数据是 'YYYY-MM-DD HH:MM:SS'）
+    // 时间归属按单据日期（order_date 为 'YYYY-MM-DD' 纯日期，直接比较）
     let mut where_clause = String::from("WHERE 1=1");
     if let Some(pid) = product_id {
         where_clause.push_str(&format!(" AND sm.product_id = {}", pid));
@@ -8793,10 +8969,10 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
         where_clause.push_str(" AND p.name LIKE ?");
     }
     if !start_date.is_empty() {
-        where_clause.push_str(&format!(" AND DATE(sm.created_at) >= '{}'", start_date));
+        where_clause.push_str(&format!(" AND sm.order_date >= '{}'", start_date));
     }
     if !end_date.is_empty() {
-        where_clause.push_str(&format!(" AND DATE(sm.created_at) <= '{}'", end_date));
+        where_clause.push_str(&format!(" AND sm.order_date <= '{}'", end_date));
     }
 
     // 总条数：直接 COUNT stock_movement
@@ -9589,23 +9765,139 @@ pub async fn api_query_overview_export(axum::extract::Query(params): axum::extra
 }
 
 pub async fn api_query_stock_balance_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let category_id=params.get("category_id").map(|s|s.as_str()).unwrap_or("");
-    let sql=if category_id.is_empty(){"SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? ORDER BY p.name, p.id".to_string()}
-    else{format!("SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? AND p.category_id={} ORDER BY p.name, p.id",category_id)};
-    let pattern=format!("%{}%",product_name);
-    let rows=if category_id.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{let cid:i64=category_id.parse().unwrap_or(0);sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).bind(cid).fetch_all(crate::db::pool()).await.unwrap_or_default()};
-    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存余额").unwrap();let hf=xlsx_header_format(0x2E75B6);
-    for(c,h)in["商品名称","规格","单位","库存数量","库存金额","最低库存","最高库存"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
-    ws.set_column_width(0,20).unwrap();ws.set_column_width(1,14).unwrap();ws.set_column_width(2,10).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,14).unwrap();ws.set_column_width(5,14).unwrap();ws.set_column_width(6,14).unwrap();
-    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("product_name")).unwrap();ws.write(r,1,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,2,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,3,row.try_get::<f64,_>("quantity").unwrap_or(0.0)).unwrap();ws.write(r,4,row.try_get::<f64,_>("amount").unwrap_or(0.0)).unwrap();ws.write(r,5,row.try_get::<f64,_>("min_stock").unwrap_or(0.0)).unwrap();ws.write(r,6,row.try_get::<f64,_>("max_stock").unwrap_or(0.0)).unwrap();}
-    xlsx_response(workbook.save_to_buffer().unwrap(), "库存余额查询.xlsx")
+    let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or("");
+    let category_id = params.get("category_id").map(|s| s.as_str()).unwrap_or("");
+    let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
+    let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
+    if (!start_date.is_empty() && !crate::is_valid_date_str(start_date))
+        || (!end_date.is_empty() && !crate::is_valid_date_str(end_date))
+    {
+        return (StatusCode::BAD_REQUEST, "日期格式不正确，应为 YYYY-MM-DD").into_response();
+    }
+    let history = !start_date.is_empty() || !end_date.is_empty();
+    let pattern = format!("%{}%", product_name);
+
+    let sql;
+    let start_bound;
+    let end_bound;
+    if history {
+        start_bound = if start_date.is_empty() {
+            "1970-01-01".to_string()
+        } else {
+            start_date.to_string()
+        };
+        end_bound = if end_date.is_empty() {
+            "2999-12-31".to_string()
+        } else {
+            end_date.to_string()
+        };
+        let cat_cond = if category_id.is_empty() {
+            String::new()
+        } else {
+            " AND p.category_id = ?".to_string()
+        };
+        // 与查询 API 同口径：时间归属按单据日期（order_date 快照）
+        let inner = format!(
+            "SELECT i.product_id, p.name AS product_name, p.spec, p.unit, p.base_price,
+                    (i.quantity - COALESCE((SELECT SUM(CASE WHEN sm2.direction='in' THEN sm2.base_quantity ELSE -sm2.base_quantity END) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.order_date >= ?), 0)) AS opening_qty,
+                    COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='in' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_in,
+                    COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='out' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_out,
+                    (i.quantity - COALESCE((SELECT SUM(CASE WHEN sm2.direction='in' THEN sm2.base_quantity ELSE -sm2.base_quantity END) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.order_date > ?), 0)) AS closing_qty
+             FROM inventory i JOIN product p ON i.product_id=p.id
+             WHERE p.name LIKE ?{}",
+            cat_cond
+        );
+        let nonzero = "ABS(opening_qty)>0.001 OR ABS(period_in)>0.001 OR ABS(period_out)>0.001 OR ABS(closing_qty)>0.001";
+        sql = format!("SELECT * FROM ({}) t WHERE {} ORDER BY product_name", inner, nonzero);
+    } else {
+        start_bound = String::new();
+        end_bound = String::new();
+        sql = if category_id.is_empty() {
+            "SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? ORDER BY p.name, p.id".to_string()
+        } else {
+            format!("SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? AND p.category_id={} ORDER BY p.name, p.id", category_id)
+        };
+    }
+
+    let rows = if category_id.is_empty() {
+        let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+        if history {
+            q = q
+                .bind(&start_bound).bind(&start_bound).bind(&end_bound)
+                .bind(&start_bound).bind(&end_bound).bind(&end_bound)
+                .bind(&pattern);
+        } else {
+            q = q.bind(&pattern);
+        }
+        q.fetch_all(crate::db::pool()).await.unwrap_or_default()
+    } else {
+        let cid: i64 = category_id.parse().unwrap_or(0);
+        let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
+        if history {
+            q = q
+                .bind(&start_bound).bind(&start_bound).bind(&end_bound)
+                .bind(&start_bound).bind(&end_bound).bind(&end_bound)
+                .bind(&pattern).bind(cid);
+        } else {
+            q = q.bind(&pattern).bind(cid);
+        }
+        q.fetch_all(crate::db::pool()).await.unwrap_or_default()
+    };
+
+    let mut workbook = Workbook::new();
+    let ws = workbook.add_worksheet();
+    let hf = xlsx_header_format(0x2E75B6);
+    let (sheet_name, file_name, headers, widths): (&str, &str, &[&str], &[u32]) = if history {
+        (
+            "收发存",
+            "库存收发存查询.xlsx",
+            &["商品名称", "规格", "单位", "期初数量", "本期入库", "本期出库", "期末数量", "期末金额"],
+            &[20, 14, 10, 12, 12, 12, 12, 14],
+        )
+    } else {
+        (
+            "库存余额",
+            "库存余额查询.xlsx",
+            &["商品名称", "规格", "单位", "库存数量", "库存金额", "最低库存", "最高库存"],
+            &[20, 14, 10, 14, 14, 14, 14],
+        )
+    };
+    ws.set_name(sheet_name).unwrap();
+    for (c, h) in headers.iter().enumerate() {
+        ws.write_with_format(0, c as u16, *h, &hf).unwrap();
+        ws.set_column_width(c as u16, widths[c]).unwrap();
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let r = (i + 1) as u32;
+        ws.write(r, 0, row.get::<String, _>("product_name")).unwrap();
+        ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap();
+        ws.write(r, 2, row.get::<Option<String>, _>("unit").unwrap_or_default()).unwrap();
+        if history {
+            let opening = row.try_get::<f64, _>("opening_qty").unwrap_or(0.0);
+            let pin = row.try_get::<f64, _>("period_in").unwrap_or(0.0);
+            let pout = row.try_get::<f64, _>("period_out").unwrap_or(0.0);
+            let closing = row.try_get::<f64, _>("closing_qty").unwrap_or(0.0);
+            let base_price = row.try_get::<f64, _>("base_price").unwrap_or(0.0);
+            ws.write(r, 3, opening).unwrap();
+            ws.write(r, 4, pin).unwrap();
+            ws.write(r, 5, pout).unwrap();
+            ws.write(r, 6, closing).unwrap();
+            ws.write(r, 7, closing * base_price).unwrap();
+        } else {
+            ws.write(r, 3, row.try_get::<f64, _>("quantity").unwrap_or(0.0)).unwrap();
+            ws.write(r, 4, row.try_get::<f64, _>("amount").unwrap_or(0.0)).unwrap();
+            ws.write(r, 5, row.try_get::<f64, _>("min_stock").unwrap_or(0.0)).unwrap();
+            ws.write(r, 6, row.try_get::<f64, _>("max_stock").unwrap_or(0.0)).unwrap();
+        }
+    }
+    xlsx_response(workbook.save_to_buffer().unwrap(), file_name)
 }
 
 pub async fn api_query_stock_flow_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");let product_id=params.get("product_id").and_then(|s|s.parse::<i64>().ok());
     let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");
     if let Some(pid)=product_id{wc.push_str(&format!(" AND sm.product_id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");}
-    if!start_date.is_empty(){wc.push_str(&format!(" AND DATE(sm.created_at)>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND DATE(sm.created_at)<='{}'",end_date));}
+    if!start_date.is_empty(){wc.push_str(&format!(" AND sm.order_date>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND sm.order_date<='{}'",end_date));}
     // 与台账查询同一口径：直接读 stock_movement，balance_after 已是快照
     let sql=format!("SELECT create_time,type,product_name,spec,unit,in_quantity,out_quantity,remark,orig_quantity,orig_unit,balance FROM ({}) ORDER BY product_name,create_time,src,sid",stock_flow_base_sql(&wc));
     let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()};
@@ -9974,8 +10266,27 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
                     placeholders.join(", ")
                 );
                 
+                // 服务端按当前单位换算比例统一计算基础数量，不信任前端值
+                let base_inputs: Vec<(i64, String, f64, f64)> = req.items
+                    .iter()
+                    .map(|item| {
+                        let quantity = if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
+                            item.pre_sale_quantity.unwrap()
+                        } else {
+                            item.quantity
+                        };
+                        (
+                            item.product_id,
+                            item.unit.clone().unwrap_or_default(),
+                            quantity,
+                            item.base_quantity.unwrap_or(0.0),
+                        )
+                    })
+                    .collect();
+                let base_qtys = compute_base_quantities(&base_inputs).await;
+
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in &req.items {
+                for (idx, item) in req.items.iter().enumerate() {
                     // 数量同步：保存时若销售数量为 0 而预售数量 > 0，
                     // 用预售数量兜底，避免后续生成采购时数量为 0 的空明细
                     let quantity = if item.quantity <= 0.0 && item.pre_sale_quantity.unwrap_or(0.0) > 0.0 {
@@ -9993,7 +10304,7 @@ pub async fn api_sales_order_create(headers: axum::http::HeaderMap, Json(req): J
                         .bind(&item.unit)
                         .bind(item.unit_price)
                         .bind(quantity)
-                        .bind(item.base_quantity.unwrap_or(0.0))
+                        .bind(base_qtys[idx])
                         .bind(item.amount)
                         .bind(item.pre_sale_quantity.unwrap_or(0.0))
                         .bind(item.supplier_id)

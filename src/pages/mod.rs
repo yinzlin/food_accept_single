@@ -4770,6 +4770,13 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     }} catch (e) {{
                         itemData.units = [];
                     }}
+                    // 补 ratio：编辑已有订单改数量时，base_quantity 须按当前单位比例重算（保存时后端也会统一重算）
+                    if (itemData.unit && itemData.unit !== itemData.base_unit) {{
+                        const mu = itemData.units.find(x => x.name === itemData.unit);
+                        itemData.ratio = mu && mu.ratio > 0 ? mu.ratio : 1;
+                    }} else {{
+                        itemData.ratio = 1;
+                    }}
                 }}
                 renderItems();
                 loadOrders();
@@ -5588,29 +5595,38 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
         <div class="card p-4">
             <h3>实时库存余额查询</h3>
             <div class="row mb-3">
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label>商品名称：</label>
                     <input type="text" id="productName" class="form-control" placeholder="输入商品名称搜索">
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label>分类：</label>
                     <select id="categoryId" class="form-control">
                         <option value="">全部分类</option>
                     </select>
                 </div>
+                <div class="col-md-3">
+                    <label>开始日期：</label>
+                    <input type="date" id="startDate" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>截止日期：</label>
+                    <input type="date" id="endDate" class="form-control">
+                </div>
             </div>
             <button onclick="searchStock()" class="btn btn-primary">查询</button>
             <button onclick="exportStock()" class="btn btn-success ml-2">导出Excel</button>
+            <div class="mt-2 text-muted small">不填日期：查询当前实时库存余额；填写起止日期：按单据日期查询该时间段的收发存（期初数量、本期入库、本期出库、期末数量），与实际审核/验收时间无关。进入页面不自动加载，请点击"查询"。</div>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>商品名称</th><th>规格</th><th>单位</th><th>库存数量</th><th>库存金额</th><th>操作</th></tr></thead>
+                <thead id="resultHead"></thead>
                 <tbody id="resultTable"></tbody>
             </table>
             <div id="stockBalPager" class="mt-2 text-muted"></div>
         </div>
         <script>
-            let balPage = 1, balPageSize = 20, balTotal = 0;
+            let balPage = 1, balPageSize = 20, balTotal = 0, balMode = '';
             async function loadCategories() {
                 const res = await fetch('/api/category/list');
                 const categories = await res.json();
@@ -5619,19 +5635,59 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
                     select.innerHTML += '<option value="' + c.id + '">' + c.name + '</option>';
                 });
             }
+            function getDates() {
+                return {
+                    start: document.getElementById('startDate').value,
+                    end: document.getElementById('endDate').value
+                };
+            }
+            function validateDates() {
+                const d = getDates();
+                if ((d.start && !d.end) || (!d.start && d.end)) {
+                    alert('开始日期和截止日期需同时填写，或都不填');
+                    return false;
+                }
+                if (d.start && d.end && d.start > d.end) {
+                    alert('开始日期不能晚于截止日期');
+                    return false;
+                }
+                return true;
+            }
+            function renderHead() {
+                const head = document.getElementById('resultHead');
+                if (balMode === 'history') {
+                    head.innerHTML = '<tr><th>商品名称</th><th>规格</th><th>单位</th><th>期初数量</th><th>本期入库</th><th>本期出库</th><th>期末数量</th><th>期末金额</th><th>操作</th></tr>';
+                } else {
+                    head.innerHTML = '<tr><th>商品名称</th><th>规格</th><th>单位</th><th>库存数量</th><th>库存金额</th><th>操作</th></tr>';
+                }
+            }
             async function searchStock(page) {
                 if (page === undefined) page = 1;
+                if (!validateDates()) return;
                 balPage = page;
+                const d = getDates();
                 const url = '/api/query/stock_balance?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
                     '&category_id=' + document.getElementById('categoryId').value +
+                    (d.start ? '&start_date=' + d.start + '&end_date=' + d.end : '') +
                     '&page=' + balPage + '&page_size=' + balPageSize;
                 const res = await fetch(url);
                 const data = await res.json();
                 balTotal = data.total || 0;
+                balMode = data.mode || '';
+                renderHead();
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
-                (data.items || []).forEach(item => {
-                    tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '') + '</td><td>' + (item.unit || '') + '</td><td>' + item.quantity.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td><td><button onclick="viewFlow(' + item.product_id + ')" class="btn btn-info btn-sm">查看流水</button></td></tr>';
+                const items = data.items || [];
+                if (items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">没有符合条件的记录</td></tr>';
+                }
+                items.forEach(item => {
+                    const btn = '<td><button onclick="viewFlow(' + item.product_id + ')" class="btn btn-info btn-sm">查看流水</button></td>';
+                    if (balMode === 'history') {
+                        tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '') + '</td><td>' + (item.unit || '') + '</td><td>' + item.opening_qty.toFixed(2) + '</td><td>' + item.period_in.toFixed(2) + '</td><td>' + item.period_out.toFixed(2) + '</td><td>' + item.closing_qty.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td>' + btn + '</tr>';
+                    } else {
+                        tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '') + '</td><td>' + (item.unit || '') + '</td><td>' + item.quantity.toFixed(2) + '</td><td>' + item.amount.toFixed(2) + '</td>' + btn + '</td></tr>';
+                    }
                 });
                 renderBalPager();
             }
@@ -5644,8 +5700,11 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
             }
             function exportStock() {
                 // 导出当前查询条件命中的全部结果（不受分页限制）
+                if (!validateDates()) return;
+                const d = getDates();
                 const url = '/api/query/stock_balance/export?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
-                    '&category_id=' + document.getElementById('categoryId').value;
+                    '&category_id=' + document.getElementById('categoryId').value +
+                    (d.start ? '&start_date=' + d.start + '&end_date=' + d.end : '');
                 window.location.href = url;
             }
             async function viewFlow(productId) {
@@ -5666,7 +5725,8 @@ pub async fn page_query_stock_balance(headers: axum::http::HeaderMap) -> Html<St
                 await priceAlert(detail, '库存流水');
             }
             loadCategories();
-            searchStock();
+            // 不默认加载数据，避免全表查询影响性能
+            document.getElementById('resultTable').innerHTML = '<tr><td colspan="9" class="text-center text-muted">请设置查询条件后点击"查询"</td></tr>';
         </script>
     "#;
     Html(crate::layout_html("实时库存余额查询", "/query/stock_balance", &content))
@@ -8093,10 +8153,11 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
                 stockFlowTotal = data.total || 0;
                 const rows = [];
                 (data.items || []).forEach(item => {{
-                    // 原始下单单位与基础单位不一致且备注未包含该单位时，在备注中标注原始数量，方便与订单对账
-                    let remark = sfEsc(item.remark);
-                    if (item.orig_unit && item.orig_unit !== item.unit && remark.indexOf(sfEsc(item.orig_unit)) === -1) {{
-                        remark = (remark ? remark + ' ' : '') + '（原 ' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit) + '）';
+                    // 备注统一规则：仅大单位（与基础单位不同）出入库时标注原始数量，如"原2.00件"；
+                    // 基础单位出入库（含冲销）备注一律留空
+                    let remark = '';
+                    if (item.orig_unit && item.orig_unit !== item.unit) {{
+                        remark = '原' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit);
                     }}
                     rows.push('<tr><td>' + sfEsc(item.create_time) + '</td><td>' + sfEsc(item.type) + '</td><td>' + sfEsc(item.product_name) + '</td><td>' + sfEsc(item.spec) + '</td><td>' + sfEsc(item.unit) + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + (item.balance || 0).toFixed(2) + '</td><td>' + remark + '</td></tr>');
                 }});

@@ -48,7 +48,7 @@ pub const STOCK_MOVEMENT_REPLAY_SQL: &str = r#"
                 INSERT INTO stock_movement (
                     product_id, warehouse_id, direction, movement_type,
                     base_quantity, orig_quantity, orig_unit, balance_after,
-                    ref_type, ref_id, remark, created_at
+                    ref_type, ref_id, remark, order_date, created_at
                 )
                 SELECT
                     am.product_id,
@@ -66,6 +66,7 @@ pub const STOCK_MOVEMENT_REPLAY_SQL: &str = r#"
                     am.order_id AS ref_id,
                     CASE WHEN am.direction='in' THEN '历史补录-采购入库'
                          ELSE '历史补录-销售出库' END AS remark,
+                    am.order_date AS order_date,
                     am.order_date AS created_at
                 FROM all_movements am
                 ORDER BY am.order_date, am.order_id, am.item_seq
@@ -597,6 +598,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             ref_type TEXT,
             ref_id INTEGER,
             remark TEXT,
+            order_date TEXT,
             created_at DATETIME DEFAULT (datetime('now','localtime')),
             FOREIGN KEY(product_id) REFERENCES product(id),
             FOREIGN KEY(warehouse_id) REFERENCES warehouse(id)
@@ -610,6 +612,7 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_ref ON stock_movement(ref_type, ref_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_type ON stock_movement(movement_type, created_at)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_warehouse ON stock_movement(warehouse_id, product_id, created_at)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_order_date ON stock_movement(product_id, order_date)").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -1473,6 +1476,23 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             let _ = sqlx::query(AssertSqlSafe(sql)).execute(pool).await;
         }
         let _ = sqlx::query("PRAGMA user_version = 11").execute(pool).await;
+    }
+
+    // v12：stock_movement 增加 order_date（单据业务日期）快照列。
+    // 时间归属口径：收发存统计按单据日期（定量），而非审核/验收的实际操作时间（可能延后 N 天）。
+    // 冲销流水同样归属原单据日期，保证同月审核又反审核时净影响为 0。
+    if version < 12 {
+        let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN order_date TEXT").execute(pool).await;
+        // 按 movement_type 从对应订单表回填；找不到订单（历史补录等极端情况）时退回 DATE(created_at)
+        let _ = sqlx::query(
+            "UPDATE stock_movement SET order_date = COALESCE(
+                CASE WHEN movement_type='purchase' THEN (SELECT order_date FROM purchase_order WHERE id=stock_movement.ref_id) END,
+                CASE WHEN movement_type='sales' THEN (SELECT order_date FROM sales_order WHERE id=stock_movement.ref_id) END,
+                DATE(created_at))
+             WHERE order_date IS NULL"
+        ).execute(pool).await;
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_order_date ON stock_movement(product_id, order_date)").execute(pool).await;
+        let _ = sqlx::query("PRAGMA user_version = 12").execute(pool).await;
     }
 
     Ok(())
