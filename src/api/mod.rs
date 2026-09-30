@@ -8913,10 +8913,12 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
     (StatusCode::OK, serde_json::to_string(&result).unwrap())
 }
 
-/// 库存流水基础查询：采购入库 + 销售出库 UNION ALL。
-/// 数量统一换算为基础单位口径（优先 base_quantity，旧数据为 0 时回退 quantity），
-/// 余额按商品分区累计（PARTITION BY product_id），单位显示商品基础单位。
+/// 库存流水基础查询：按订单最终状态聚合成组（同一订单同一商品的审核/反审核流水相互抵消）。
+/// 数量统一换算为基础单位口径，单位显示商品基础单位。
 /// src/sid 作为稳定排序键：0=采购、1=销售，同日内先入后出。
+/// 余额列此处固定返回 0.0 占位：balance_after 快照是物理写入时刻的库存值，
+/// 反审核/再审核后无法对应单据日期顺序下的逻辑余额，故余额由调用方在应用层
+/// 按 (商品, order_date, src, sid) 顺序用净额累计计算。
 /// 返回的 SQL 不含外层 ORDER BY / LIMIT，由调用方追加。
 fn stock_flow_base_sql(where_clause: &str) -> String {
     // 按订单最终状态聚合：同一订单同一商品的审核/反审核流水相互抵消，
@@ -8942,10 +8944,7 @@ fn stock_flow_base_sql(where_clause: &str) -> String {
                    MAX(sm.orig_unit) AS orig_unit,
                    CASE WHEN sm.movement_type='purchase' THEN 0 ELSE 1 END AS src,
                    MAX(sm.id) AS sid,
-                   (SELECT sm2.balance_after FROM stock_movement sm2
-                     WHERE sm2.ref_type=sm.ref_type AND sm2.ref_id=sm.ref_id AND sm2.product_id=sm.product_id
-                       AND sm2.direction=(CASE WHEN sm.movement_type='purchase' THEN 'in' ELSE 'out' END)
-                     ORDER BY sm2.id DESC LIMIT 1) AS balance
+                   0.0 AS balance
             FROM stock_movement sm
             JOIN product p ON sm.product_id = p.id
             {}
@@ -8954,6 +8953,46 @@ fn stock_flow_base_sql(where_clause: &str) -> String {
         WHERE t.in_quantity > 0.001 OR t.out_quantity > 0.001",
         where_clause
     )
+}
+
+/// 台账余额累计：rows 必须已按时间线（create_time, src, sid）排序。
+/// 基准日期取 start_date（为空则取首行日期），先查各商品在基准日期之前的流水净额作期初，
+/// 再逐行按 product_id 分别累计结存（同一行序下各商品独立余额，与手工分户账一致）。
+/// 返回与 rows 等长、按行序对应的余额数组。
+async fn compute_running_balances(rows: &[sqlx::sqlite::SqliteRow], start_date: &str) -> Vec<f64> {
+    use sqlx::Row;
+    let Some(first) = rows.first() else { return Vec::new(); };
+    let first_date: String = first.get("create_time");
+    let base_date = if start_date.is_empty() { first_date.as_str() } else { start_date };
+
+    let mut pids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("product_id")).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    let pid_list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    // 期初库存必须与 stock_flow_base_sql 同一聚合口径（按订单分组抵消反审核），
+    // 否则反审核冲销记录会被重复计入，导致期初余额错误。
+    let opening_where = format!(
+        "WHERE sm.product_id IN ({}) AND sm.order_date < '{}'",
+        pid_list, base_date
+    );
+    let opening_sql = format!(
+        "SELECT product_id, SUM(in_quantity - out_quantity) AS net FROM ({}) GROUP BY product_id",
+        stock_flow_base_sql(&opening_where)
+    );
+    let opening_rows = sqlx::query(AssertSqlSafe(opening_sql.as_str()))
+        .fetch_all(crate::db::pool()).await.unwrap_or_default();
+    let mut acc: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for r in &opening_rows {
+        acc.insert(r.get::<i64, _>("product_id"), r.get::<f64, _>("net"));
+    }
+    rows.iter().map(|row| {
+        let pid = row.get::<i64, _>("product_id");
+        let net = row.try_get::<f64, _>("in_quantity").unwrap_or(0.0)
+            - row.try_get::<f64, _>("out_quantity").unwrap_or(0.0);
+        let b = acc.get(&pid).copied().unwrap_or(0.0) + net;
+        acc.insert(pid, b);
+        b
+    }).collect()
 }
 
 pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
@@ -8985,12 +9024,16 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
     // 总条数：按订单最终状态聚合后的行数（与 data_sql 同口径）
     let count_sql = format!("SELECT COUNT(*) FROM ({})", stock_flow_base_sql(&where_clause));
 
-    // 分页查询：balance_after 已写入快照，外层直接 ORDER BY 取当前页
+    // 分页查询：余额需从第 0 行开始累计才正确，故一次取到当前页末尾（LIMIT offset+page_size），
+    // 应用层累计后再切出当前页；深度分页成本随页码线性增长，可接受
+    let fetch_limit = offset + page_size;
+    // 与手工台账口径一致：按时间线（单据日期 → 先入后出 → 流水号）排序，
+    // 余额为各商品自身在该时间线下的逐笔结存
     let data_sql = format!(
-        "SELECT create_time, type, product_name, spec, unit, in_quantity, out_quantity, remark, orig_quantity, orig_unit, balance
+        "SELECT create_time, type, product_id, product_name, spec, unit, in_quantity, out_quantity, remark, orig_quantity, orig_unit
          FROM ({})
-         ORDER BY product_name, create_time, src, sid LIMIT {} OFFSET {}",
-        stock_flow_base_sql(&where_clause), page_size, offset
+         ORDER BY create_time, src, sid LIMIT {}",
+        stock_flow_base_sql(&where_clause), fetch_limit
     );
 
     let needs_bind = product_id.is_none() && !product_name.is_empty();
@@ -9003,7 +9046,12 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
     let total = count_q.fetch_one(crate::db::pool()).await.unwrap_or(0);
     let rows = data_q.fetch_all(crate::db::pool()).await.unwrap_or_default();
 
-    let items: Vec<serde_json::Value> = rows.iter().map(|row| {
+    // 期初净额：涉及商品在基准日期（start_date，无则为首行日期）之前的聚合净额作期初，
+    // 再按时间线顺序逐行累计（按 product_id 分别结存），保证余额与显示顺序自洽
+    let balances = compute_running_balances(&rows, start_date).await;
+
+    let skip = offset as usize;
+    let items: Vec<serde_json::Value> = rows.iter().enumerate().skip(skip).map(|(i, row)| {
         let in_qty = row.try_get::<f64, _>("in_quantity").unwrap_or(0.0);
         let out_qty = row.try_get::<f64, _>("out_quantity").unwrap_or(0.0);
         serde_json::json!({
@@ -9015,7 +9063,7 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
             "in_quantity": in_qty,
             "out_quantity": out_qty,
             "remark": row.get::<Option<String>, _>("remark"),
-            "balance": row.try_get::<f64, _>("balance").unwrap_or(0.0),
+            "balance": balances.get(i).copied().unwrap_or(0.0),
             "orig_quantity": row.try_get::<f64, _>("orig_quantity").unwrap_or(0.0),
             "orig_unit": row.get::<Option<String>, _>("orig_unit"),
         })
@@ -9784,13 +9832,14 @@ pub async fn api_query_stock_flow_export(axum::extract::Query(params): axum::ext
     let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");
     if let Some(pid)=product_id{wc.push_str(&format!(" AND sm.product_id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");}
     if!start_date.is_empty(){wc.push_str(&format!(" AND sm.order_date>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND sm.order_date<='{}'",end_date));}
-    // 与台账查询同一口径：直接读 stock_movement，balance_after 已是快照
-    let sql=format!("SELECT create_time,type,product_name,spec,unit,in_quantity,out_quantity,remark,orig_quantity,orig_unit,balance FROM ({}) ORDER BY product_name,create_time,src,sid",stock_flow_base_sql(&wc));
+    // 与台账查询同一口径：时间线排序 + 应用层累计余额（与 api_query_stock_flow 一致）
+    let sql=format!("SELECT create_time,type,product_id,product_name,spec,unit,in_quantity,out_quantity,remark,orig_quantity,orig_unit FROM ({}) ORDER BY create_time,src,sid",stock_flow_base_sql(&wc));
     let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()};
+    let balances=compute_running_balances(&rows,start_date).await;
     let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
     for(c,h)in["日期","类型","商品名称","规格","单位","入库数量","出库数量","余额","原始数量","原始单位","备注"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
     ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,10).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,12).unwrap();ws.set_column_width(7,12).unwrap();ws.set_column_width(8,12).unwrap();ws.set_column_width(9,10).unwrap();ws.set_column_width(10,20).unwrap();
-    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("create_time")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,4,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,5,row.try_get::<f64,_>("in_quantity").unwrap_or(0.0)).unwrap();ws.write(r,6,row.try_get::<f64,_>("out_quantity").unwrap_or(0.0)).unwrap();ws.write(r,7,row.try_get::<f64,_>("balance").unwrap_or(0.0)).unwrap();ws.write(r,8,row.try_get::<f64,_>("orig_quantity").unwrap_or(0.0)).unwrap();ws.write(r,9,row.get::<Option<String>,_>("orig_unit").unwrap_or_default()).unwrap();ws.write(r,10,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();}
+    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("create_time")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,4,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,5,row.try_get::<f64,_>("in_quantity").unwrap_or(0.0)).unwrap();ws.write(r,6,row.try_get::<f64,_>("out_quantity").unwrap_or(0.0)).unwrap();ws.write(r,7,balances.get(i).copied().unwrap_or(0.0)).unwrap();ws.write(r,8,row.try_get::<f64,_>("orig_quantity").unwrap_or(0.0)).unwrap();ws.write(r,9,row.get::<Option<String>,_>("orig_unit").unwrap_or_default()).unwrap();ws.write(r,10,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();}
     xlsx_response(workbook.save_to_buffer().unwrap(), "库存流水查询.xlsx")
 }
 
