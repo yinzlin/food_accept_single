@@ -12092,8 +12092,8 @@ pub async fn api_sales_order_sort_items_by_supplier(axum::extract::Query(params)
         "WHERE so.status IN ('pending', 'sorting')"
     };
     let sql = format!(
-        "SELECT soi.id as item_id, soi.order_id, soi.product_id, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
-                soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, p.id as purchaser_id, so.order_no,
+        "SELECT soi.id as item_id, soi.order_id, soi.product_id, soi.product_name, soi.unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+                COALESCE(soi.supplier_id, 0) as supplier_id, s.name as supplier_name, p.name as purchaser_name, p.id as purchaser_id, so.order_no,
                 COALESCE(pr.purchase_price, 0.0) as purchase_price
          FROM sales_order_item soi 
          LEFT JOIN sales_order so ON soi.order_id = so.id
@@ -12181,7 +12181,7 @@ pub async fn api_sales_order_sort_items_by_supplier_excel(axum::extract::Query(p
     };
     let sql = format!(
         "SELECT soi.product_id, soi.product_name, soi.spec, soi.unit, soi.quantity, soi.pre_sale_quantity, soi.amount, soi.remark,
-                soi.supplier_id, s.name as supplier_name, p.name as purchaser_name, p.id as purchaser_id, so.order_no,
+                COALESCE(soi.supplier_id, 0) as supplier_id, s.name as supplier_name, p.name as purchaser_name, p.id as purchaser_id, so.order_no,
                 COALESCE(pr.purchase_price, 0.0) as purchase_price
          FROM sales_order_item soi
          LEFT JOIN sales_order so ON soi.order_id = so.id

@@ -8095,7 +8095,7 @@ pub async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
     Html(crate::layout_html("订单调整与同屏比对", "/query/order_adjust", &content))
 }
 
-pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<String> {
+pub async fn page_query_stock_flow() -> Html<String> {
     let content = r#"
         <div class="card p-4">
             <h3>库存明细台账</h3>
