@@ -8925,7 +8925,7 @@ fn stock_flow_base_sql(where_clause: &str) -> String {
     format!(
         "SELECT * FROM (
             SELECT sm.order_date AS create_time,
-                   CASE WHEN sm.movement_type='purchase' THEN '采购入库' ELSE '销售出库' END AS type,
+                   CASE WHEN sm.movement_type='purchase' THEN '入库' ELSE '出库' END AS type,
                    sm.product_id,
                    p.name AS product_name,
                    p.spec,
@@ -8936,7 +8936,7 @@ fn stock_flow_base_sql(where_clause: &str) -> String {
                    CASE WHEN sm.movement_type='sales'
                         THEN SUM(CASE WHEN sm.direction='out' THEN sm.base_quantity ELSE -sm.base_quantity END)
                         ELSE 0 END AS out_quantity,
-                   CASE WHEN sm.movement_type='purchase' THEN '采购入库-审核' ELSE '销售出库-验收' END AS remark,
+                   CASE WHEN sm.movement_type='purchase' THEN '入库-审核' ELSE '出库-验收' END AS remark,
                    ABS(SUM(CASE WHEN sm.direction=(CASE WHEN sm.movement_type='purchase' THEN 'in' ELSE 'out' END)
                            THEN sm.orig_quantity ELSE -sm.orig_quantity END)) AS orig_quantity,
                    MAX(sm.orig_unit) AS orig_unit,
