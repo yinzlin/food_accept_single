@@ -8919,32 +8919,39 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
 /// src/sid 作为稳定排序键：0=采购、1=销售，同日内先入后出。
 /// 返回的 SQL 不含外层 ORDER BY / LIMIT，由调用方追加。
 fn stock_flow_base_sql(where_clause: &str) -> String {
-    // 直接从 stock_movement 表读取：balance_after 已在写入时算好快照，
-    // 无需窗口函数反算；movement_type + direction 组合判断正/冲销。
+    // 按订单最终状态聚合：同一订单同一商品的审核/反审核流水相互抵消，
+    // 净额为 0（最终未审核）的整组不显示，台账只保留最终生效的一条，不产生出入库虚数。
+    // 审核与冲销归属同一 order_date，日期过滤不会拆散配对。
     format!(
-        "SELECT sm.order_date AS create_time,
-                CASE
-                    WHEN sm.movement_type='purchase' AND sm.direction='in'  THEN '采购入库'
-                    WHEN sm.movement_type='purchase' AND sm.direction='out' THEN '采购入库冲销'
-                    WHEN sm.movement_type='sales'    AND sm.direction='out' THEN '销售出库'
-                    WHEN sm.movement_type='sales'    AND sm.direction='in'  THEN '销售出库冲销'
-                    ELSE sm.movement_type
-                END AS type,
-                sm.product_id,
-                p.name AS product_name,
-                p.spec,
-                COALESCE(NULLIF(p.base_unit, ''), p.unit) AS unit,
-                CASE WHEN sm.direction='in'  THEN sm.base_quantity ELSE 0 END AS in_quantity,
-                CASE WHEN sm.direction='out' THEN sm.base_quantity ELSE 0 END AS out_quantity,
-                sm.remark,
-                sm.orig_quantity,
-                sm.orig_unit,
-                CASE WHEN sm.movement_type='purchase' THEN 0 ELSE 1 END AS src,
-                sm.id AS sid,
-                sm.balance_after AS balance
-         FROM stock_movement sm
-         JOIN product p ON sm.product_id = p.id
-         {}",
+        "SELECT * FROM (
+            SELECT sm.order_date AS create_time,
+                   CASE WHEN sm.movement_type='purchase' THEN '采购入库' ELSE '销售出库' END AS type,
+                   sm.product_id,
+                   p.name AS product_name,
+                   p.spec,
+                   COALESCE(NULLIF(p.base_unit, ''), p.unit) AS unit,
+                   CASE WHEN sm.movement_type='purchase'
+                        THEN SUM(CASE WHEN sm.direction='in' THEN sm.base_quantity ELSE -sm.base_quantity END)
+                        ELSE 0 END AS in_quantity,
+                   CASE WHEN sm.movement_type='sales'
+                        THEN SUM(CASE WHEN sm.direction='out' THEN sm.base_quantity ELSE -sm.base_quantity END)
+                        ELSE 0 END AS out_quantity,
+                   CASE WHEN sm.movement_type='purchase' THEN '采购入库-审核' ELSE '销售出库-验收' END AS remark,
+                   ABS(SUM(CASE WHEN sm.direction=(CASE WHEN sm.movement_type='purchase' THEN 'in' ELSE 'out' END)
+                           THEN sm.orig_quantity ELSE -sm.orig_quantity END)) AS orig_quantity,
+                   MAX(sm.orig_unit) AS orig_unit,
+                   CASE WHEN sm.movement_type='purchase' THEN 0 ELSE 1 END AS src,
+                   MAX(sm.id) AS sid,
+                   (SELECT sm2.balance_after FROM stock_movement sm2
+                     WHERE sm2.ref_type=sm.ref_type AND sm2.ref_id=sm.ref_id AND sm2.product_id=sm.product_id
+                       AND sm2.direction=(CASE WHEN sm.movement_type='purchase' THEN 'in' ELSE 'out' END)
+                     ORDER BY sm2.id DESC LIMIT 1) AS balance
+            FROM stock_movement sm
+            JOIN product p ON sm.product_id = p.id
+            {}
+            GROUP BY sm.ref_type, sm.ref_id, sm.product_id, sm.movement_type, sm.order_date
+        ) t
+        WHERE t.in_quantity > 0.001 OR t.out_quantity > 0.001",
         where_clause
     )
 }
@@ -8975,11 +8982,8 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
         where_clause.push_str(&format!(" AND sm.order_date <= '{}'", end_date));
     }
 
-    // 总条数：直接 COUNT stock_movement
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM stock_movement sm JOIN product p ON sm.product_id = p.id {}",
-        where_clause
-    );
+    // 总条数：按订单最终状态聚合后的行数（与 data_sql 同口径）
+    let count_sql = format!("SELECT COUNT(*) FROM ({})", stock_flow_base_sql(&where_clause));
 
     // 分页查询：balance_after 已写入快照，外层直接 ORDER BY 取当前页
     let data_sql = format!(
