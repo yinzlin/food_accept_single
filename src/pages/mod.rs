@@ -715,6 +715,9 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                             <div class="col-md-2">
                                 <select name="category_id" class="form-control">{0}</select>
                             </div>
+                            <div class="col-md-1">
+                                <input type="text" name="shelf_life" placeholder="保质期" class="form-control">
+                            </div>
                             <div class="col-md-2">
                                 <button type="submit" class="btn btn-primary">新增</button>
                             </div>
@@ -741,9 +744,9 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
 
         <div class="product-list-section">
         <table class="table table-bordered product-sticky-table">
-            <thead><tr><th>ID</th><th>图片</th><th style="width:120px">名称</th><th style="min-width:180px">规格</th><th>显示单位</th><th>基础单位</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>最新政采/比价</th><th>审核</th><th style="width:280px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>图片</th><th style="width:120px">名称</th><th style="min-width:180px">规格</th><th>显示单位</th><th>基础单位</th><th>保质期</th><th>售价</th><th class="purchase-price-col">进价</th><th>多单位</th><th>分类</th><th>状态</th><th>最新政采/比价</th><th>审核</th><th style="width:280px">操作</th></tr></thead>
             <tbody id="productTableBody">
-                <tr><td colspan="14" class="text-center text-muted">加载中...</td></tr>
+                <tr><td colspan="15" class="text-center text-muted">加载中...</td></tr>
             </tbody>
         </table>
         <div id="productPagination" class="mt-3"></div>
@@ -819,6 +822,12 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                                 <div class="col-md-2 purchase-price-col">
                                     <label class="form-label">历史最低进价（自动）</label>
                                     <input type="number" step="0.01" name="min_purchase_price" class="form-control" readonly style="background-color:#f5f5f5;">
+                                </div>
+                            </div>
+                            <div class="row mt-3">
+                                <div class="col-md-3">
+                                    <label class="form-label">保质期（如：7天、180天）</label>
+                                    <input type="text" name="shelf_life" class="form-control" placeholder="如：7天">
                                 </div>
                             </div>
 
@@ -1079,7 +1088,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
             function renderProductTable(products) {{
                 const tbody = document.getElementById('productTableBody');
                 if (!products || products.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="14" class="text-center text-muted">暂无商品数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="15" class="text-center text-muted">暂无商品数据</td></tr>';
                     return;
                 }}
                 // 异步拉取每个商品的最新政采价/超市比价
@@ -1147,7 +1156,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     if (basePrice > 0) {{
                         priceCell = '¥' + basePrice.toFixed(2);
                     }}
-                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + priceCell + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
+                    html += '<tr><td>' + p.id + '</td><td>' + imageHtml + '</td><td>' + nameDisplay + '</td><td>' + escapeHtml(p.spec || '') + '</td><td>' + escapeHtml(p.unit || '') + '</td><td>' + escapeHtml(p.base_unit || '') + '</td><td>' + escapeHtml(p.shelf_life || '') + '</td><td>' + priceCell + '</td>' + (isSuperAdmin ? '<td>' + (p.purchase_price || 0) + '</td>' : '') + '<td>' + escapeHtml(unitsText) + '</td><td>' + escapeHtml(p.category_name || '无分类') + '</td><td>' + statusBadge + ' ' + autoBadge + '</td>';
                     // 最新政采/比价列：gov 优先，否则显示最大超市价
                     let policyCell = '<span class="text-muted">-</span>';
                     if (pp) {{
@@ -1408,6 +1417,7 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 form.category_id.value = p.category_id || '';
                 form.markup_rate.value = (p.markup_rate !== undefined && p.markup_rate !== null) ? p.markup_rate : 0.5;
                 form.auto_update_price.value = (p.auto_update_price !== undefined && p.auto_update_price !== null) ? p.auto_update_price : 0;
+                form.shelf_life.value = p.shelf_life || '';
 
                 form.gov_price.value = '';
                 form.supermarket_1.value = '';
@@ -1576,7 +1586,8 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     image_url: p ? p.image_url : null,
                     category_id: form.category_id.value ? parseInt(form.category_id.value) : null,
                     markup_rate: parseFloat(form.markup_rate.value) || 0.5,
-                    auto_update_price: parseInt(form.auto_update_price.value)
+                    auto_update_price: parseInt(form.auto_update_price.value),
+                    shelf_life: form.shelf_life.value || null
                 }};
                 const res = await fetch('/api/product/update', {{
                     method: 'POST',
@@ -1732,7 +1743,8 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     base_unit: form.base_unit.value || null,
                     base_price: parseFloat(form.base_price.value) || null,
                     purchase_price: parseFloat(form.purchase_price.value) || null,
-                    category_id: form.category_id.value ? parseInt(form.category_id.value) : null
+                    category_id: form.category_id.value ? parseInt(form.category_id.value) : null,
+                    shelf_life: form.shelf_life.value || null
                 }};
                 
                 const checkRes = await fetch('/api/product/check_name?name=' + encodeURIComponent(data.name));
@@ -2144,7 +2156,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
                 <table class="table table-bordered">
                     <thead>
-                        <tr><th style="min-width:120px">商品名称</th><th style="min-width:170px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:110px">仓库</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
+                        <tr><th style="min-width:120px">商品名称</th><th style="min-width:170px">规格</th><th style="width:75px">单位</th><th style="width:85px">订购数量</th><th style="width:75px">数量</th><th style="width:85px">单价</th><th style="width:110px">金额</th><th style="width:110px">仓库</th><th style="width:110px">生产日期</th><th style="width:90px">批号</th><th style="width:120px">备注</th><th style="width:65px">操作</th></tr>
                     </thead>
                     <tbody id="itemsTable"></tbody>
                 </table>
@@ -2634,7 +2646,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             loadOrders();
 
             function addItem() {{
-                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [], warehouse_id: 0, warehouse_name: '' }});
+                items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [], warehouse_id: 0, warehouse_name: '', production_date: '', batch_no: '' }});
                 renderItems();
             }}
 
@@ -2693,6 +2705,8 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                     <div id="warehouseDropdown_${{index}}" class="search-dropdown"></div>
                                 </div>
                             </td>
+                            <td style="width:110px"><input type="date" value="${{item.production_date || ''}}" onchange="updateProductionDate(${{index}}, this)" class="form-control-sm"></td>
+                            <td style="width:90px"><input type="text" value="${{item.batch_no || ''}}" onchange="updateBatchNo(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'batch_no')" class="form-control-sm" placeholder="批号"></td>
                             <td style="width:120px"><input type="text" value="${{item.remark || ''}}" onchange="updateRemark(${{index}}, this)" onkeydown="handleEnterKey(event, ${{index}}, 'remark')" class="form-control-sm" placeholder="单品备注" enterkeyhint="next"></td>
                             <td style="width:65px"><button onclick="removeItem(${{index}})" class="btn btn-danger btn-sm">删除</button></td>
                         </tr>
@@ -3051,6 +3065,14 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 items[index].remark = input.value.trim();
             }}
 
+            function updateProductionDate(index, input) {{
+                items[index].production_date = input.value.trim();
+            }}
+
+            function updateBatchNo(index, input) {{
+                items[index].batch_no = input.value.trim();
+            }}
+
             let currentOrderId = null;
             let currentVersion = 1;
 
@@ -3209,6 +3231,8 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                         remark: item.remark || '',
                         warehouse_id: item.warehouse_id || 0,
                         warehouse_name: item.warehouse_name || '',
+                        production_date: item.production_date || '',
+                        batch_no: item.batch_no || '',
                         supplier_id: item.supplier_id || 0,
                         supplier_name: item.supplier_name || '',
                         base_unit: '',
@@ -8015,6 +8039,7 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
     let role = crate::auth::get_user_role(&headers).await;
     // 台账维护按钮（清空/重新生成）仅管理员可见；接口本身也有 manage.admin 权限校验
     let admin_buttons = if role == "admin" || role == "super_admin" {
+        // 台账维护按钮与查询/导出同一行展示；接口本身也有 manage.admin 权限校验
         r#"
             <button onclick="clearStockMovement()" class="btn btn-danger ml-2">清空台账</button>
             <button onclick="regenerateStockMovement()" class="btn btn-warning ml-2">重新生成记录</button>
@@ -8039,8 +8064,10 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
                     <input type="date" id="endDate" class="form-control">
                 </div>
             </div>
-            <button onclick="searchStockFlow()" class="btn btn-primary">查询</button>
-            <button onclick="exportStockFlow()" class="btn btn-success ml-2">导出Excel</button>{admin_buttons}
+            <div>
+                <button onclick="searchStockFlow()" class="btn btn-primary">查询</button>
+                <button onclick="exportStockFlow()" class="btn btn-success ml-2">导出Excel</button>{admin_buttons}
+            </div>
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
@@ -8066,9 +8093,9 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
                 stockFlowTotal = data.total || 0;
                 const rows = [];
                 (data.items || []).forEach(item => {{
-                    // 原始下单单位与基础单位不一致时，在备注中标注原始数量，方便与订单对账
+                    // 原始下单单位与基础单位不一致且备注未包含该单位时，在备注中标注原始数量，方便与订单对账
                     let remark = sfEsc(item.remark);
-                    if (item.orig_unit && item.orig_unit !== item.unit) {{
+                    if (item.orig_unit && item.orig_unit !== item.unit && remark.indexOf(sfEsc(item.orig_unit)) === -1) {{
                         remark = (remark ? remark + ' ' : '') + '（原 ' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit) + '）';
                     }}
                     rows.push('<tr><td>' + sfEsc(item.create_time) + '</td><td>' + sfEsc(item.type) + '</td><td>' + sfEsc(item.product_name) + '</td><td>' + sfEsc(item.spec) + '</td><td>' + sfEsc(item.unit) + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + (item.balance || 0).toFixed(2) + '</td><td>' + remark + '</td></tr>');
@@ -8094,22 +8121,30 @@ pub async fn page_query_stock_flow(headers: axum::http::HeaderMap) -> Html<Strin
             async function clearStockMovement() {{
                 if (!await priceConfirm('确定要清空库存台账吗？\n将删除全部流水记录，并把库存数量清零。\n此操作不可恢复！')) return;
                 if (!await priceConfirm('再次确认：清空后流水记录无法找回，确定继续？')) return;
-                const res = await fetch('/api/stock_movement/clear');
-                const text = await res.text();
-                let msg = text;
-                try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
-                await priceAlert(msg, res.ok ? '清空完成' : '清空失败');
-                if (res.ok) searchStockFlow(1);
+                try {{
+                    const res = await fetch('/api/stock_movement/clear');
+                    const text = await res.text();
+                    let msg = text;
+                    try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
+                    await priceAlert(msg, res.ok ? '清空完成' : '清空失败');
+                    if (res.ok) searchStockFlow(1);
+                }} catch (e) {{
+                    await priceAlert('请求失败：服务可能未运行，请检查程序后重试', '清空失败');
+                }}
             }}
             async function regenerateStockMovement() {{
                 if (!await priceConfirm('确定要重新生成库存台账吗？\n将清空现有流水，并按订单状态重新生成：\n已审核采购单 → 入库流水；已验收/已结算销售单 → 出库流水。\n库存余额将按流水重新计算。')) return;
                 if (!await priceConfirm('再次确认：现有流水记录将被全部替换，确定继续？')) return;
-                const res = await fetch('/api/stock_movement/regenerate');
-                const text = await res.text();
-                let msg = text;
-                try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
-                await priceAlert(msg, res.ok ? '重新生成完成' : '重新生成失败');
-                if (res.ok) searchStockFlow(1);
+                try {{
+                    const res = await fetch('/api/stock_movement/regenerate');
+                    const text = await res.text();
+                    let msg = text;
+                    try {{ msg = JSON.parse(text).message || text; }} catch (e) {{}}
+                    await priceAlert(msg, res.ok ? '重新生成完成' : '重新生成失败');
+                    if (res.ok) searchStockFlow(1);
+                }} catch (e) {{
+                    await priceAlert('请求失败：服务可能未运行，请检查程序后重试', '重新生成失败');
+                }}
             }}
             searchStockFlow(1);
         </script>

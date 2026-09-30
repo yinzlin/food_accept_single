@@ -1616,11 +1616,13 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
 
     let item_rows = sqlx::query(
         "SELECT soi.id, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.remark,
+                soi.production_date, soi.batch_no, p.shelf_life,
                 p.category_id, pc.name as category_name, pc.parent_id, pc2.name as parent_name
          FROM sales_order_item soi LEFT JOIN product p ON soi.product_id = p.id
          LEFT JOIN category pc ON p.category_id = pc.id
          LEFT JOIN category pc2 ON pc.parent_id = pc2.id
-         WHERE soi.order_id = ?"
+         WHERE soi.order_id = ?
+         ORDER BY soi.id ASC"
     )
     .bind(id)
     .fetch_all(pool())
@@ -1652,6 +1654,7 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
     let supplement_rows = if reimburse {
         sqlx::query(
             "SELECT soi.id, soi.target_order_id, soi.source_order_id, soi.source_remark, soi.product_id, soi.product_name, soi.alias1, soi.alias2, soi.spec, p.spec as product_spec, soi.unit, p.unit as product_unit, p.base_unit as product_base_unit, soi.unit_price, soi.quantity, soi.amount, soi.allocate_date, soi.operation_type, soi.target_order_item_id,
+                    p.shelf_life,
                     pc.name as category_name, pc2.name as parent_name
              FROM order_supplement_item soi
              LEFT JOIN product p ON soi.product_id = p.id
@@ -1668,7 +1671,8 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
     };
 
     use std::collections::HashMap;
-    let mut item_map: HashMap<i64, (i64, String, String, f64, f64, f64, String)> = HashMap::new();
+    // 元素: (sort_key, food_name, unit, unit_price, quantity, amount, remark, production_date, batch_no, shelf_life)
+    let mut item_map: HashMap<i64, (i64, String, String, f64, f64, f64, String, Option<String>, Option<String>, Option<String>)> = HashMap::new();
     // product_id -> 真实明细行 id，用于分摊增项 target_order_item_id 失效时回退匹配
     let mut product_to_key: HashMap<i64, i64> = HashMap::new();
     for r in &item_rows {
@@ -1709,7 +1713,10 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
         let category_name = r.get::<Option<String>, _>("category_name").unwrap_or_default();
         let parent_name = r.get::<Option<String>, _>("parent_name").unwrap_or_default();
         let sort_key = get_category_sort_key(&category_name, &parent_name);
-        item_map.insert(rid, (sort_key, food_name, unit_for_spec, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark));
+        let prod_date: Option<String> = r.try_get("production_date").ok().flatten();
+        let batch_no: Option<String> = r.try_get("batch_no").ok().flatten();
+        let shelf_life: Option<String> = r.try_get("shelf_life").ok().flatten();
+        item_map.insert(rid, (sort_key, food_name, unit_for_spec, r.get::<f64, _>("unit_price"), r.get::<f64, _>("quantity"), r.get::<f64, _>("amount"), remark, prod_date, batch_no, shelf_life));
     }
 
     for r in &supplement_rows {
@@ -1736,7 +1743,7 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
                     if new_qty.abs() < 0.001 || new_amt.abs() < 0.001 {
                         item_map.remove(&tid);
                     } else {
-                        *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, entry.6.clone());
+                        *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, entry.6.clone(), entry.7.clone(), entry.8.clone(), entry.9.clone());
                     }
                 }
             }
@@ -1749,7 +1756,7 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
                     let new_qty = entry.4 + qty;
                     let new_amt = entry.5 + amt;
                     let new_remark = format!("{}（含增项+{}）", entry.6, qty);
-                    *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, new_remark);
+                    *entry = (entry.0, entry.1.clone(), entry.2.clone(), entry.3, new_qty, new_amt, new_remark, entry.7.clone(), entry.8.clone(), entry.9.clone());
                 }
             }
         } else {
@@ -1795,14 +1802,29 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
                 }
             };
             // 规格列（C列）填单位（打印模板的"规格"列实际是单位列）
-            item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark));
+            // 增项无 FIFO 批次快照，生产日期/批号留空；保质期取商品属性（如有）
+            let supp_shelf: Option<String> = r.try_get("shelf_life").ok().flatten();
+            item_map.insert(-r.get::<i64, _>("id"), (sort_key, food_name, unit, r.get::<f64, _>("unit_price"), qty, amt, remark, None, None, supp_shelf));
         }
     }
 
-    let mut items: Vec<(i64, String, String, f64, f64, f64, String)> = item_map.into_values().collect();
-    items.sort_by(|a, b| a.0.cmp(&b.0));
+    // 保留 HashMap key 作为稳定的次级排序依据：
+    //   key > 0 = 订单原始明细（key = sales_order_item.id，按录入顺序自增）
+    //   key < 0 = 分摊新增/换入明细（key = -order_supplement_item.id）
+    // 排序规则：先按类别 sort_key，同类内「原始明细在前(按id升序)、增项在后(按id升序)」。
+    // 关键：必须有完全确定的次序，否则 HashMap 迭代随机 → 同一张单每次导出顺序都不同。
+    type ItemTuple = (i64, String, String, f64, f64, f64, String, Option<String>, Option<String>, Option<String>);
+    let mut items: Vec<(i64, ItemTuple)> = item_map.into_iter().collect();
+    items.sort_by(|(ka, va), (kb, vb)| {
+        va.0.cmp(&vb.0).then_with(|| {
+            let ta = if *ka > 0 { (0, *ka) } else { (1, -*ka) };
+            let tb = if *kb > 0 { (0, *kb) } else { (1, -*kb) };
+            ta.cmp(&tb)
+        })
+    });
+    let items: Vec<ItemTuple> = items.into_iter().map(|(_, v)| v).collect();
 
-    let accept_total_amount: f64 = items.iter().map(|(_, _, _, _, _, amount, _)| amount).sum();
+    let accept_total_amount: f64 = items.iter().map(|(_, _, _, _, _, amount, _, _, _, _)| amount).sum();
     let accept_final_amount = accept_total_amount * (1.0 - discount_rate / 100.0);
 
     let result: Result<Vec<u8>, XlsxError> = (|| {
@@ -1915,7 +1937,7 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
             let end_idx = std::cmp::min(start_idx + items_per_page, items.len());
             current_row = first_data_row;
 
-            for (item_idx, (_sort_key, food_name, spec, unit_price, quantity, amount, remark)) in items[start_idx..end_idx].iter().enumerate() {
+            for (item_idx, (_sort_key, food_name, spec, unit_price, quantity, amount, remark, prod_date, batch_no, shelf_life)) in items[start_idx..end_idx].iter().enumerate() {
                 let seq_num = (start_idx + item_idx + 1) as f64;
                 worksheet.write_with_format(current_row, 0, seq_num, &cell_format)?;
                 worksheet.write_with_format(current_row, 1, food_name, &cell_left_format)?;
@@ -1923,8 +1945,16 @@ pub(crate) async fn build_accept_excel(headers: &axum::http::HeaderMap, id: i64,
                 worksheet.write_with_format(current_row, 3, *quantity, &cell_right_format)?;
                 worksheet.write_with_format(current_row, 4, *unit_price, &money_format)?;
                 worksheet.write_with_format(current_row, 5, *amount, &money_format)?;
-                worksheet.write_with_format(current_row, 6, "", &cell_format)?;
-                worksheet.write_with_format(current_row, 7, "", &cell_format)?;
+                // 生产日期/批号：确认验收时按 FIFO 写入的快照（有日期带批号，只有一项写一项）
+                let prod_cell = match (prod_date.as_deref().map(str::trim).filter(|s| !s.is_empty()), batch_no.as_deref().map(str::trim).filter(|s| !s.is_empty())) {
+                    (Some(p), Some(b)) => format!("{}/{}", p, b),
+                    (Some(p), None) => p.to_string(),
+                    (None, Some(b)) => b.to_string(),
+                    (None, None) => String::new(),
+                };
+                worksheet.write_with_format(current_row, 6, prod_cell, &cell_format)?;
+                // 保质期：商品属性（如有）
+                worksheet.write_with_format(current_row, 7, shelf_life.as_deref().unwrap_or(""), &cell_format)?;
                 worksheet.write_with_format(current_row, 8, "□有 □无", &cell_format)?;
                 worksheet.write_with_format(current_row, 9, "□有 □无", &cell_format)?;
                 worksheet.write_with_format(current_row, 10, "□有 □无", &cell_format)?;

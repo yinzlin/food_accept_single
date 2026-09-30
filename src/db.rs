@@ -403,6 +403,11 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 保质期（商品自身属性，如 "7天"、"180天"）
+    let _ = sqlx::query("ALTER TABLE product ADD COLUMN shelf_life TEXT")
+        .execute(pool)
+        .await;
+
     // 价格变更日志表：记录每次进价/售价变更，便于审计和对账
     sqlx::query(
         r#"
@@ -657,6 +662,26 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN ordered_quantity REAL NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // 食材溯源：生产日期/批号是"每一批到货实物"的属性，同一商品每批不同，
+    // 放采购明细表（进货查验记录），不放 product（会互相覆盖）也不放订单主表（粒度不对）
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN production_date TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE purchase_order_item ADD COLUMN batch_no TEXT")
+        .execute(pool)
+        .await;
+
+    // 验收单导出快照：确认验收时按 FIFO 取当前库存最早批次的 生产日期/批号 写入销售明细，
+    // 导出验收单/报销单直接读快照，不再实时计算
+    let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN production_date TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query("ALTER TABLE sales_order_item ADD COLUMN batch_no TEXT")
         .execute(pool)
         .await;
 

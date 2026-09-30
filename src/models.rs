@@ -57,6 +57,8 @@ pub struct ProductReq {
     pub purchase_price: Option<f64>,
     pub image_url: Option<String>,
     pub category_id: Option<i64>,
+    /// 保质期（商品自身属性，如 "7天"、"180天"）
+    pub shelf_life: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -154,6 +156,10 @@ pub struct PurchaseOrderItemReq {
     /// 明细级仓库：同一订单各行可入不同仓库
     pub warehouse_id: Option<i64>,
     pub warehouse_name: Option<String>,
+    /// 食材溯源：本批到货实物的生产日期（如 2026-09-28）
+    pub production_date: Option<String>,
+    /// 食材溯源：本批到货实物的批号
+    pub batch_no: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -261,6 +267,8 @@ pub struct ProductUpdateReq {
     pub category_id: Option<i64>,
     pub markup_rate: Option<f64>,
     pub auto_update_price: Option<i64>,
+    /// 保质期（商品自身属性，如 "7天"、"180天"）
+    pub shelf_life: Option<String>,
 }
 
 #[derive(Deserialize)]
