@@ -8781,7 +8781,7 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
         // 历史时点余额 = 当前 inventory 余额 − 单据日期在时点之后的净流水（in 正 / out 负）；
         // 冲销流水 direction 与原方向相反且归属同一单据日期，自动计入。相关子查询走 idx_sm_order_date 索引。
         let inner = format!(
-            "SELECT i.product_id, p.name AS product_name, p.spec, p.unit, p.base_price,
+            "SELECT i.product_id, p.name AS product_name, p.spec, COALESCE(NULLIF(p.base_unit, ''), p.unit) AS unit, p.base_price,
                     (i.quantity - COALESCE((SELECT SUM(CASE WHEN sm2.direction='in' THEN sm2.base_quantity ELSE -sm2.base_quantity END) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.order_date >= ?), 0)) AS opening_qty,
                     COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='in' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_in,
                     COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='out' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_out,
@@ -8811,7 +8811,7 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
         );
         data_sql = format!(
             "SELECT i.id, i.product_id, i.warehouse_id, i.quantity, i.min_stock, i.max_stock,
-                    p.name as product_name, p.spec, p.unit, p.base_price,
+                    p.name as product_name, p.spec, COALESCE(NULLIF(p.base_unit, ''), p.unit) AS unit, p.base_price,
                     (i.quantity * p.base_price) as amount
              FROM inventory i JOIN product p ON i.product_id=p.id
              {} ORDER BY p.name LIMIT ? OFFSET ?",
@@ -9798,7 +9798,7 @@ pub async fn api_query_stock_balance_export(axum::extract::Query(params): axum::
         };
         // 与查询 API 同口径：时间归属按单据日期（order_date 快照）
         let inner = format!(
-            "SELECT i.product_id, p.name AS product_name, p.spec, p.unit, p.base_price,
+            "SELECT i.product_id, p.name AS product_name, p.spec, COALESCE(NULLIF(p.base_unit, ''), p.unit) AS unit, p.base_price,
                     (i.quantity - COALESCE((SELECT SUM(CASE WHEN sm2.direction='in' THEN sm2.base_quantity ELSE -sm2.base_quantity END) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.order_date >= ?), 0)) AS opening_qty,
                     COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='in' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_in,
                     COALESCE((SELECT SUM(sm2.base_quantity) FROM stock_movement sm2 WHERE sm2.product_id=i.product_id AND sm2.direction='out' AND sm2.order_date >= ? AND sm2.order_date <= ?), 0) AS period_out,
@@ -9813,9 +9813,9 @@ pub async fn api_query_stock_balance_export(axum::extract::Query(params): axum::
         start_bound = String::new();
         end_bound = String::new();
         sql = if category_id.is_empty() {
-            "SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? ORDER BY p.name, p.id".to_string()
+            "SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,COALESCE(NULLIF(p.base_unit, ''), p.unit) as unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? ORDER BY p.name, p.id".to_string()
         } else {
-            format!("SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,p.unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? AND p.category_id={} ORDER BY p.name, p.id", category_id)
+            format!("SELECT i.id,i.product_id,i.quantity,i.min_stock,i.max_stock,p.name as product_name,p.spec,COALESCE(NULLIF(p.base_unit, ''), p.unit) as unit,p.base_price,(i.quantity*p.base_price) as amount FROM inventory i JOIN product p ON i.product_id=p.id WHERE p.name LIKE ? AND p.category_id={} ORDER BY p.name, p.id", category_id)
         };
     }
 
