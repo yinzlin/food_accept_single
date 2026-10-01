@@ -8195,9 +8195,13 @@ pub async fn api_sales_order_generate_purchase(
         // 这样既保证"用户从 PO 删的明细能补回"（快照覆盖到被删的 id），
         // 又不会因老代码 INSERT fallback 留下的 source=主表兜底孤儿"被新代码当成本销售单的",
         // 进而形成 (P,U) 重复插入。
+        // 采购明细与销售明细一一对应：同单同商品多行（补采行为）各自生成一条采购明细，
+        // 已写入的明细 id 记入 consumed，后续同 (P,U,wh) 行的孤儿匹配必须排除它们，
+        // 否则后行会复用并覆盖前行（数量丢失、备注被吞）。
         let mut updated_lines: i64 = 0;
         let mut added_lines: i64 = 0;
         let mut delta_amount: f64 = 0.0; // UPDATE 同步：金额增量 = 新 - 旧
+        let mut consumed_po_item_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         for (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, _base_unit, _base_price, remark) in items {
             let amount = ((quantity * unit_price) * 100.0).round() / 100.0;
@@ -8249,6 +8253,7 @@ pub async fn api_sales_order_generate_purchase(
                 if affected > 0 {
                     // 真正命中 DB 中存在的明细 → UPDATE 成功
                     new_snapshot_ids.insert(snap_po_id);
+                    consumed_po_item_ids.insert(snap_po_id);
                     updated_via_snapshot = true;
                     delta_amount += new_amount - old_amount; // 差量计入主表
                     updated_lines += 1;
@@ -8270,24 +8275,35 @@ pub async fn api_sales_order_generate_purchase(
                 let new_amount = ((quantity * unit_price) * 100.0).round() / 100.0;
                 // 孤儿匹配：同 (P,U,warehouse_id) 任意 source；优先选 source=本单的（极端兜底），
                 // 否则按 id 最小的（最早插入的）复用。
-                let orphan_id: Option<i64> = sqlx::query(
+                // 排除本轮已写入的明细（同单同商品多行 1:1 生成，各行互不复用）。
+                // id 为内部主键（i64），直接拼入 SQL 安全。
+                let exclude_sql = if consumed_po_item_ids.is_empty() {
+                    String::new()
+                } else {
+                    let ids = consumed_po_item_ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                    format!(" AND id NOT IN ({})", ids)
+                };
+                let orphan_sql = format!(
                     "SELECT id FROM purchase_order_item
                      WHERE order_id = ? AND product_id = ?
                        AND COALESCE(NULLIF(TRIM(COALESCE(sales_unit, '')), ''), unit, '') = ?
-                       AND warehouse_id = ?
+                       AND warehouse_id = {}
+                     {}
                      ORDER BY (CASE WHEN source_sales_order_id = ? THEN 0 ELSE 1 END), id
-                     LIMIT 1"
-                )
-                .bind(po_id)
-                .bind(product_id)
-                .bind(sales_unit.trim())
-                .bind(main_wh_id)
-                .bind(id)
-                .fetch_optional(crate::db::pool())
-                .await
-                .ok()
-                .flatten()
-                .map(|r| r.get::<i64, _>("id"));
+                     LIMIT 1",
+                    main_wh_id, exclude_sql
+                );
+                let oq = sqlx::query(AssertSqlSafe(orphan_sql.as_str()))
+                    .bind(po_id)
+                    .bind(product_id)
+                    .bind(sales_unit.trim())
+                    .bind(id);
+                let orphan_id: Option<i64> = oq
+                    .fetch_optional(crate::db::pool())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| r.get::<i64, _>("id"));
 
                 if let Some(orphan_po_id) = orphan_id {
                     // 读取旧 amount 以计算差量
@@ -8330,6 +8346,7 @@ pub async fn api_sales_order_generate_purchase(
                     if let Some(res) = upd_res {
                         if res.rows_affected() > 0 {
                             new_snapshot_ids.insert(orphan_po_id);
+                            consumed_po_item_ids.insert(orphan_po_id);
                             delta_amount += new_amount - old_amount;
                             updated_lines += 1;
                             // 不加 added_lines：这是复用，不是新增
@@ -8367,6 +8384,7 @@ pub async fn api_sales_order_generate_purchase(
                     let new_po_id = res.last_insert_rowid();
                     if new_po_id > 0 {
                         new_snapshot_ids.insert(new_po_id);
+                        consumed_po_item_ids.insert(new_po_id);
                     }
                 }
                 delta_amount += amount;

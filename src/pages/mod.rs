@@ -2889,6 +2889,17 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 const input = document.querySelector('#itemsTable tr:nth-child(' + (index + 1) + ') .product-search-input');
                 const dropdown = document.getElementById('searchDropdown_' + index);
 
+                // 同商品重复提示：订单中已有该商品时，确认后才能再增加一条记录
+                const dupPid = parseInt(li.getAttribute('data-id'));
+                const dupName = li.getAttribute('data-name') || '';
+                const dupIdx = items.findIndex(function(it, j) {{ return j !== index && it.product_id === dupPid; }});
+                if (dupIdx >= 0 && !confirm('该订单已有商品【' + dupName + '】（第' + (dupIdx + 1) + '行），是否确认增加记录？')) {{
+                    input.value = items[index].product_name || '';
+                    dropdown.innerHTML = '';
+                    dropdown.style.display = 'none';
+                    return;
+                }}
+
                 items[index].product_id = parseInt(li.getAttribute('data-id'));
                 items[index].product_name = li.getAttribute('data-name');
                 items[index].alias1 = li.getAttribute('data-alias1') || '';
@@ -4023,6 +4034,17 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             async function selectProduct(index, li, afterSelect) {{
                 const input = document.querySelector('#itemsTable tr:nth-child(' + (index + 1) + ') .product-search-input');
                 const dropdown = document.getElementById('searchDropdown_' + index);
+
+                // 同商品重复提示：订单中已有该商品时，确认后才能再增加一条记录（补采行为按行保留）
+                const dupPid = parseInt(li.getAttribute('data-id'));
+                const dupName = li.getAttribute('data-name') || '';
+                const dupIdx = items.findIndex(function(it, j) {{ return j !== index && it.product_id === dupPid; }});
+                if (dupIdx >= 0 && !confirm('该订单已有商品【' + dupName + '】（第' + (dupIdx + 1) + '行），是否确认增加记录？')) {{
+                    input.value = items[index].product_name || '';
+                    dropdown.innerHTML = '';
+                    dropdown.style.display = 'none';
+                    return;
+                }}
 
                 items[index].product_id = parseInt(li.getAttribute('data-id'));
                 items[index].product_name = li.getAttribute('data-name');
