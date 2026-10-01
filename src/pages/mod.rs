@@ -2341,11 +2341,40 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                                 }}
                             }});
                             if (currentVal) handlerSelect.value = currentVal;
+                            // 新建订单状态：经手人选项就绪后恢复上一次选择
+                            if (!currentOrderId) applyLastPurchaseDefaults();
                         }}
                     }}
                 }} catch (e) {{}}
             }}
             loadUsers();
+
+            // 记住/恢复上一次采购单的供应商与经手人（新建订单时默认带入）
+            function rememberPurchaseDefaults() {{
+                try {{
+                    localStorage.setItem('po_last_supplier_id', document.getElementById('supplierId').value || '');
+                    localStorage.setItem('po_last_supplier_name', document.getElementById('supplierInput').value || '');
+                    localStorage.setItem('po_last_handler_id', document.getElementById('handlerId').value || '');
+                }} catch (e) {{}}
+            }}
+            function applyLastPurchaseDefaults() {{
+                try {{
+                    const sid = localStorage.getItem('po_last_supplier_id');
+                    const sname = localStorage.getItem('po_last_supplier_name');
+                    if (sid) {{
+                        document.getElementById('supplierId').value = sid;
+                        document.getElementById('supplierInput').value = sname || '';
+                    }}
+                    const hid = localStorage.getItem('po_last_handler_id');
+                    if (hid) {{
+                        const hs = document.getElementById('handlerSelect');
+                        if (hs.querySelector('option[value="' + hid + '"]')) {{
+                            hs.value = hid;
+                            document.getElementById('handlerId').value = hid;
+                        }}
+                    }}
+                }} catch (e) {{}}
+            }}
 
             // 导出采购单（打印模板样式）
             async function exportPurchaseOrder(orderId) {{
@@ -2644,6 +2673,8 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
 
             generateOrderNo('purchase');
             loadOrders();
+            // 首次进入先恢复供应商（经手人待用户列表加载完成后在 loadUsers 中恢复）
+            applyLastPurchaseDefaults();
 
             function addItem() {{
                 items.push({{ product_id: 0, product_name: '', alias1: '', alias2: '', spec: '', unit: '', base_unit: '', unit_price: 0, purchase_price: 0, quantity: 0, base_quantity: 0, amount: 0, ordered_quantity: 0, ratio: 1, units: [], warehouse_id: 0, warehouse_name: '', production_date: '', batch_no: '' }});
@@ -3188,6 +3219,8 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     if (res.ok) {{
                         // 先恢复按钮状态再刷新，避免 location.reload 被浏览器/扩展拦截时按钮永久卡在「保存中…」
                         restorePurchaseBtn();
+                        // 记住本次供应商与经手人，新建下一张订单时默认带入
+                        rememberPurchaseDefaults();
                         location.reload();
                     }} else {{
                         const text = await res.text();
@@ -3339,9 +3372,14 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderDateInput').value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
                 document.getElementById('remarkInput').value = '';
                 document.getElementById('discountRateInput').value = '0';
+                // 经手人恢复为未选，再带入上一次默认
+                document.getElementById('handlerSelect').value = '';
+                document.getElementById('handlerId').value = '';
                 items = [];
                 renderItems();
                 generateOrderNo('purchase');
+                // 默认带入上一次采购单的供应商与经手人
+                applyLastPurchaseDefaults();
             }}
         </script>
     "#, now);
@@ -3735,6 +3773,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             }}
 
             generateOrderNo('sales');
+            // 首次进入页面：默认带入上一次销售单的采购单位、出库仓库、供应商、供货车牌号（联系方式由 loadContactPhone 处理）
+            applyLastSalesDefaults();
 
             // 订单日期变化时：已选明细按新日期重新拉政采价/超市比价覆盖（与 selectProduct 规则一致：政采优先 > 非零平均价）
             async function onOrderDateChange() {{
@@ -4498,6 +4538,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                                 body: JSON.stringify({{ contact_phone: contactPhone }})
                             }});
                         }}
+                        // 记住本次采购单位/出库仓库/供应商/供货车牌号/联系方式，新建下一张订单时默认带入
+                        rememberSalesDefaults();
                         if (isNew) {{
                             resetForm();
                             restoreBtn();
@@ -4998,6 +5040,41 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 resetForm();
             }}
 
+            // 记住/恢复上一次销售单的采购单位、出库仓库、供应商、供货车牌号、联系方式（新建订单时默认带入）
+            function rememberSalesDefaults() {{
+                try {{
+                    localStorage.setItem('so_last_purchaser_id', document.getElementById('purchaserId').value || '');
+                    localStorage.setItem('so_last_purchaser_name', document.getElementById('purchaserInput').value || '');
+                    localStorage.setItem('so_last_warehouse_id', document.getElementById('warehouseId').value || '');
+                    localStorage.setItem('so_last_warehouse_name', document.getElementById('warehouseInput').value || '');
+                    localStorage.setItem('so_last_supplier_company', document.getElementById('supplierCompanyInput').value.trim() || '');
+                    localStorage.setItem('so_last_truck_plate', document.getElementById('truckPlateInput').value.trim() || '');
+                    localStorage.setItem('so_last_contact_phone', document.getElementById('contactPhoneInput').value.trim() || '');
+                }} catch (e) {{}}
+            }}
+            function applyLastSalesDefaults() {{
+                try {{
+                    const pid = localStorage.getItem('so_last_purchaser_id');
+                    const pname = localStorage.getItem('so_last_purchaser_name');
+                    if (pid) {{
+                        document.getElementById('purchaserId').value = pid;
+                        document.getElementById('purchaserInput').value = pname || '';
+                    }}
+                    const wid = localStorage.getItem('so_last_warehouse_id');
+                    const wname = localStorage.getItem('so_last_warehouse_name');
+                    if (wid) {{
+                        document.getElementById('warehouseId').value = wid;
+                        document.getElementById('warehouseInput').value = wname || '';
+                    }}
+                    const sc = localStorage.getItem('so_last_supplier_company');
+                    if (sc) document.getElementById('supplierCompanyInput').value = sc;
+                    const tp = localStorage.getItem('so_last_truck_plate');
+                    if (tp) document.getElementById('truckPlateInput').value = tp;
+                    const cp = localStorage.getItem('so_last_contact_phone');
+                    if (cp) document.getElementById('contactPhoneInput').value = cp;
+                }} catch (e) {{}}
+            }}
+
             function resetForm() {{
                 currentOrderId = null;
                 document.getElementById('formTitle').textContent = '新建销售订单';
@@ -5020,6 +5097,8 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 renderItems();
                 generateOrderNo('sales');
                 loadOrders();
+                // 默认带入上一次销售单的采购单位、出库仓库、供应商、供货车牌号、联系方式
+                applyLastSalesDefaults();
             }}
 
             loadPurchasers();
@@ -5027,8 +5106,14 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
             loadContactPhone();
 
             // 拉取当前登录用户最近保存的联系方式（销售订单主表单"联系方式"输入框的默认值）
+            // 仅在 localStorage 无记录时作为兜底，避免覆盖 localStorage 中更新更及时的上次输入
             async function loadContactPhone() {{
                 try {{
+                    const local = localStorage.getItem('so_last_contact_phone');
+                    if (local) {{
+                        document.getElementById('contactPhoneInput').value = local;
+                        return;
+                    }}
                     const res = await fetch('/api/user/contact_phone');
                     const data = await res.json();
                     if (data.success) {{
