@@ -1336,16 +1336,16 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                     // 商超1/2/3/AI 非零价的平均（四舍五入保留 2 位）
                     const vals = [sm1, sm2, sm3, ai].filter(function(v) {{ return v > 0; }});
                     if (vals.length > 0) {{
+                        // 均价四舍五入保留两位小数（不做末位数字限制）
                         sellingPrice = Math.round(vals.reduce(function(a, b) {{ return a + b; }}, 0) / vals.length * 100) / 100;
                     }} else {{
                         sellingPrice = parseFloat(form.base_price.value) || 0;
                     }}
                 }}
-                // 应用统一尾数规则
-                form.selling_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+                form.selling_price.value = sellingPrice.toFixed(2);
                 // 基础单价 = 计算售价（计算售价变化时同步基础单价）
                 if (sellingPrice > 0) {{
-                    form.base_price.value = roundToAllowedLastDigit(sellingPrice).toFixed(2);
+                    form.base_price.value = sellingPrice.toFixed(2);
                 }}
             }}
 
@@ -1362,24 +1362,9 @@ pub async fn page_product(headers: axum::http::HeaderMap) -> Html<String> {
                 const purchase = parseFloat(form.purchase_price.value) || 0;
                 const markup = parseFloat(form.markup_rate.value) || 0;
                 if (purchase > 0) {{
-                    const raw = purchase * (1 + markup);
-                    const preview = roundToAllowedLastDigit(raw);
-                    form.selling_price.value = preview.toFixed(2);
+                    // 售价不做尾数/取整限制：计算原值预览（显示保留2位）
+                    form.selling_price.value = (purchase * (1 + markup)).toFixed(2);
                 }}
-            }}
-
-            // 客户端取整（与后端 round_to_allowed_last_digit 保持一致）
-            function roundToAllowedLastDigit(price) {{
-                if (price <= 0) return price;
-                let cents = Math.round(price * 100);
-                let last = cents % 10;
-                let mapped;
-                if (last <= 2) mapped = 0;
-                else if (last <= 5) mapped = 5;
-                else if (last === 6) mapped = 6;
-                else if (last <= 8) mapped = 8;
-                else mapped = 9;
-                return (Math.floor(cents / 10) * 10 + mapped) / 100;
             }}
 
             // 通用：拉取商品最近采购价并在采购/销售单选商品后做同基础单位对比提示
@@ -2296,7 +2281,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     </div>
                     <div class="mr-4">
                         <label>金额折减：</label>
-                        <input type="number" step="0.01" id="amountReductionInput" value="0" oninput="updateFinalAmount()" class="form-control-sm" style="width: 80px;">
+                        <input type="number" step="0.01" id="amountReductionInput" value="0" readonly title="自动扣减下浮后金额的小数部分，使整单金额为整数" class="form-control-sm" style="width: 80px; background: #f0f0f0;">
                     </div>
                     <div>
                         <label>最终合计：</label>
@@ -2474,6 +2459,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     localStorage.setItem('po_last_supplier_id', document.getElementById('supplierId').value || '');
                     localStorage.setItem('po_last_supplier_name', document.getElementById('supplierInput').value || '');
                     localStorage.setItem('po_last_handler_id', document.getElementById('handlerId').value || '');
+                    localStorage.setItem('po_last_discount_rate', document.getElementById('discountRateInput').value || '');
                 }} catch (e) {{}}
             }}
             async function applyLastPurchaseDefaults() {{
@@ -2493,6 +2479,12 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                             hs.value = hid;
                             document.getElementById('handlerId').value = hid;
                         }}
+                    }}
+                    // 下浮率：!== null 区分未存过（保留默认 0）与存过（含用户清空后保存的空值）
+                    const dr = localStorage.getItem('po_last_discount_rate');
+                    if (dr !== null) {{
+                        document.getElementById('discountRateInput').value = dr;
+                        updateFinalAmount();
                     }}
                 }} catch (e) {{}}
             }}
@@ -2689,9 +2681,11 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
             function updateFinalAmount() {{
                 const total = parseFloat(document.getElementById('totalAmount').textContent) || 0;
                 const rate = parseFloat(document.getElementById('discountRateInput').value) || 0;
-                const reduction = parseFloat(document.getElementById('amountReductionInput').value) || 0;
                 const discountAmount = Math.round(total * (1 - rate / 100) * 100) / 100;
-                const finalAmount = Math.max(0, Math.round((discountAmount - reduction) * 100) / 100);
+                // 扣减自动取"下浮后金额的小数部分"，使整张订单最终金额为整数
+                const reduction = Math.round((discountAmount - Math.floor(discountAmount)) * 100) / 100;
+                const finalAmount = discountAmount - reduction;
+                document.getElementById('amountReductionInput').value = reduction.toFixed(2);
                 document.getElementById('discountAmount').textContent = discountAmount.toFixed(2);
                 document.getElementById('finalAmount').textContent = finalAmount.toFixed(2);
             }}
@@ -5207,6 +5201,7 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     localStorage.setItem('so_last_supplier_company', document.getElementById('supplierCompanyInput').value.trim() || '');
                     localStorage.setItem('so_last_truck_plate', document.getElementById('truckPlateInput').value.trim() || '');
                     localStorage.setItem('so_last_contact_phone', document.getElementById('contactPhoneInput').value.trim() || '');
+                    localStorage.setItem('so_last_discount_rate', document.getElementById('discountRateInput').value || '');
                 }} catch (e) {{}}
             }}
             function applyLastSalesDefaults() {{
@@ -5230,6 +5225,12 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                     if (tp !== null) document.getElementById('truckPlateInput').value = tp;
                     const cp = localStorage.getItem('so_last_contact_phone');
                     if (cp) document.getElementById('contactPhoneInput').value = cp;
+                    // 下浮率：!== null 区分未存过（保留默认 20）与存过（含用户清空后保存的空值）
+                    const dr = localStorage.getItem('so_last_discount_rate');
+                    if (dr !== null) {{
+                        document.getElementById('discountRateInput').value = dr;
+                        updateFinalAmount();
+                    }}
                 }} catch (e) {{}}
             }}
 
@@ -10845,7 +10846,6 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             <a href="/mobile/sort_by_purchaser" class="switch-link">按单位分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
             <a href="/mobile/today_price" class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold;">💰 今日进价</a>
-            <a class="switch-link" style="background: rgba(255,255,255,0.45); font-weight:bold; cursor:pointer;" onclick="generatePurchaseOrdersFromView()">📋 生成采购订单</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -11144,87 +11144,6 @@ pub async fn page_mobile_sort_by_supplier() -> Html<String> {
             container.innerHTML = html;
         }
 
-        // 参照销售订单页面的「生成采购订单」：按分拣清单显示顺序逐单调用，同供应商同日期自动合并
-        async function generatePurchaseOrdersFromView() {
-            const orderIds = [];
-            suppliers.forEach(supplier => {
-                if (!supplier.purchasers) return;
-                supplier.purchasers.forEach(purchaser => {
-                    purchaser.items.forEach(item => {
-                        if (item.order_id && orderIds.indexOf(item.order_id) === -1) {
-                            orderIds.push(item.order_id);
-                        }
-                    });
-                });
-            });
-            if (orderIds.length === 0) {
-                alert('当前视图没有可生成采购订单的销售订单');
-                return;
-            }
-            const date = document.getElementById('historyDate').value || '今天';
-            if (!confirm('将为 ' + date + ' 的 ' + orderIds.length + ' 个销售订单生成或补全采购订单（已审核的自动跳过，同供应商同日期自动合并）。\n是否继续？')) return;
-
-            let createdCount = 0, mergedCount = 0, refreshedCount = 0, excludedCount = 0;
-            const errors = [];
-            const toRefresh = []; // 已有待分拣采购订单的订单：自动补全（force=1）
-
-            // 第一遍：分类——从未生成的直接新建；已有待分拣的收集待补全；已审核的跳过
-            for (const orderId of orderIds) {
-                const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=0', { method: 'POST' });
-                const contentType = res.headers.get('content-type') || '';
-                if (contentType.indexOf('application/json') !== -1) {
-                    const data = await res.json();
-                    if (data.error) {
-                        // 已审核/已处理的采购订单：不重复生成，自动跳过，不视为错误
-                        if (data.excluded) { excludedCount += (data.excluded_count || 1); continue; }
-                        errors.push(data.message); continue;
-                    }
-                    if (data.warning) { toRefresh.push(orderId); continue; }
-                    if (res.ok) {
-                        createdCount += (data.count || 0);
-                        mergedCount += (data.merged || 0);
-                        excludedCount += (data.excluded_count || 0);
-                        continue;
-                    }
-                    errors.push(data.message || '订单 ' + orderId + ' 生成失败');
-                } else if (res.ok) {
-                    createdCount += 1;
-                } else {
-                    errors.push('订单 ' + orderId + ' 生成失败');
-                }
-            }
-
-            // 第二遍：补全未审核（待分拣）的采购订单——按新销售单明细增删改，无需再次确认
-            for (const orderId of toRefresh) {
-                const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=1', { method: 'POST' });
-                const contentType = res.headers.get('content-type') || '';
-                if (contentType.indexOf('application/json') !== -1) {
-                    const data = await res.json();
-                    if (data.error) {
-                        if (data.excluded) { excludedCount += (data.excluded_count || 1); }
-                        else { errors.push(data.message); }
-                    } else if (res.ok) {
-                        refreshedCount += 1;
-                        createdCount += (data.count || 0);
-                        mergedCount += (data.merged || 0);
-                        excludedCount += (data.excluded_count || 0);
-                    }
-                } else if (res.ok) {
-                    refreshedCount += 1;
-                }
-            }
-
-            let msg = '成功生成 ' + createdCount + ' 张采购订单';
-            if (refreshedCount > 0) msg += '，补全 ' + refreshedCount + ' 张未审核采购订单';
-            if (mergedCount > 0) msg += '，合并 ' + mergedCount + ' 条明细';
-            if (excludedCount > 0) msg += '（已审核 ' + excludedCount + ' 张自动跳过）';
-            if (errors.length > 0) {
-                msg += '\n\n以下订单生成失败：\n' + errors.join('\n');
-            }
-            alert(msg);
-            loadItems();
-        }
-
         function exportExcel(withValues) {
             const date = document.getElementById('historyDate').value;
             let url = '/api/sales_order/sort_items_by_supplier_excel';
@@ -11322,6 +11241,7 @@ pub async fn page_mobile_today_price(headers: axum::http::HeaderMap) -> Html<Str
             <a href="/mobile/sort_by_category" class="switch-link">按分类分拣</a>
             <a href="/mobile/sort_by_supplier" class="switch-link">按供应商分拣</a>
             <a href="/mobile/sort_comprehensive" class="switch-link">综合分拣</a>
+            <a class="switch-link" style="cursor:pointer;" onclick="generatePurchaseOrdersForDate()">📋 生成采购订单</a>
         </div>
         <div class="stats-bar">
             <div class="stat-item">
@@ -11389,6 +11309,96 @@ pub async fn page_mobile_today_price(headers: axum::http::HeaderMap) -> Html<Str
         function clearHistory() {
             document.getElementById('historyDate').value = '';
             loadItems();
+        }
+
+        // 生成采购订单（自供应商分拣页迁入）：按当前日期取当日销售订单，逐单生成/补全，同供应商同日期自动合并
+        async function generatePurchaseOrdersForDate() {
+            const date = document.getElementById('historyDate').value;
+            let url = '/api/sales_order/sort_items_by_supplier';
+            if (date) url += '?date=' + encodeURIComponent(date);
+            let sortSuppliers = [];
+            try {
+                const res = await fetch(url);
+                sortSuppliers = await res.json();
+            } catch (e) {
+                alert('获取当日销售订单失败：' + e);
+                return;
+            }
+            const orderIds = [];
+            (sortSuppliers || []).forEach(supplier => {
+                if (!supplier.purchasers) return;
+                supplier.purchasers.forEach(purchaser => {
+                    purchaser.items.forEach(item => {
+                        if (item.order_id && orderIds.indexOf(item.order_id) === -1) {
+                            orderIds.push(item.order_id);
+                        }
+                    });
+                });
+            });
+            if (orderIds.length === 0) {
+                alert((date || '当前') + ' 没有可生成采购订单的销售订单');
+                return;
+            }
+            if (!confirm('将为 ' + (date || '当前待分拣') + ' 的 ' + orderIds.length + ' 个销售订单生成或补全采购订单（已审核的自动跳过，同供应商同日期自动合并）。\n是否继续？')) return;
+
+            let createdCount = 0, mergedCount = 0, refreshedCount = 0, excludedCount = 0;
+            const errors = [];
+            const toRefresh = []; // 已有待分拣采购订单的订单：自动补全（force=1）
+
+            // 第一遍：分类——从未生成的直接新建；已有待分拣的收集待补全；已审核的跳过
+            for (const orderId of orderIds) {
+                const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=0', { method: 'POST' });
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.indexOf('application/json') !== -1) {
+                    const data = await res.json();
+                    if (data.error) {
+                        // 已审核/已处理的采购订单：不重复生成，自动跳过，不视为错误
+                        if (data.excluded) { excludedCount += (data.excluded_count || 1); continue; }
+                        errors.push(data.message); continue;
+                    }
+                    if (data.warning) { toRefresh.push(orderId); continue; }
+                    if (res.ok) {
+                        createdCount += (data.count || 0);
+                        mergedCount += (data.merged || 0);
+                        excludedCount += (data.excluded_count || 0);
+                        continue;
+                    }
+                    errors.push(data.message || '订单 ' + orderId + ' 生成失败');
+                } else if (res.ok) {
+                    createdCount += 1;
+                } else {
+                    errors.push('订单 ' + orderId + ' 生成失败');
+                }
+            }
+
+            // 第二遍：补全未审核（待分拣）的采购订单——按新销售单明细增删改，无需再次确认
+            for (const orderId of toRefresh) {
+                const res = await fetch('/api/sales_order/generate_purchase/' + orderId + '?force=1', { method: 'POST' });
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.indexOf('application/json') !== -1) {
+                    const data = await res.json();
+                    if (data.error) {
+                        if (data.excluded) { excludedCount += (data.excluded_count || 1); }
+                        else { errors.push(data.message); }
+                    } else if (res.ok) {
+                        refreshedCount += 1;
+                        createdCount += (data.count || 0);
+                        mergedCount += (data.merged || 0);
+                        excludedCount += (data.excluded_count || 0);
+                    }
+                } else if (res.ok) {
+                    refreshedCount += 1;
+                }
+            }
+
+            let msg = '成功生成 ' + createdCount + ' 张采购订单';
+            if (refreshedCount > 0) msg += '，补全 ' + refreshedCount + ' 张未审核采购订单';
+            if (mergedCount > 0) msg += '，合并 ' + mergedCount + ' 条明细';
+            if (excludedCount > 0) msg += '（已审核 ' + excludedCount + ' 张自动跳过）';
+            if (errors.length > 0) {
+                msg += '\n\n以下订单生成失败：\n' + errors.join('\n');
+            }
+            alert(msg);
         }
 
         function updatePriceInput(productId, value) {

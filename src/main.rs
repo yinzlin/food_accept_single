@@ -261,123 +261,6 @@ pub(crate) async fn serve_chart_js() -> impl IntoResponse {
 // 采购入库后，按商品ID更新当前进价/历史最高进价/历史最低进价
 // unit_price 为该采购明细单位单价，需换算回基础单位单价：base_unit_price = unit_price / ratio
 // 这里 base_quantity/quantity 可近似换算比例，但为稳妥直接用 unit_price 与商品当前记录比较（明细已按下单单位存储）。
-// 售价自动更新专用取整：保留两位小数，最末位仅允许 0/5/6/8/9
-// 就近取值（不向上靠）：末位与允许集合中最近者匹配
-// 映射表（百位百分位）：0→0, 1→0, 2→0, 3→5, 4→5, 5→5, 6→6, 7→8, 8→8, 9→9
-
-#[cfg(test)]
-mod price_rounding_tests {
-    use super::round_to_allowed_last_digit;
-
-    // 末位映射表：0/1/2→0, 3/4/5→5, 6→6, 7/8→8, 9→9
-    fn expected(whole: i64, last: i64) -> f64 {
-        let mapped = match last {
-            0 | 1 | 2 => 0,
-            3 | 4 | 5 => 5,
-            6 => 6,
-            7 | 8 => 8,
-            9 => 9,
-            _ => last,
-        };
-        (whole * 10 + mapped) as f64 / 100.0
-    }
-
-    #[test]
-    fn test_last_digit_zero_to_two_rounds_to_zero() {
-        for last in 0..=2 {
-            let price = 8.30 + (last as f64) * 0.01;
-            let r = round_to_allowed_last_digit(price);
-            assert!(
-                (r - expected(83, last)).abs() < 0.0001,
-                "末位 {} 输入 {} 期望 {} 实际 {}",
-                last, price, expected(83, last), r
-            );
-        }
-    }
-
-    #[test]
-    fn test_last_digit_three_to_five_rounds_to_five() {
-        for last in 3..=5 {
-            let price = 8.30 + (last as f64) * 0.01;
-            let r = round_to_allowed_last_digit(price);
-            assert!(
-                (r - expected(83, last)).abs() < 0.0001,
-                "末位 {} 输入 {} 期望 {} 实际 {}",
-                last, price, expected(83, last), r
-            );
-        }
-    }
-
-    #[test]
-    fn test_last_digit_six_unchanged() {
-        let r = round_to_allowed_last_digit(8.36);
-        assert!((r - 8.36).abs() < 0.0001, "8.36 期望 8.36 实际 {}", r);
-    }
-
-    #[test]
-    fn test_last_digit_seven_eight_rounds_to_eight() {
-        let r7 = round_to_allowed_last_digit(8.37);
-        assert!((r7 - 8.38).abs() < 0.0001, "8.37 期望 8.38 实际 {}", r7);
-        let r8 = round_to_allowed_last_digit(8.38);
-        assert!((r8 - 8.38).abs() < 0.0001, "8.38 期望 8.38 实际 {}", r8);
-    }
-
-    #[test]
-    fn test_last_digit_nine_unchanged() {
-        let r = round_to_allowed_last_digit(8.39);
-        assert!((r - 8.39).abs() < 0.0001, "8.39 期望 8.39 实际 {}", r);
-    }
-
-    #[test]
-    fn test_full_ten_cent_coverage() {
-        // 覆盖 0.00-0.09 共 10 个尾数，期望结果末位必须属于 {0,5,6,8,9}
-        let allowed = [0, 5, 6, 8, 9];
-        for last in 0..=9 {
-            let price = 12.30 + (last as f64) * 0.01;
-            let r = round_to_allowed_last_digit(price);
-            // 用 100 倍还原分
-            let cents = (r * 100.0).round() as i64;
-            let actual_last = cents % 10;
-            assert!(
-                allowed.contains(&actual_last),
-                "尾数 {} 输入 {} 得到 {}，末位 {} 不在允许集合",
-                last, price, r, actual_last
-            );
-        }
-    }
-
-    #[test]
-    fn test_realistic_purchase_markup_scenarios() {
-        // 模拟一批进价 × (1 + 0.5) 后的尾数
-        for purchase_cents in [350i64, 437, 562, 689, 715, 832, 999, 1024, 1280, 1567, 2034] {
-            let purchase = purchase_cents as f64 / 100.0;
-            let raw = purchase * 1.5;
-            let r = round_to_allowed_last_digit(raw);
-            let cents = (r * 100.0).round() as i64;
-            let last = cents % 10;
-            let allowed = [0, 5, 6, 8, 9];
-            assert!(
-                allowed.contains(&last),
-                "进价 {} → 原始售价 {} → 调整后 {} 末位 {} 不在允许集合",
-                purchase, raw, r, last
-            );
-        }
-    }
-
-    #[test]
-    fn test_zero_or_negative_returns_as_is() {
-        assert_eq!(round_to_allowed_last_digit(0.0), 0.0);
-        assert_eq!(round_to_allowed_last_digit(-1.5), -1.5);
-    }
-
-    #[test]
-    fn test_floating_edge_cases() {
-        // 浮点 8.57000000000001 应等同 8.57
-        let r = round_to_allowed_last_digit(8.570_000_000_000_007);
-        assert!((r - 8.58).abs() < 0.0001, "8.57(浮点) 期望 8.58 实际 {}", r);
-    }
-}
-
 // ===== 价格策略时段（product_price_schedule） =====
 // 政采价 / 超市比价按生效日期段管理，支持补录历史销售单时按 order_date 自动匹配
 // 时段连续性由数据库 UNIQUE(product_id, price_type, effective_date) 与
@@ -584,10 +467,11 @@ pub(crate) async fn recalc_base_price_by_markup(
         }
 
         let raw_price = purchase_price * (1.0 + markup_rate);
-        let new_base_price = round_to_allowed_last_digit(raw_price);
+        // 售价保留两位小数（四舍五入），不做末位数字限制
+        let new_base_price = round2(raw_price);
         eprintln!(
-            "[售价自动更新] 商品ID={} source={} 进价={:.4} 加成率={:.4} 原始售价={:.6} 取整后售价={:.4} 旧售价={:.4}",
-            product_id, source, purchase_price, markup_rate, raw_price, new_base_price, old_base_price
+            "[售价自动更新] 商品ID={} source={} 进价={:.4} 加成率={:.4} 计算售价={:.6} 旧售价={:.4}",
+            product_id, source, purchase_price, markup_rate, new_base_price, old_base_price
         );
         if (old_base_price - new_base_price).abs() < 0.001 {
             eprintln!("[售价自动更新] 商品ID={} 售价未变化，跳过写库", product_id);

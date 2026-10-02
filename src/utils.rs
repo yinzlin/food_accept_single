@@ -1247,26 +1247,9 @@ pub fn layout_html(title: &str, page: &str, content: &str) -> String {
     "#, title, sidebar_with_active, title, Local::now().format("%Y-%m-%d %H:%M"), content)
 }
 
-pub fn round_to_allowed_last_digit(price: f64) -> f64 {
-    if price <= 0.0 {
-        return price;
-    }
-    // 截断到分
-    let cents = (price * 100.0).round() / 100.0;
-    // 取出末位
-    let last = (cents * 100.0).round() as i64 % 10;
-    let mapped = match last {
-        0 | 1 | 2 => 0,
-        3 | 4 | 5 => 5,
-        6 => 6,
-        7 | 8 => 8,
-        9 => 9,
-        _ => last,
-    };
-    let integer_cents = (cents * 100.0).round() as i64;
-    let tens = integer_cents / 10;
-    let new_cents = tens * 10 + mapped;
-    new_cents as f64 / 100.0
+/// 售价统一保留两位小数（四舍五入），不做末位数字限制——计算售价标准取整
+pub fn round2(price: f64) -> f64 {
+    (price * 100.0).round() / 100.0
 }
 
 pub fn parse_keyword_pattern(params: &HashMap<String, String>) -> String {

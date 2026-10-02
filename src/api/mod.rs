@@ -5,7 +5,7 @@ use bytes::Bytes;
 use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use chrono::Local;
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
-use crate::utils::{xlsx_response, xlsx_header_format, parse_keyword_pattern, parse_csv, sanitize_filename_prefix, image_url_to_path, operation_action_label, build_category_tree_json, generate_order_no, round_to_allowed_last_digit};
+use crate::utils::{xlsx_response, xlsx_header_format, parse_keyword_pattern, parse_csv, sanitize_filename_prefix, image_url_to_path, operation_action_label, build_category_tree_json, generate_order_no, round2};
 use crate::models::*;
 use crate::update_product_purchase_prices;
 use crate::log_price_change;
@@ -3086,13 +3086,13 @@ pub async fn api_product_export() -> impl IntoResponse {
             let ai = row.get::<f64, _>("ai_price");
             let base_price = row.get::<f64, _>("base_price");
             let purchase_price = row.get::<f64, _>("purchase_price");
-            // 计算售价：政采价优先；否则商超1/2/3/AI 中非零价的平均（四舍五入保留 2 位）
+            // 计算售价：政采价优先；否则商超1/2/3/AI 中非零价的平均（不做取整，计算原值）
             let selling = if gov > 0.0 {
                 gov
             } else {
                 let vals = [sm1, sm2, sm3, ai];
                 let (sum, cnt) = vals.iter().fold((0.0f64, 0usize), |(s, c), &v| if v > 0.0 { (s + v, c + 1) } else { (s, c) });
-                if cnt == 0 { 0.0 } else { ((sum / cnt as f64) * 100.0).round() / 100.0 }
+                if cnt == 0 { 0.0 } else { round2(sum / cnt as f64) }
             };
             // 基础单价：非零计算售价则同步为计算售价，否则取基础单价原值
             let base_out = if selling > 0.0 { selling } else { base_price };
@@ -3681,11 +3681,11 @@ pub(crate) async fn sync_product_base_price(product_id: i64) {
             .flatten();
         let old_base_price: f64 = old_row.as_ref().map(|r| r.get::<f64, _>("base_price")).unwrap_or(0.0);
 
-        // 应用统一尾数规则
-        let normalized = round_to_allowed_last_digit(selling_price);
+        // 售价保留两位小数（四舍五入）后同步，不做末位数字限制
+        let normalized = round2(selling_price);
         eprintln!(
-            "[售价同步] 商品ID={} 同步原始售价={:.4} 尾数处理后={:.4} 旧售价={:.4}",
-            product_id, selling_price, normalized, old_base_price
+            "[售价同步] 商品ID={} 同步售价={:.4} 旧售价={:.4}",
+            product_id, normalized, old_base_price
         );
 
         let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
@@ -4060,10 +4060,11 @@ pub async fn api_product_batch_set_auto_update_price(
             let purchase: f64 = r.get("purchase_price");
             let markup: f64 = r.get("markup_rate");
             let raw = purchase * (1.0 + markup);
-            let new_base = round_to_allowed_last_digit(raw);
+            // 保留两位小数（四舍五入），不做末位数字限制
+            let new_base = round2(raw);
             eprintln!(
-                "[批量售价自动更新] 商品ID={} 进价={:.4} 加成率={:.4} 原始售价={:.6} 取整后={:.4} 旧售价={:.4}",
-                pid, purchase, markup, raw, new_base, old_base
+                "[批量售价自动更新] 商品ID={} 进价={:.4} 加成率={:.4} 计算售价={:.6} 旧售价={:.4}",
+                pid, purchase, markup, new_base, old_base
             );
             if (old_base - new_base).abs() >= 0.001 {
                 let _ = sqlx::query("UPDATE product SET base_price = ? WHERE id = ?")
@@ -4200,6 +4201,11 @@ pub async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req)
         Ok(res) => {
             let order_id = res.last_insert_rowid();
             if !req.items.is_empty() {
+                // base_quantity 服务端统一重算（product_unit.ratio 权威），不信任前端值——与销售单同一规则
+                let base_inputs: Vec<(i64, String, f64, f64)> = req.items.iter()
+                    .map(|it| (it.product_id, it.unit.clone().unwrap_or_default(), it.quantity, it.base_quantity.unwrap_or(0.0)))
+                    .collect();
+                let base_qtys = compute_base_quantities(&base_inputs).await;
                 let placeholders: Vec<String> = req.items.iter()
                     .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                     .collect();
@@ -4209,7 +4215,7 @@ pub async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req)
                 );
 
                 let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
-                for item in &req.items {
+                for (idx, item) in req.items.iter().enumerate() {
                     query = query
                         .bind(order_id)
                         .bind(item.product_id)
@@ -4220,7 +4226,7 @@ pub async fn api_purchase_order_create(headers: axum::http::HeaderMap, Json(req)
                         .bind(&item.unit)
                         .bind(item.unit_price)
                         .bind(item.quantity)
-                        .bind(item.base_quantity.unwrap_or(0.0))
+                        .bind(base_qtys[idx])
                         .bind(item.amount)
                         .bind(item.ordered_quantity.unwrap_or(0.0))
                         .bind(&item.remark)
@@ -4506,6 +4512,7 @@ async fn insert_purchase_item(
     order_id: i64,
     item: &crate::models::PurchaseOrderItemReq,
     fallback_source: Option<i64>,
+    base_qty: f64,
 ) {
     let _ = sqlx::query(
         "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark, warehouse_id, warehouse_name, sales_unit, source_sales_order_id, production_date, batch_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -4519,7 +4526,7 @@ async fn insert_purchase_item(
     .bind(&item.unit)
     .bind(item.unit_price)
     .bind(item.quantity)
-    .bind(item.base_quantity.unwrap_or(0.0))
+    .bind(base_qty)
     .bind(item.amount)
     .bind(item.ordered_quantity.unwrap_or(0.0))
     .bind(&item.remark)
@@ -4664,6 +4671,11 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
             }
         }
     }
+    // base_quantity 服务端统一重算（product_unit.ratio 权威），不信任前端值——与销售单同一规则
+    let base_inputs: Vec<(i64, String, f64, f64)> = req.items.iter()
+        .map(|it| (it.product_id, it.unit.clone().unwrap_or_default(), it.quantity, it.base_quantity.unwrap_or(0.0)))
+        .collect();
+    let base_qtys = compute_base_quantities(&base_inputs).await;
     for (db_id, _src) in &existing_by_id {
         if !req_ids.contains(db_id) {
             let _ = sqlx::query("DELETE FROM purchase_order_item WHERE id = ? AND order_id = ?")
@@ -4674,7 +4686,7 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
         }
     }
 
-    for item in &req.items {
+    for (idx, item) in req.items.iter().enumerate() {
         if let Some(iid) = item.id {
             if iid > 0 && existing_by_id.contains_key(&iid) {
                 let _ = sqlx::query(
@@ -4688,7 +4700,7 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
                 .bind(&item.unit)
                 .bind(item.unit_price)
                 .bind(item.quantity)
-                .bind(item.base_quantity.unwrap_or(0.0))
+                .bind(base_qtys[idx])
                 .bind(item.amount)
                 .bind(item.ordered_quantity.unwrap_or(0.0))
                 .bind(&item.remark)
@@ -4702,10 +4714,10 @@ pub async fn api_purchase_order_update(headers: axum::http::HeaderMap, Json(req)
                 .await
                 .ok();
             } else {
-                insert_purchase_item(&mut tx, req.id.unwrap_or(0), item, po_main_source).await;
+                insert_purchase_item(&mut tx, req.id.unwrap_or(0), item, po_main_source, base_qtys[idx]).await;
             }
         } else {
-            insert_purchase_item(&mut tx, req.id.unwrap_or(0), item, po_main_source).await;
+            insert_purchase_item(&mut tx, req.id.unwrap_or(0), item, po_main_source, base_qtys[idx]).await;
         }
     }
     if let Err(_) = tx.commit().await {
@@ -5712,7 +5724,6 @@ pub async fn api_purchase_order_import(headers: axum::http::HeaderMap, content: 
                         let unit = if item.len() > 4 { item[4].trim() } else { "个" };
                         let unit_price: f64 = if item.len() > 5 { item[5].trim().parse().unwrap_or(0.0) } else { 0.0 };
                         let quantity: f64 = if item.len() > 6 { item[6].trim().parse().unwrap_or(0.0) } else { 0.0 };
-                        let base_quantity: f64 = if item.len() > 7 { item[7].trim().parse().unwrap_or(0.0) } else { 0.0 };
                         let amount: f64 = if item.len() > 8 { item[8].trim().parse().unwrap_or(0.0) } else { 0.0 };
                         let item_remark = if item.len() > 9 { item[9].trim() } else { "" };
                         
@@ -5725,7 +5736,20 @@ pub async fn api_purchase_order_import(headers: axum::http::HeaderMap, content: 
                             .flatten()
                             .map(|r| r.get::<i64, _>("id"))
                             .unwrap_or(0);
-                        
+
+                        // base_quantity 服务端按 product_unit.ratio 重算（有 ratio 时权威，否则回退模板值或 quantity）
+                        let computed_bq = if product_id > 0 {
+                            sqlx::query("SELECT ratio FROM product_unit WHERE product_id = ? AND unit_name = ?")
+                                .bind(product_id).bind(unit)
+                                .fetch_optional(crate::db::pool()).await
+                                .ok().flatten()
+                                .map(|r| ((quantity * r.get::<f64, _>("ratio")) * 100.0).round() / 100.0)
+                        } else { None };
+                        let bq = computed_bq.unwrap_or_else(|| {
+                            let from_sheet = if item.len() > 7 { item[7].trim().parse().unwrap_or(0.0) } else { 0.0 };
+                            if from_sheet > 0.0 { from_sheet } else { quantity }
+                        });
+
                         sqlx::query(
                             "INSERT INTO purchase_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, ordered_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
@@ -5738,7 +5762,7 @@ pub async fn api_purchase_order_import(headers: axum::http::HeaderMap, content: 
                         .bind(unit)
                         .bind(unit_price)
                         .bind(quantity)
-                        .bind(base_quantity)
+                        .bind(bq)
                         .bind(amount)
                         .bind(0.0f64)
                         .bind(item_remark)
@@ -6489,7 +6513,6 @@ pub async fn api_sales_order_import(headers: axum::http::HeaderMap, content: Byt
                         let unit = if item.len() > 4 { item[4].trim() } else { "个" };
                         let unit_price: f64 = if item.len() > 5 { item[5].trim().parse().unwrap_or(0.0) } else { 0.0 };
                         let quantity: f64 = if item.len() > 6 { item[6].trim().parse().unwrap_or(0.0) } else { 0.0 };
-                        let base_quantity: f64 = if item.len() > 7 { item[7].trim().parse().unwrap_or(0.0) } else { 0.0 };
                         let amount: f64 = if item.len() > 8 { item[8].trim().parse().unwrap_or(0.0) } else { 0.0 };
                         let item_remark = if item.len() > 9 { item[9].trim() } else { "" };
                         
@@ -6502,7 +6525,20 @@ pub async fn api_sales_order_import(headers: axum::http::HeaderMap, content: Byt
                             .flatten()
                             .map(|r| r.get::<i64, _>("id"))
                             .unwrap_or(0);
-                        
+
+                        // base_quantity 服务端按 product_unit.ratio 重算（有 ratio 时权威，否则回退模板值或 quantity）
+                        let computed_bq = if product_id > 0 {
+                            sqlx::query("SELECT ratio FROM product_unit WHERE product_id = ? AND unit_name = ?")
+                                .bind(product_id).bind(unit)
+                                .fetch_optional(crate::db::pool()).await
+                                .ok().flatten()
+                                .map(|r| ((quantity * r.get::<f64, _>("ratio")) * 100.0).round() / 100.0)
+                        } else { None };
+                        let bq = computed_bq.unwrap_or_else(|| {
+                            let from_sheet = if item.len() > 7 { item[7].trim().parse().unwrap_or(0.0) } else { 0.0 };
+                            if from_sheet > 0.0 { from_sheet } else { quantity }
+                        });
+
                         sqlx::query(
                             "INSERT INTO sales_order_item(order_id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
@@ -6515,7 +6551,7 @@ pub async fn api_sales_order_import(headers: axum::http::HeaderMap, content: Byt
                         .bind(unit)
                         .bind(unit_price)
                         .bind(quantity)
-                        .bind(base_quantity)
+                        .bind(bq)
                         .bind(amount)
                         .bind(0.0f64)
                         .bind(item_remark)
@@ -8294,7 +8330,17 @@ pub async fn api_sales_order_generate_purchase(
 
         for (product_id, product_name, alias1, alias2, spec, unit, quantity, ordered_quantity, unit_price, _base_unit, _base_price, remark) in items {
             let amount = ((quantity * unit_price) * 100.0).round() / 100.0;
-            let base_quantity = quantity;
+            // base_quantity 按 product_unit.ratio 现算（销售开"件"时采购入库基础数量必须乘比例），
+            // 与手工开单（create/update 服务端重算）和审核写流水兜底保持同一口径
+            let base_quantity = sqlx::query("SELECT ratio FROM product_unit WHERE product_id = ? AND unit_name = ?")
+                .bind(product_id)
+                .bind(&unit)
+                .fetch_optional(crate::db::pool())
+                .await
+                .ok()
+                .flatten()
+                .map(|r| ((quantity * r.get::<f64, _>("ratio")) * 100.0).round() / 100.0)
+                .unwrap_or(quantity);
             let sales_unit = unit.clone();
             // 1) 快照中找 (P,U, warehouse) → 尝试按主键 UPDATE
             // key 加 warehouse_id：跨仓库同 (P,U) 是不同行，必须区分
