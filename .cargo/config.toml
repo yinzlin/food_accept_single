@@ -1,5 +1,5 @@
 # 默认编译 Win7 兼容目标（该二进制在 Win7/10/11 上均可运行）
-# 需 nightly 工具链：rustup override set nightly（已在本项目目录设置）
+# 需 nightly 工具链：rustup override set nightly（在本项目目录执行）
 [build]
 target = "x86_64-win7-windows-msvc"
 
