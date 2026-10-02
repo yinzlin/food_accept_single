@@ -4778,9 +4778,9 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                 document.getElementById('orderNoInput').value = order.order_no;
                 document.getElementById('orderDateInput').value = order.order_date;
                 document.getElementById('remarkInput').value = order.remark || '';
-                // 供应商与供货车牌号：主表字段为空时回退到默认占位文本，与新建时一致
-                document.getElementById('supplierCompanyInput').value = order.supplier_company || '湖南食全味美餐饮管理有限公司';
-                document.getElementById('truckPlateInput').value = order.truck_plate || '湘A·BE9312';
+                // 供应商与供货车牌号：按订单实际保存内容显示，为空则显示空（不回退默认占位文本）
+                document.getElementById('supplierCompanyInput').value = order.supplier_company || '';
+                document.getElementById('truckPlateInput').value = order.truck_plate || '';
                 document.getElementById('discountRateInput').value = order.discount_rate || 0;
                 document.getElementById('amountReductionInput').value = order.amount_reduction || 0;
                 setSalesOrderImage('customer', order.customer_order_image || null);
@@ -5066,10 +5066,11 @@ pub async fn page_sales(headers: axum::http::HeaderMap) -> Html<String> {
                         document.getElementById('warehouseId').value = wid;
                         document.getElementById('warehouseInput').value = wname || '';
                     }}
+                    // 用 !== null 区分"未存过"与"存了空值"：用户清空后保存的，新建时应显示空而不是默认占位文本
                     const sc = localStorage.getItem('so_last_supplier_company');
-                    if (sc) document.getElementById('supplierCompanyInput').value = sc;
+                    if (sc !== null) document.getElementById('supplierCompanyInput').value = sc;
                     const tp = localStorage.getItem('so_last_truck_plate');
-                    if (tp) document.getElementById('truckPlateInput').value = tp;
+                    if (tp !== null) document.getElementById('truckPlateInput').value = tp;
                     const cp = localStorage.getItem('so_last_contact_phone');
                     if (cp) document.getElementById('contactPhoneInput').value = cp;
                 }} catch (e) {{}}
@@ -5924,11 +5925,11 @@ pub async fn page_query_overview() -> Html<String> {
 pub async fn page_query_purchase_price() -> Html<String> {
     let content = r#"
         <div class="card p-4">
-            <h3>采购价格查询</h3>
+            <h3>采购台账查询</h3>
             <div class="row mb-3">
                 <div class="col-md-4">
-                    <label>商品名称：</label>
-                    <input type="text" id="productName" class="form-control" placeholder="输入商品名称">
+                    <label>品名规格：</label>
+                    <input type="text" id="productName" class="form-control" placeholder="输入品名规格">
                 </div>
                 <div class="col-md-4">
                     <label>供应商：</label>
@@ -5942,14 +5943,14 @@ pub async fn page_query_purchase_price() -> Html<String> {
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>商品名称</th><th>规格</th><th>供应商</th><th id="thPurchaseUnitPrice">采购单价</th><th>采购日期</th><th>采购数量</th></tr></thead>
+                <thead><tr><th>进货日期</th><th>品名规格</th><th>单位</th><th id="thPurchaseUnitPrice">单价</th><th>数量</th><th id="thPurchaseAmount">金额</th><th>生产日期</th><th>保质期</th><th>供应商</th><th>联系电话</th><th>备注</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
             <div id="pagination" class="mt-3"></div>
         </div>
         <script>
             let currentPage = 1;
-            // 采购单价为进价信息，仅超级管理员可见
+            // 单价/金额为进价信息，仅超级管理员可见
             let isSuperAdmin = false;
             fetch('/api/login/check').then(r => r.json()).then(d => {
                 if (d && d.logged_in) {
@@ -5958,6 +5959,8 @@ pub async fn page_query_purchase_price() -> Html<String> {
                 if (!isSuperAdmin) {
                     const th = document.getElementById('thPurchaseUnitPrice');
                     if (th) th.style.display = 'none';
+                    const tha = document.getElementById('thPurchaseAmount');
+                    if (tha) tha.style.display = 'none';
                 }
             });
             async function loadSuppliers() {
@@ -5974,7 +5977,7 @@ pub async fn page_query_purchase_price() -> Html<String> {
             }
             async function loadData(page) {
                 if (page !== undefined) currentPage = page;
-                const url = '/api/query/purchase_price?product_name=' + encodeURIComponent(document.getElementById('productName').value) + 
+                const url = '/api/query/purchase_price?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
                     '&supplier_id=' + document.getElementById('supplierId').value +
                     '&page=' + currentPage + '&page_size=20';
                 const res = await fetch(url);
@@ -5983,12 +5986,25 @@ pub async fn page_query_purchase_price() -> Html<String> {
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (data.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无数据</td></tr>';
                     renderPagination(result.page, result.total_pages, result.total);
                     return;
                 }
                 data.forEach(item => {
-                    tbody.innerHTML += '<tr><td>' + item.product_name + '</td><td>' + (item.spec || '-') + '</td><td>' + item.supplier_name + '</td>' + (isSuperAdmin ? '<td>¥' + item.unit_price.toFixed(2) + '/' + (item.unit || '') + '</td>' : '') + '<td>' + item.order_date + '</td><td>' + item.quantity.toFixed(2) + (item.unit || '') + '</td></tr>';
+                    // 列顺序：进货日期 品名规格 单位 单价 数量 金额 生产日期 保质期 供应商 联系电话 备注
+                    tbody.innerHTML += '<tr>' +
+                        '<td>' + item.order_date + '</td>' +
+                        '<td>' + item.product_name + '</td>' +
+                        '<td>' + (item.unit || '') + '</td>' +
+                        (isSuperAdmin ? '<td>' + item.unit_price.toFixed(2) + '</td>' : '') +
+                        '<td>' + item.quantity.toFixed(2) + '</td>' +
+                        (isSuperAdmin ? '<td>' + item.amount.toFixed(2) + '</td>' : '') +
+                        '<td>' + (item.production_date || '') + '</td>' +
+                        '<td>' + (item.shelf_life || '') + '</td>' +
+                        '<td>' + item.supplier_name + '</td>' +
+                        '<td>' + (item.contact_phone || '') + '</td>' +
+                        '<td>' + (item.remark || '') + '</td>' +
+                        '</tr>';
                 });
                 renderPagination(result.page, result.total_pages, result.total);
             }
@@ -6011,7 +6027,7 @@ pub async fn page_query_purchase_price() -> Html<String> {
             loadSuppliers();
         </script>
     "#;
-    Html(crate::layout_html("采购价格查询", "/query/purchase_price", &content))
+    Html(crate::layout_html("采购台账查询", "/query/purchase_price", &content))
 }
 
 pub async fn page_query_sales_price(headers: axum::http::HeaderMap) -> Html<String> {

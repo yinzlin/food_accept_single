@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use chrono::Local;
-use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, XlsxError};
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
 use crate::utils::{xlsx_response, xlsx_header_format, parse_keyword_pattern, parse_csv, sanitize_filename_prefix, image_url_to_path, operation_action_label, build_category_tree_json, generate_order_no, round_to_allowed_last_digit};
 use crate::models::*;
 use crate::update_product_purchase_prices;
@@ -6644,12 +6644,13 @@ pub async fn api_query_purchase_price(axum::extract::Query(params): axum::extrac
     let offset = (page - 1) * page_size;
     
     let mut base_sql = String::from(
-        " FROM purchase_order_item poi 
-         JOIN purchase_order po ON poi.order_id = po.id 
-         JOIN supplier s ON po.supplier_id = s.id WHERE 1=1"
+        " FROM purchase_order_item poi
+         JOIN purchase_order po ON poi.order_id = po.id
+         JOIN supplier s ON po.supplier_id = s.id
+         JOIN product p ON poi.product_id = p.id WHERE 1=1"
     );
     let mut binds: Vec<String> = Vec::new();
-    
+
     if !product_name.is_empty() {
         base_sql.push_str(" AND poi.product_name LIKE ?");
         binds.push(format!("%{}%", product_name));
@@ -6668,7 +6669,7 @@ pub async fn api_query_purchase_price(axum::extract::Query(params): axum::extrac
     let total: i64 = total_rows.get("COUNT(*)");
     
     let data_sql = format!(
-        "SELECT poi.product_name, poi.spec, poi.unit_price, poi.quantity, poi.unit, po.order_date, s.name as supplier_name {data_sql} ORDER BY po.order_date DESC LIMIT ? OFFSET ?",
+        "SELECT poi.product_name, poi.unit, poi.unit_price, poi.quantity, poi.amount, poi.production_date, poi.remark, p.shelf_life, po.order_date, s.name as supplier_name, s.phone as contact_phone {data_sql} ORDER BY po.order_date ASC, poi.id ASC LIMIT ? OFFSET ?",
         data_sql = base_sql
     );
     let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str()));
@@ -6684,14 +6685,19 @@ pub async fn api_query_purchase_price(axum::extract::Query(params): axum::extrac
         .map(|row| {
             let unit_price: f64 = row.get("unit_price");
             let quantity: f64 = row.get("quantity");
+            let amount: f64 = row.get("amount");
             serde_json::json!({
-                "product_name": row.get::<String, _>("product_name"),
-                "spec": row.get::<Option<String>, _>("spec"),
-                "unit": row.get::<Option<String>, _>("unit"),
-                "supplier_name": row.get::<String, _>("supplier_name"),
-                "unit_price": unit_price,
                 "order_date": row.get::<String, _>("order_date"),
+                "product_name": row.get::<String, _>("product_name"),
+                "unit": row.get::<Option<String>, _>("unit"),
+                "unit_price": unit_price,
                 "quantity": quantity,
+                "amount": amount,
+                "production_date": row.get::<Option<String>, _>("production_date"),
+                "shelf_life": row.get::<Option<String>, _>("shelf_life"),
+                "supplier_name": row.get::<String, _>("supplier_name"),
+                "contact_phone": row.get::<Option<String>, _>("contact_phone"),
+                "remark": row.get::<Option<String>, _>("remark"),
             })
         })
         .collect();
@@ -9547,22 +9553,110 @@ pub async fn api_query_profit_detail(axum::extract::Query(params): axum::extract
 }
 
 pub async fn api_query_purchase_price_export(headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
-    // 采购单价为进价信息，仅超级管理员可见：非 super_admin 导出时该列置空
+    // 单价/金额为进价信息，仅超级管理员可见：非 super_admin 导出时这两列置空
     let is_super_admin = crate::auth::get_user_ctx(&headers).await.role == "super_admin";
     let product_name = params.get("product_name").map(|s| s.as_str()).unwrap_or(""); let supplier_id = params.get("supplier_id").map(|s| s.as_str()).unwrap_or("");
-    let mut base_sql = String::from(" FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id WHERE 1=1");
+    let mut base_sql = String::from(" FROM purchase_order_item poi JOIN purchase_order po ON poi.order_id = po.id JOIN supplier s ON po.supplier_id = s.id JOIN product p ON poi.product_id = p.id WHERE 1=1");
     let mut binds: Vec<String> = Vec::new();
     if !product_name.is_empty() { base_sql.push_str(" AND poi.product_name LIKE ?"); binds.push(format!("%{}%", product_name)); }
     if !supplier_id.is_empty() { base_sql.push_str(" AND po.supplier_id = ?"); binds.push(supplier_id.to_string()); }
-    let data_sql = format!("SELECT poi.product_name, poi.spec, poi.unit, poi.unit_price, poi.quantity, po.order_date, s.name as supplier_name {} ORDER BY po.order_date DESC, po.id DESC, poi.id ASC", base_sql);
+    let data_sql = format!("SELECT poi.product_name, poi.unit, poi.unit_price, poi.quantity, poi.amount, poi.production_date, poi.remark, p.shelf_life, po.order_date, s.name as supplier_name, s.phone as contact_phone {} ORDER BY po.order_date ASC, poi.id ASC", base_sql);
     let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str())); for b in &binds { query = query.bind(b); }
     let rows = query.fetch_all(crate::db::pool()).await.unwrap_or_default();
-    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("采购价格").unwrap();
-    let hf = xlsx_header_format(0x4472C4);
-    for (col, h) in ["商品名称", "规格", "供应商", "采购单价", "采购日期", "采购数量"].iter().enumerate() { ws.write_with_format(0, col as u16, if *h == "采购单价" && !is_super_admin { "" } else { *h }, &hf).unwrap(); }
-    ws.set_column_width(0, 20).unwrap(); ws.set_column_width(1, 14).unwrap(); ws.set_column_width(2, 16).unwrap(); ws.set_column_width(3, 14).unwrap(); ws.set_column_width(4, 14).unwrap(); ws.set_column_width(5, 14).unwrap();
-    for (i, row) in rows.iter().enumerate() { let r = (i + 1) as u32; ws.write(r, 0, row.get::<String, _>("product_name")).unwrap(); ws.write(r, 1, row.get::<Option<String>, _>("spec").unwrap_or_default()).unwrap(); ws.write(r, 2, row.get::<String, _>("supplier_name")).unwrap(); if is_super_admin { ws.write(r, 3, row.get::<f64, _>("unit_price")).unwrap(); } else { ws.write(r, 3, "").unwrap(); } ws.write(r, 4, row.get::<String, _>("order_date")).unwrap(); ws.write(r, 5, row.get::<f64, _>("quantity")).unwrap(); }
-    xlsx_response(workbook.save_to_buffer().unwrap(), "采购价格查询.xlsx")
+    let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("采购台账").unwrap();
+    // 列头：浅灰底、黑色加粗字
+    let hf = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xD9D9D9))
+        .set_font_color(Color::Black)
+        .set_align(FormatAlign::Center)
+        .set_border(FormatBorder::Thin);
+    // 打印布局：A4 横版，上下边距为 0，左右预留 2cm 装订区，水平居中（便于双面打印装订）
+    ws.set_landscape();
+    ws.set_paper_size(9); // 9 = A4
+    let margin_cm = 2.0f64 / 2.54; // 2cm 转英寸
+    ws.set_margins(margin_cm, margin_cm, 0.0, 0.0, 0.0, 0.0);
+    ws.set_print_center_horizontally(true);
+    // 页脚居中输出页码：第n页
+    ws.set_footer("&C第&[Page]页");
+    // 每页重复输出表头大标题行（第1行）与列头行（第3行）
+    ws.set_repeat_rows(0, 2).unwrap();
+    // 记录行网格边框：居中格式 / 默认左对齐格式
+    let grid_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center);
+    let grid_left = Format::new().set_border(FormatBorder::Thin);
+    // 长文本自动缩小填充：品名规格（左对齐）、供应商（居中）
+    let grid_shrink_left = Format::new().set_border(FormatBorder::Thin).set_shrink();
+    let grid_shrink_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center).set_shrink();
+    // 表头大标题：商品进货台账
+    let title_fmt = Format::new().set_bold().set_font_size(20.0).set_align(FormatAlign::Center);
+    ws.merge_range(0, 0, 0, 11, "商 品 进 货 台 账", &title_fmt).unwrap();
+    // 第2行为空白间隔行（表头与表格间隔一行）
+    // 列头（第3行）：进货日期 序号 品名规格 单位 单价 数量 金额 生产日期 保质期 供应商 联系电话 备注
+    let headers_arr = ["进货日期", "序号", "品名规格", "单位", "单价", "数量", "金额", "生产日期", "保质期", "供应商", "联系电话", "备注"];
+    for (col, h) in headers_arr.iter().enumerate() {
+        let blank = !is_super_admin && (*h == "单价" || *h == "金额");
+        ws.write_with_format(2, col as u16, if blank { "" } else { *h }, &hf).unwrap();
+    }
+    let widths = [11u32, 5, 16, 5, 8, 8, 12, 11, 6, 14, 12, 10];
+    for (col, w) in widths.iter().enumerate() { ws.set_column_width(col as u16, *w).unwrap(); }
+    // 序号以日期重新计数（每行均为明细记录，逐行编号）
+    let mut prev_date = String::new();
+    let mut seq: u32 = 0;
+    for (i, row) in rows.iter().enumerate() {
+        let r = (i + 3) as u32;
+        let date = row.get::<String, _>("order_date");
+        if date != prev_date { seq = 1; prev_date = date.clone(); } else { seq += 1; }
+        ws.write_with_format(r, 0, date, &grid_center).unwrap();
+        ws.write_with_format(r, 1, seq, &grid_center).unwrap();
+        ws.write_with_format(r, 2, row.get::<String, _>("product_name"), &grid_shrink_left).unwrap();
+        ws.write_with_format(r, 3, row.get::<Option<String>, _>("unit").unwrap_or_default(), &grid_center).unwrap();
+        // 单价/数量/金额：为 0 或空时留白不填 0
+        let unit_price = row.get::<Option<f64>, _>("unit_price").unwrap_or(0.0);
+        if is_super_admin && unit_price != 0.0 {
+            ws.write_with_format(r, 4, unit_price, &grid_left).unwrap();
+        } else { ws.write_with_format(r, 4, "", &grid_left).unwrap(); }
+        let qty = row.get::<Option<f64>, _>("quantity").unwrap_or(0.0);
+        if qty != 0.0 {
+            ws.write_with_format(r, 5, qty, &grid_left).unwrap();
+        } else { ws.write_with_format(r, 5, "", &grid_left).unwrap(); }
+        let amount = row.get::<Option<f64>, _>("amount").unwrap_or(0.0);
+        if is_super_admin && amount != 0.0 {
+            ws.write_with_format(r, 6, amount, &grid_left).unwrap();
+        } else { ws.write_with_format(r, 6, "", &grid_left).unwrap(); }
+        ws.write_with_format(r, 7, row.get::<Option<String>, _>("production_date").unwrap_or_default(), &grid_center).unwrap();
+        ws.write_with_format(r, 8, row.get::<Option<String>, _>("shelf_life").unwrap_or_default(), &grid_center).unwrap();
+        ws.write_with_format(r, 9, row.get::<String, _>("supplier_name"), &grid_shrink_center).unwrap();
+        ws.write_with_format(r, 10, row.get::<Option<String>, _>("contact_phone").unwrap_or_default(), &grid_center).unwrap();
+        ws.write_with_format(r, 11, row.get::<Option<String>, _>("remark").unwrap_or_default(), &grid_left).unwrap();
+    }
+    // 数据不足 25 条时补空行，保证每页固定 25 条明细记录（空行带网格边框）
+    const PAGE_SIZE: usize = 25;
+    let total_data = rows.len();
+    let fill = (PAGE_SIZE - (total_data % PAGE_SIZE)) % PAGE_SIZE;
+    for i in 0..fill {
+        let r = (total_data + i + 3) as u32;
+        for col in 0..12u16 {
+            ws.write_with_format(r, col, "", &grid_left).unwrap();
+        }
+    }
+    // 行高：表头行 30，其余（间隔行、列头、数据行、补齐空行）均为 20
+    let last_row = (rows.len() + fill) as u32 + 2;
+    for r in 0..=last_row {
+        ws.set_row_height(r, 20.0).unwrap();
+    }
+    ws.set_row_height(0, 30.0).unwrap();
+    // 每页固定 25 条明细记录（不含列头）：在每满 25 条数据后插入分页符（0 基行号，数据从第 3 行开始）
+    // set_page_breaks(x) 表示在 x 行之后分页；第 c 条数据行号 = c+2，故分界 = c+3
+    let total = rows.len();
+    let breaks: Vec<u32> = (1..)
+        .map(|k| k * 25)
+        .take_while(|&c| c < total)
+        .map(|c| c as u32 + 3)
+        .collect();
+    if !breaks.is_empty() {
+        ws.set_page_breaks(&breaks).unwrap();
+    }
+    xlsx_response(workbook.save_to_buffer().unwrap(), "采购台账查询.xlsx")
 }
 
 pub async fn api_query_purchase_summary_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {

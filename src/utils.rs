@@ -150,7 +150,7 @@ pub fn sidebar_html() -> String {
                                     <a href="/query/purchase_document"><span class="node-icon">🧾</span><span class="node-label">采购单据列表</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/purchase_price">
-                                    <a href="/query/purchase_price"><span class="node-icon">💰</span><span class="node-label">采购价格查询</span></a>
+                                    <a href="/query/purchase_price"><span class="node-icon">💰</span><span class="node-label">采购台账查询</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/purchase_summary">
                                     <a href="/query/purchase_summary"><span class="node-icon">📊</span><span class="node-label">采购汇总统计</span></a>
