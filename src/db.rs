@@ -445,6 +445,35 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
         .execute(pool)
         .await;
 
+    // 定点供应商档案：定点标记/编号、负责人、资质证照、合同信息
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN is_designated INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN designated_no TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN legal_person TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN credit_code TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN license_no TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN license_expire TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN contract_no TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN contract_start TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE supplier ADD COLUMN contract_end TEXT")
+        .execute(pool)
+        .await;
+
     let _ = sqlx::query("ALTER TABLE purchaser ADD COLUMN business_scope TEXT")
         .execute(pool)
         .await;
@@ -613,6 +642,93 @@ pub async fn init_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_type ON stock_movement(movement_type, created_at)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_warehouse ON stock_movement(warehouse_id, product_id, created_at)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sm_order_date ON stock_movement(product_id, order_date)").execute(pool).await;
+
+    // 出入库记录（数量保管账）账本快照列：append-only 流水在写入时冗余业务溯源信息，免 join 且不怕主数据后改
+    let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN ref_item_id INTEGER").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN production_date TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN batch_no TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN ref_no TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN party_name TEXT").execute(pool).await;
+    // 快照版本标记：新代码写入的流水恒为 1（写入即携带真实明细/批次快照）；历史行为 NULL，由下方迁移回填。
+    // 用标记而非时间分界，可对任何环境（含未来全新部署的客户库）幂等重算，且绝不覆盖新行的时点快照。
+    let _ = sqlx::query("ALTER TABLE stock_movement ADD COLUMN snapshot_version INTEGER").execute(pool).await;
+
+    // 历史流水一次性回填（幂等：只补 NULL/空）。单据号/往来单位为单据级，直接关联回填
+    let _ = sqlx::query(
+        "UPDATE stock_movement SET
+            ref_no = COALESCE((SELECT po.order_no FROM purchase_order po WHERE po.id = stock_movement.ref_id), ref_no),
+            party_name = COALESCE((SELECT s.name FROM purchase_order po JOIN supplier s ON po.supplier_id = s.id WHERE po.id = stock_movement.ref_id), party_name)
+         WHERE movement_type = 'purchase' AND (ref_no IS NULL OR ref_no = '')"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "UPDATE stock_movement SET
+            ref_no = COALESCE((SELECT so.order_no FROM sales_order so WHERE so.id = stock_movement.ref_id), ref_no),
+            party_name = COALESCE((SELECT pu.name FROM sales_order so JOIN purchaser pu ON so.purchaser_id = pu.id WHERE so.id = stock_movement.ref_id), party_name)
+         WHERE movement_type = 'sales' AND (ref_no IS NULL OR ref_no = '')"
+    ).execute(pool).await;
+
+    // 明细级回填：一轮审核按明细顺序逐行写流水（同单同商品可能有多行，如补采/分行验收），
+    // 故同方向流水按 id 的轮次序号，对同单同商品明细按 id 顺序取模配对（反审核/重审的多轮同样成立）；
+    // 冲销方向独立编号配对。配对失败（明细已被编辑删除）保持 NULL。
+    let _ = sqlx::query(
+        "UPDATE stock_movement
+         SET ref_item_id = (
+            SELECT m.id FROM (
+                SELECT poi.id, poi.order_id, poi.product_id,
+                       (SELECT COUNT(*) FROM purchase_order_item x
+                         WHERE x.order_id = poi.order_id AND x.product_id = poi.product_id AND x.id <= poi.id) AS irn
+                FROM purchase_order_item poi
+            ) m
+            WHERE m.order_id = stock_movement.ref_id AND m.product_id = stock_movement.product_id
+              AND m.irn = (
+                  ((SELECT COUNT(*) FROM stock_movement y
+                     WHERE y.ref_id = stock_movement.ref_id AND y.product_id = stock_movement.product_id
+                       AND y.movement_type = stock_movement.movement_type AND y.direction = stock_movement.direction
+                       AND y.id <= stock_movement.id) - 1)
+                  %
+                  (SELECT COUNT(*) FROM purchase_order_item z
+                     WHERE z.order_id = stock_movement.ref_id AND z.product_id = stock_movement.product_id)
+              ) + 1
+         )
+         WHERE movement_type = 'purchase' AND snapshot_version IS NULL"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "UPDATE stock_movement
+         SET ref_item_id = (
+            SELECT m.id FROM (
+                SELECT soi.id, soi.order_id, soi.product_id,
+                       (SELECT COUNT(*) FROM sales_order_item x
+                         WHERE x.order_id = soi.order_id AND x.product_id = soi.product_id AND x.id <= soi.id) AS irn
+                FROM sales_order_item soi
+            ) m
+            WHERE m.order_id = stock_movement.ref_id AND m.product_id = stock_movement.product_id
+              AND m.irn = (
+                  ((SELECT COUNT(*) FROM stock_movement y
+                     WHERE y.ref_id = stock_movement.ref_id AND y.product_id = stock_movement.product_id
+                       AND y.movement_type = stock_movement.movement_type AND y.direction = stock_movement.direction
+                       AND y.id <= stock_movement.id) - 1)
+                  %
+                  (SELECT COUNT(*) FROM sales_order_item z
+                     WHERE z.order_id = stock_movement.ref_id AND z.product_id = stock_movement.product_id)
+              ) + 1
+         )
+         WHERE movement_type = 'sales' AND snapshot_version IS NULL"
+    ).execute(pool).await;
+    // 批次按配对后的 ref_item_id 回填（历史流水未存批次，取明细当前值）
+    let _ = sqlx::query(
+        "UPDATE stock_movement SET
+            production_date = (SELECT poi.production_date FROM purchase_order_item poi WHERE poi.id = stock_movement.ref_item_id),
+            batch_no = (SELECT poi.batch_no FROM purchase_order_item poi WHERE poi.id = stock_movement.ref_item_id)
+         WHERE movement_type = 'purchase' AND snapshot_version IS NULL"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "UPDATE stock_movement SET
+            production_date = (SELECT soi.production_date FROM sales_order_item soi WHERE soi.id = stock_movement.ref_item_id),
+            batch_no = (SELECT soi.batch_no FROM sales_order_item soi WHERE soi.id = stock_movement.ref_item_id)
+         WHERE movement_type = 'sales' AND snapshot_version IS NULL"
+    ).execute(pool).await;
+    // 回填完成，历史行打上版本标记（配对失败的也标记，避免每次启动重复尝试）
+    let _ = sqlx::query("UPDATE stock_movement SET snapshot_version = 1 WHERE snapshot_version IS NULL").execute(pool).await;
 
     sqlx::query(
         r#"

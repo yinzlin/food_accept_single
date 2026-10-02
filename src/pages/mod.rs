@@ -25,14 +25,62 @@ pub async fn page_index(headers: axum::http::HeaderMap) -> Html<String> {
     } else {
         String::new()
     };
-    
+
+    // 定点供应商证照/合同 30 天内到期或已过期提醒（仅超级管理员）
+    let license_alert_card = if is_super_admin {
+        let alert_rows = sqlx::query(
+            "SELECT name, designated_no, license_expire, contract_end FROM supplier \
+             WHERE is_designated = 1 AND audit_status = 'confirmed' AND ( \
+                 (license_expire IS NOT NULL AND license_expire <> '' AND date(license_expire) <= date('now','+30 day')) \
+                 OR (contract_end IS NOT NULL AND contract_end <> '' AND date(contract_end) <= date('now','+30 day')) \
+             ) ORDER BY COALESCE(license_expire, contract_end) ASC"
+        )
+        .fetch_all(crate::pool())
+        .await
+        .unwrap_or_default();
+        if alert_rows.is_empty() {
+            String::new()
+        } else {
+            let today = Local::now().date_naive();
+            let mut items_html = String::new();
+            for row in &alert_rows {
+                let name: String = row.get("name");
+                let designated_no: String = row.get::<Option<String>, _>("designated_no").unwrap_or_default();
+                let mut parts: Vec<String> = Vec::new();
+                for (label, key) in [("许可证", "license_expire"), ("供货合同", "contract_end")] {
+                    let ds: Option<String> = row.get(key);
+                    if let Some(d) = ds.filter(|v| !v.is_empty()) {
+                        let (cls, suffix) = match chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d") {
+                            Ok(dt) if dt < today => ("text-danger fw-bold", "（已过期）".to_string()),
+                            Ok(dt) => ("text-warning fw-bold", format!("（剩{}天）", (dt - today).num_days())),
+                            Err(_) => ("", String::new()),
+                        };
+                        parts.push(format!("<span class=\"{}\">{} {}{}</span>", cls, label, d, suffix));
+                    }
+                }
+                items_html.push_str(&format!(
+                    "<li>{} <span class=\"text-muted\">{}</span>：{}</li>",
+                    name,
+                    if designated_no.is_empty() { String::new() } else { format!("({})", designated_no) },
+                    parts.join("；")
+                ));
+            }
+            format!(
+                r#"<div class="alert alert-warning mt-4 mb-0"><div class="fw-bold">⚠ 定点供应商证照/合同到期提醒（30天内）</div><ul class="mb-0 mt-1">{}</ul></div>"#,
+                items_html
+            )
+        }
+    } else {
+        String::new()
+    };
+
     let content = format!(r#"
         <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-4">
             <div class="col">
                 <div class="card bg-primary text-white">
                     <div class="card-body">
-                        <h5 class="card-title">供应商管理</h5>
-                        <p class="card-text">管理供应商信息</p>
+                        <h5 class="card-title">供应商档案</h5>
+                        <p class="card-text">供应商档案与定点资质维护</p>
                         <a href="/supplier" class="btn btn-light">进入</a>
                     </div>
                 </div>
@@ -129,6 +177,7 @@ pub async fn page_index(headers: axum::http::HeaderMap) -> Html<String> {
             </div>
             {today_price_card}
         </div>
+        {license_alert_card}
     "#);
     
     Html(crate::layout_html("进销存管理系统", "/", &content))
@@ -178,14 +227,24 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                         <div class="col-md-4">
                             <input type="text" name="business_scope" placeholder="经营范围" class="form-control">
                         </div>
-                        <div class="col-md-4">
+                        <div class="col-md-3">
                             <input type="text" name="remark" placeholder="备注" class="form-control">
                         </div>
                         <div class="col-md-2">
+                            <div class="form-check mt-2">
+                                <input class="form-check-input" type="checkbox" name="is_designated" id="newDesignatedChk">
+                                <label class="form-check-label" for="newDesignatedChk">定点供应商</label>
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <input type="text" name="designated_no" placeholder="定点编号" class="form-control">
+                        </div>
+                        <div class="col-md-1">
                             <button type="submit" class="btn btn-primary">新增</button>
                         </div>
                     </div>
                 </form>
+                <div class="form-text mt-2">定点供应商的证照、合同等完整档案信息请在新增后点「编辑档案」维护。</div>
             </div>
         </div>
 
@@ -202,29 +261,45 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
         </div>
 
         <table class="table table-bordered table-sm">
-            <thead><tr><th>ID</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>经营范围</th><th>备注</th><th>分类</th><th>审核状态</th><th style="width:260px">操作</th></tr></thead>
+            <thead><tr><th>ID</th><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>经营范围</th><th>备注</th><th>分类</th><th>证照/合同到期</th><th>审核状态</th><th style="width:260px">操作</th></tr></thead>
             <tbody id="supplierTableBody">
-                <tr><td colspan="10" class="text-center text-muted">加载中...</td></tr>
+                <tr><td colspan="11" class="text-center text-muted">加载中...</td></tr>
             </tbody>
         </table>
 
         <div class="modal fade" id="editSupplierModal" tabindex="-1">
-            <div class="modal-dialog">
+            <div class="modal-dialog modal-lg">
                 <div class="modal-content">
                     <div class="modal-header">
-                        <h5 class="modal-title">编辑供应商</h5>
+                        <h5 class="modal-title">供应商档案维护</h5>
                         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
                         <form id="editForm">
                             <input type="hidden" name="id">
-                            <div class="mb-3"><label class="form-label">供应商名称</label><input type="text" name="name" class="form-control" required></div>
-                            <div class="mb-3"><label class="form-label">联系人</label><input type="text" name="contact" class="form-control"></div>
-                            <div class="mb-3"><label class="form-label">电话</label><input type="text" name="phone" class="form-control"></div>
-                            <div class="mb-3"><label class="form-label">地址</label><input type="text" name="address" class="form-control"></div>
-                            <div class="mb-3"><label class="form-label">经营范围</label><textarea name="business_scope" class="form-control" rows="2"></textarea></div>
-                            <div class="mb-3"><label class="form-label">备注</label><textarea name="remark" class="form-control" rows="2"></textarea></div>
-                            <div class="mb-3"><label class="form-label">分类</label><select name="category_id" class="form-control">{0}</select></div>
+                            <div class="row g-2">
+                                <div class="col-md-8"><label class="form-label">供应商名称</label><input type="text" name="name" class="form-control" required></div>
+                                <div class="col-md-4"><label class="form-label">分类</label><select name="category_id" class="form-control">{0}</select></div>
+                                <div class="col-md-3">
+                                    <div class="form-check mt-4">
+                                        <input class="form-check-input" type="checkbox" name="is_designated" id="editDesignatedChk">
+                                        <label class="form-check-label" for="editDesignatedChk">定点供应商</label>
+                                    </div>
+                                </div>
+                                <div class="col-md-3"><label class="form-label">定点编号</label><input type="text" name="designated_no" class="form-control"></div>
+                                <div class="col-md-3"><label class="form-label">负责人</label><input type="text" name="legal_person" class="form-control"></div>
+                                <div class="col-md-3"><label class="form-label">电话</label><input type="text" name="phone" class="form-control"></div>
+                                <div class="col-md-6"><label class="form-label">联系人</label><input type="text" name="contact" class="form-control"></div>
+                                <div class="col-md-6"><label class="form-label">统一社会信用代码</label><input type="text" name="credit_code" class="form-control"></div>
+                                <div class="col-md-12"><label class="form-label">地址</label><input type="text" name="address" class="form-control"></div>
+                                <div class="col-md-6"><label class="form-label">食品经营/生产许可证号</label><input type="text" name="license_no" class="form-control"></div>
+                                <div class="col-md-6"><label class="form-label">许可证有效期至</label><input type="date" name="license_expire" class="form-control"></div>
+                                <div class="col-md-4"><label class="form-label">供货合同编号</label><input type="text" name="contract_no" class="form-control"></div>
+                                <div class="col-md-4"><label class="form-label">合同开始日期</label><input type="date" name="contract_start" class="form-control"></div>
+                                <div class="col-md-4"><label class="form-label">合同结束日期</label><input type="date" name="contract_end" class="form-control"></div>
+                                <div class="col-md-12"><label class="form-label">经营范围</label><textarea name="business_scope" class="form-control" rows="2"></textarea></div>
+                                <div class="col-md-12"><label class="form-label">备注</label><textarea name="remark" class="form-control" rows="2"></textarea></div>
+                            </div>
                         </form>
                     </div>
                     <div class="modal-footer">
@@ -274,7 +349,7 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                 allSuppliers=suppliers||[];
                 const tbody=document.getElementById('supplierTableBody');
                 if(!suppliers||suppliers.length===0){{
-                    tbody.innerHTML='<tr><td colspan="10" class="text-center text-muted">暂无供应商数据</td></tr>';
+                    tbody.innerHTML='<tr><td colspan="11" class="text-center text-muted">暂无供应商数据</td></tr>';
                     return;
                 }}
                 let html='';
@@ -288,10 +363,33 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                             auditBtns+='<button class="btn btn-sm btn-success me-1" onclick="approveSupplier('+p.id+')">审核</button>';
                         }}
                     }}
-                    html+='<tr><td>'+p.id+'</td><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.contact||'')+'</td><td>'+escapeHtml(p.phone||'')+'</td><td>'+escapeHtml(p.address||'')+'</td><td title="'+escapeHtml(p.business_scope||'')+'">'+escapeHtml(truncateText(p.business_scope||'',20))+'</td><td title="'+escapeHtml(p.remark||'')+'">'+escapeHtml(truncateText(p.remark||'',20))+'</td><td>'+escapeHtml(p.category_name||'无分类')+'</td><td>'+auditBadge+'</td>';
-                    html+='<td>'+auditBtns+'<button class="btn btn-sm btn-outline-primary me-1" onclick="editSupplier('+p.id+')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="deleteSupplier('+p.id+')">删除</button></td></tr>';
+                    let nameCell=escapeHtml(p.name);
+                    if(p.is_designated===1){{
+                        nameCell+=' <span class="badge bg-info">定点'+(p.designated_no?' '+escapeHtml(p.designated_no):'')+'</span>';
+                    }}
+                    let expireCell=renderExpireCell(p);
+                    html+='<tr><td>'+p.id+'</td><td>'+nameCell+'</td><td>'+escapeHtml(p.contact||'')+'</td><td>'+escapeHtml(p.phone||'')+'</td><td>'+escapeHtml(p.address||'')+'</td><td title="'+escapeHtml(p.business_scope||'')+'">'+escapeHtml(truncateText(p.business_scope||'',20))+'</td><td title="'+escapeHtml(p.remark||'')+'">'+escapeHtml(truncateText(p.remark||'',20))+'</td><td>'+escapeHtml(p.category_name||'无分类')+'</td><td>'+expireCell+'</td><td>'+auditBadge+'</td>';
+                    html+='<td>'+auditBtns+'<button class="btn btn-sm btn-outline-primary me-1" onclick="editSupplier('+p.id+')">编辑档案</button><button class="btn btn-sm btn-outline-danger" onclick="deleteSupplier('+p.id+')">删除</button></td></tr>';
                 }});
                 tbody.innerHTML=html;
+            }}
+            // 证照/合同到期状态：已过期红色，30天内黄色，否则绿色；未填显示 —
+            function expireBadge(label, dateStr){{
+                if(!dateStr)return '';
+                let today=new Date();today.setHours(0,0,0,0);
+                let d=new Date(dateStr+'T00:00:00');
+                let days=Math.round((d.getTime()-today.getTime())/86400000);
+                let cls='text-success',txt=label+' '+dateStr;
+                if(days<0){{cls='text-danger fw-bold';txt=label+' '+dateStr+' 已过期';}}
+                else if(days<=30){{cls='text-warning fw-bold';txt=label+' '+dateStr+' 剩'+days+'天';}}
+                return '<div class="'+cls+'">'+txt+'</div>';
+            }}
+            function renderExpireCell(p){{
+                let parts=[];
+                if(p.license_expire)parts.push(expireBadge('许可证',p.license_expire));
+                if(p.contract_end)parts.push(expireBadge('合同',p.contract_end));
+                if(parts.length===0)return '<span class="text-muted">—</span>';
+                return parts.join('');
             }}
             function truncateText(text,maxLen){{
                 if(!text)return '';
@@ -320,6 +418,15 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                 form.business_scope.value=p.business_scope||'';
                 form.remark.value=p.remark||'';
                 form.category_id.value=p.category_id||'';
+                form.is_designated.checked=(p.is_designated===1);
+                form.designated_no.value=p.designated_no||'';
+                form.legal_person.value=p.legal_person||'';
+                form.credit_code.value=p.credit_code||'';
+                form.license_no.value=p.license_no||'';
+                form.license_expire.value=p.license_expire||'';
+                form.contract_no.value=p.contract_no||'';
+                form.contract_start.value=p.contract_start||'';
+                form.contract_end.value=p.contract_end||'';
                 const modal=new bootstrap.Modal(document.getElementById('editSupplierModal'));
                 modal.show();
             }}
@@ -333,7 +440,16 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                     address:form.address.value||null,
                     business_scope:form.business_scope.value||null,
                     remark:form.remark.value||null,
-                    category_id:form.category_id.value?parseInt(form.category_id.value):null
+                    category_id:form.category_id.value?parseInt(form.category_id.value):null,
+                    is_designated:form.is_designated.checked?1:0,
+                    designated_no:form.designated_no.value||null,
+                    legal_person:form.legal_person.value||null,
+                    credit_code:form.credit_code.value||null,
+                    license_no:form.license_no.value||null,
+                    license_expire:form.license_expire.value||null,
+                    contract_no:form.contract_no.value||null,
+                    contract_start:form.contract_start.value||null,
+                    contract_end:form.contract_end.value||null
                 }};
                 const res=await fetch('/api/supplier/update',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});
                 if(res.ok){{bootstrap.Modal.getInstance(document.getElementById('editSupplierModal')).hide();loadSuppliersByCategory(currentCategoryId);}}
@@ -365,7 +481,9 @@ pub async fn page_supplier(headers: axum::http::HeaderMap) -> Html<String> {
                     address:form.address.value||null,
                     business_scope:form.business_scope.value||null,
                     remark:form.remark.value||null,
-                    category_id:form.category_id.value?parseInt(form.category_id.value):null
+                    category_id:form.category_id.value?parseInt(form.category_id.value):null,
+                    is_designated:form.is_designated.checked?1:0,
+                    designated_no:form.designated_no.value||null
                 }};
                 const res=await fetch('/api/supplier/create',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});
                 if(res.ok){{form.reset();loadSuppliersByCategory(currentCategoryId);}}
@@ -2131,6 +2249,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                             <input type="text" id="supplierInput" class="form-control" placeholder="单击选择 / 双击搜索" readonly>
                             <input type="hidden" id="supplierId" value="">
                             <div id="supplierDropdown" class="search-dropdown"></div>
+                            <div id="supplierProfile" class="small mt-1"></div>
                         </div>
                     </div>
                     <div class="col-md-3">
@@ -2357,13 +2476,15 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     localStorage.setItem('po_last_handler_id', document.getElementById('handlerId').value || '');
                 }} catch (e) {{}}
             }}
-            function applyLastPurchaseDefaults() {{
+            async function applyLastPurchaseDefaults() {{
                 try {{
                     const sid = localStorage.getItem('po_last_supplier_id');
                     const sname = localStorage.getItem('po_last_supplier_name');
                     if (sid) {{
                         document.getElementById('supplierId').value = sid;
                         document.getElementById('supplierInput').value = sname || '';
+                        if (!(suppliers || []).length) {{ try {{ await loadSuppliers(); }} catch (e) {{}} }}
+                        renderSupplierProfileById(sid);
                     }}
                     const hid = localStorage.getItem('po_last_handler_id');
                     if (hid) {{
@@ -2427,8 +2548,42 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                     document.getElementById('supplierId').value = id;
                     document.getElementById('supplierInput').value = name;
                     this.style.display = 'none';
+                    renderSupplierProfileById(id);
                 }}
             }});
+
+            // 定点供应商选中后展示只读档案条（编号/证照/电话/地址，临期红色预警）
+            function renderSupplierProfileById(id) {{
+                const box = document.getElementById('supplierProfile');
+                if (!box) return;
+                const s = (suppliers || []).find(x => String(x.id) === String(id));
+                if (!s) {{ box.innerHTML = ''; return; }}
+                let html = '';
+                if (s.is_designated === 1) {{
+                    let warn = '';
+                    if (s.license_expire) {{
+                        const today = new Date(); today.setHours(0,0,0,0);
+                        const d = new Date(s.license_expire + 'T00:00:00');
+                        const days = Math.round((d.getTime() - today.getTime()) / 86400000);
+                        if (days < 0) warn = ' <span class="badge bg-danger">许可证已过期</span>';
+                        else if (days <= 30) warn = ' <span class="badge bg-warning text-dark">许可证剩' + days + '天</span>';
+                    }}
+                    html = '<div class="border rounded p-2" style="font-size:12px;background:#f8f9fa">'
+                        + '<span class="badge bg-info">定点</span> '
+                        + (s.designated_no ? escapeHtml(s.designated_no) + '｜' : '')
+                        + (s.license_no ? '许可证 ' + escapeHtml(s.license_no) + '｜' : '')
+                        + (s.license_expire ? '有效期至 ' + escapeHtml(s.license_expire) : '')
+                        + warn
+                        + ((s.phone || s.address) ? '<br>' + (s.phone ? '电话 ' + escapeHtml(s.phone) : '') + (s.address ? '｜' + escapeHtml(s.address) : '') : '')
+                        + '</div>';
+                }} else {{
+                    const parts = [];
+                    if (s.phone) parts.push('电话 ' + escapeHtml(s.phone));
+                    if (s.address) parts.push(escapeHtml(s.address));
+                    html = parts.length ? '<span class="text-muted" style="font-size:12px">' + parts.join('｜') + '</span>' : '';
+                }}
+                box.innerHTML = html;
+            }}
 
             document.getElementById('supplierInput').addEventListener('click', function() {{
                 this.readOnly = true;
@@ -3240,6 +3395,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 currentVersion = order.version || 1;
                 document.getElementById('supplierId').value = order.supplier_id;
                 document.getElementById('supplierInput').value = order.supplier_name;
+                renderSupplierProfileById(order.supplier_id);
                 document.getElementById('orderNoInput').value = order.order_no;
                 document.getElementById('orderDateInput').value = order.order_date;
                 document.getElementById('remarkInput').value = order.remark || '';
@@ -3367,6 +3523,7 @@ pub async fn page_purchase(headers: axum::http::HeaderMap) -> Html<String> {
                 currentOrderId = null;
                 document.getElementById('supplierId').value = '';
                 document.getElementById('supplierInput').value = '';
+                document.getElementById('supplierProfile').innerHTML = '';
                 document.getElementById('orderNoInput').value = '';
                 const d = new Date();
                 document.getElementById('orderDateInput').value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -5943,7 +6100,7 @@ pub async fn page_query_purchase_price() -> Html<String> {
         </div>
         <div class="card p-4 mt-4">
             <table class="table table-bordered">
-                <thead><tr><th>进货日期</th><th>品名规格</th><th>单位</th><th id="thPurchaseUnitPrice">单价</th><th>数量</th><th id="thPurchaseAmount">金额</th><th>生产日期</th><th>保质期</th><th>供应商</th><th>联系电话</th><th>备注</th></tr></thead>
+                <thead><tr><th>进货日期</th><th>品名规格</th><th>单位</th><th id="thPurchaseUnitPrice">单价</th><th>数量</th><th id="thPurchaseAmount">金额</th><th>生产日期</th><th>保质期</th><th>供应商</th><th>备注</th></tr></thead>
                 <tbody id="resultTable"></tbody>
             </table>
             <div id="pagination" class="mt-3"></div>
@@ -5986,12 +6143,12 @@ pub async fn page_query_purchase_price() -> Html<String> {
                 const tbody = document.getElementById('resultTable');
                 tbody.innerHTML = '';
                 if (data.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无数据</td></tr>';
                     renderPagination(result.page, result.total_pages, result.total);
                     return;
                 }
                 data.forEach(item => {
-                    // 列顺序：进货日期 品名规格 单位 单价 数量 金额 生产日期 保质期 供应商 联系电话 备注
+                    // 列顺序：进货日期 品名规格 单位 单价 数量 金额 生产日期 保质期 供应商 备注（联系方式见供应商档案页）
                     tbody.innerHTML += '<tr>' +
                         '<td>' + item.order_date + '</td>' +
                         '<td>' + item.product_name + '</td>' +
@@ -6002,7 +6159,6 @@ pub async fn page_query_purchase_price() -> Html<String> {
                         '<td>' + (item.production_date || '') + '</td>' +
                         '<td>' + (item.shelf_life || '') + '</td>' +
                         '<td>' + item.supplier_name + '</td>' +
-                        '<td>' + (item.contact_phone || '') + '</td>' +
                         '<td>' + (item.remark || '') + '</td>' +
                         '</tr>';
                 });
@@ -8221,60 +8377,109 @@ pub async fn page_order_adjust(headers: axum::http::HeaderMap) -> Html<String> {
 pub async fn page_query_stock_flow() -> Html<String> {
     let content = r#"
         <div class="card p-4">
-            <h3>库存明细台账</h3>
+            <h3>出入库记录</h3>
             <div class="row mb-3">
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <label>商品名称：</label>
                     <input type="text" id="productName" class="form-control" placeholder="输入商品名称搜索">
                 </div>
-                <div class="col-md-3">
+                <div class="col-md-2">
                     <label>开始日期：</label>
                     <input type="date" id="startDate" class="form-control">
                 </div>
-                <div class="col-md-3">
+                <div class="col-md-2">
                     <label>结束日期：</label>
                     <input type="date" id="endDate" class="form-control">
                 </div>
+                <div class="col-md-3">
+                    <label>视图：</label>
+                    <div class="btn-group btn-group-toggle">
+                        <button type="button" class="btn btn-outline-primary active" id="viewTimelineBtn" onclick="switchStockView('timeline')">时间线</button>
+                        <button type="button" class="btn btn-outline-primary" id="viewGroupBtn" onclick="switchStockView('group')">按商品分户</button>
+                    </div>
+                </div>
             </div>
             <div>
-                <button onclick="searchStockFlow()" class="btn btn-primary">查询</button>
-                <button onclick="exportStockFlow()" class="btn btn-success ml-2">导出Excel</button>
+                <button onclick="searchStockFlow(1)" class="btn btn-primary">查询</button>
+                <button onclick="exportStockFlow('ledger')" class="btn btn-success ml-2">导出保管账</button>
+                <button onclick="exportStockFlow('timeline')" class="btn btn-outline-success ml-2">按时间线补打</button>
+                <span class="text-muted small ml-2">保管账=一品一户成册；时间线补打=新期间连续紧凑页，结存自动承接前期余额，续订在旧账本后。</span>
             </div>
         </div>
         <div class="card p-4 mt-4">
-            <table class="table table-bordered">
-                <thead><tr><th>日期</th><th>类型</th><th>商品名称</th><th>规格</th><th>单位</th><th>入库数量</th><th>出库数量</th><th>余额</th><th>备注</th></tr></thead>
-                <tbody id="resultTable"></tbody>
-            </table>
+            <div class="table-responsive">
+                <table class="table table-bordered table-sm">
+                    <thead class="thead-light"><tr><th>日期</th><th>摘要</th><th>单据号</th><th>商品名称</th><th>规格</th><th>单位</th><th>入库数量</th><th>出库数量</th><th>结存</th><th>来源/去向</th><th>生产日期/批号</th><th>备注</th></tr></thead>
+                    <tbody id="resultTable"></tbody>
+                </table>
+            </div>
             <div id="stockFlowPager" class="mt-2 text-muted"></div>
         </div>
         <script>
-            let stockFlowPage = 1, stockFlowPageSize = 200, stockFlowTotal = 0;
+            const SF_COLS = 12;
+            let stockFlowPage = 1, stockFlowPageSize = 200, stockFlowTotal = 0, stockFlowView = 'timeline', stockFlowQueried = false;
             function sfEsc(s) {
                 return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            }
+            // 0/空留白；入库绿色、负结存红字
+            function sfQty(v) {
+                const n = Number(v || 0);
+                return n === 0 ? '' : n.toFixed(2);
+            }
+            function switchStockView(v) {
+                stockFlowView = v;
+                document.getElementById('viewTimelineBtn').classList.toggle('active', v === 'timeline');
+                document.getElementById('viewGroupBtn').classList.toggle('active', v === 'group');
+                if (stockFlowQueried) searchStockFlow(1);
             }
             async function searchStockFlow(page) {
                 if (page === undefined) page = 1;
                 stockFlowPage = page;
+                stockFlowQueried = true;
                 const url = '/api/query/stock_flow?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
                     '&start_date=' + document.getElementById('startDate').value +
                     '&end_date=' + document.getElementById('endDate').value +
+                    '&view=' + stockFlowView +
                     '&page=' + stockFlowPage + '&page_size=' + stockFlowPageSize;
                 const res = await fetch(url);
                 const data = await res.json();
                 stockFlowTotal = data.total || 0;
                 const rows = [];
+                let lastPid = null;
                 (data.items || []).forEach(item => {
-                    // 备注统一规则：仅大单位（与基础单位不同）出入库时标注原始数量，如"原2.00件"；
-                    // 基础单位出入库备注一律留空
-                    let remark = '';
-                    if (item.orig_unit && item.orig_unit !== item.unit) {
-                        remark = '原' + (item.orig_quantity || 0).toFixed(2) + sfEsc(item.orig_unit);
+                    // 分户视图：商品切换时插入分户标题行
+                    if (stockFlowView === 'group' && lastPid !== item.product_id) {
+                        rows.push('<tr class="table-secondary"><td colspan="' + SF_COLS + '"><strong>' +
+                            sfEsc(item.product_name) + '</strong>' +
+                            (item.spec ? '　' + sfEsc(item.spec) : '') +
+                            '　<span class="text-muted">单位：' + sfEsc(item.unit) + '</span></td></tr>');
+                        lastPid = item.product_id;
                     }
-                    rows.push('<tr><td>' + sfEsc(item.create_time) + '</td><td>' + sfEsc(item.type) + '</td><td>' + sfEsc(item.product_name) + '</td><td>' + sfEsc(item.spec) + '</td><td>' + sfEsc(item.unit) + '</td><td>' + (item.in_quantity || 0).toFixed(2) + '</td><td>' + (item.out_quantity || 0).toFixed(2) + '</td><td>' + (item.balance || 0).toFixed(2) + '</td><td>' + remark + '</td></tr>');
+                    // 备注：仅大单位（与基础单位不同）出入库时标注原始数量，如"原2件"
+                    let remark = '';
+                    if (item.orig_unit && item.orig_unit !== item.unit && item.orig_quantity) {
+                        const q = Math.round(item.orig_quantity * 100) / 100;
+                        remark = '原' + q + sfEsc(item.orig_unit);
+                    }
+                    const batch = [sfEsc(item.production_date), sfEsc(item.batch_no)].filter(Boolean).join(' / ');
+                    const balCls = (item.balance || 0) < 0 ? ' class="text-danger font-weight-bold"' : '';
+                    const nameCell = stockFlowView === 'group' ? '<span class="text-muted">—</span>' : sfEsc(item.product_name);
+                    rows.push('<tr><td>' + sfEsc(item.create_time) + '</td>' +
+                        '<td>' + sfEsc(item.summary) + '</td>' +
+                        '<td class="small">' + sfEsc(item.ref_no) + '</td>' +
+                        '<td>' + nameCell + '</td>' +
+                        '<td>' + sfEsc(item.spec) + '</td>' +
+                        '<td>' + sfEsc(item.unit) + '</td>' +
+                        '<td class="text-success font-weight-bold">' + sfQty(item.in_quantity) + '</td>' +
+                        '<td>' + sfQty(item.out_quantity) + '</td>' +
+                        '<td' + balCls + '>' + sfQty(item.balance) + '</td>' +
+                        '<td>' + sfEsc(item.party_name) + '</td>' +
+                        '<td class="small">' + batch + '</td>' +
+                        '<td class="small">' + remark + '</td></tr>');
                 });
                 // 一次性写入，避免逐行 innerHTML 拼接导致页面卡死
-                document.getElementById('resultTable').innerHTML = rows.join('');
+                document.getElementById('resultTable').innerHTML = rows.join('') ||
+                    '<tr><td colspan="' + SF_COLS + '" class="text-center text-muted">该条件下没有出入库记录</td></tr>';
                 renderStockFlowPager();
             }
             function renderStockFlowPager() {
@@ -8284,18 +8489,20 @@ pub async fn page_query_stock_flow() -> Html<String> {
                 html += ' <button class="btn btn-sm btn-outline-secondary ml-2"' + (stockFlowPage >= pages ? ' disabled' : '') + ' onclick="searchStockFlow(' + (stockFlowPage + 1) + ')">下一页</button>';
                 document.getElementById('stockFlowPager').innerHTML = html;
             }
-            function exportStockFlow() {
+            function exportStockFlow(fmt) {
                 // 导出当前查询条件命中的全部结果（不受分页限制）
+                // ledger=一品一户数量保管账；timeline=时间线连续补打（紧凑分页，承接前期结存）
                 const url = '/api/query/stock_flow/export?product_name=' + encodeURIComponent(document.getElementById('productName').value) +
                     '&start_date=' + document.getElementById('startDate').value +
-                    '&end_date=' + document.getElementById('endDate').value;
+                    '&end_date=' + document.getElementById('endDate').value +
+                    '&format=' + (fmt || 'ledger');
                 window.location.href = url;
             }
             // 不默认加载数据，避免全表查询影响性能
-            document.getElementById('resultTable').innerHTML = '<tr><td colspan="9" class="text-center text-muted">请设置查询条件后点击"查询"</td></tr>';
+            document.getElementById('resultTable').innerHTML = '<tr><td colspan="' + SF_COLS + '" class="text-center text-muted">请设置查询条件后点击"查询"</td></tr>';
         </script>
     "#;
-    Html(crate::layout_html("库存明细台账", "/query/stock_flow", &content))
+    Html(crate::layout_html("出入库记录", "/query/stock_flow", &content))
 }
 
 pub async fn page_query_stock_summary(headers: axum::http::HeaderMap) -> Html<String> {

@@ -859,7 +859,9 @@ pub async fn api_clean_invalid_orders(headers: axum::http::HeaderMap) -> impl In
 
 pub async fn api_supplier_export() -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, c.name as category_name 
+        "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, c.name as category_name,
+                s.is_designated, s.designated_no, s.legal_person, s.credit_code, s.license_no, s.license_expire,
+                s.contract_no, s.contract_start, s.contract_end
          FROM supplier s LEFT JOIN category c ON s.category_id = c.id ORDER BY s.id"
     )
     .fetch_all(crate::db::pool())
@@ -875,7 +877,10 @@ pub async fn api_supplier_export() -> impl IntoResponse {
             .set_align(FormatAlign::Center)
             .set_align(FormatAlign::VerticalCenter);
         
-        let headers = ["ID", "名称", "联系人", "电话", "地址", "经营范围", "备注", "分类"];
+        // 前 8 列顺序固定不可调整（Excel 导入按列索引解析）；档案扩展列只能追加在其后
+        let headers = ["ID", "名称", "联系人", "电话", "地址", "经营范围", "备注", "分类",
+                       "定点供应商", "定点编号", "负责人", "统一社会信用代码", "许可证号", "许可证有效期至",
+                       "供货合同编号", "合同开始日期", "合同结束日期"];
         for (i, &header) in headers.iter().enumerate() {
             worksheet.write_with_format(0, i as u16, header, &header_format)?;
         }
@@ -890,6 +895,15 @@ pub async fn api_supplier_export() -> impl IntoResponse {
             worksheet.write(row_idx, 5, row.get::<Option<String>, _>("business_scope").unwrap_or_default())?;
             worksheet.write(row_idx, 6, row.get::<Option<String>, _>("remark").unwrap_or_default())?;
             worksheet.write(row_idx, 7, row.get::<Option<String>, _>("category_name").unwrap_or_default())?;
+            worksheet.write(row_idx, 8, if row.get::<i64, _>("is_designated") == 1 { "是" } else { "否" })?;
+            worksheet.write(row_idx, 9, row.get::<Option<String>, _>("designated_no").unwrap_or_default())?;
+            worksheet.write(row_idx, 10, row.get::<Option<String>, _>("legal_person").unwrap_or_default())?;
+            worksheet.write(row_idx, 11, row.get::<Option<String>, _>("credit_code").unwrap_or_default())?;
+            worksheet.write(row_idx, 12, row.get::<Option<String>, _>("license_no").unwrap_or_default())?;
+            worksheet.write(row_idx, 13, row.get::<Option<String>, _>("license_expire").unwrap_or_default())?;
+            worksheet.write(row_idx, 14, row.get::<Option<String>, _>("contract_no").unwrap_or_default())?;
+            worksheet.write(row_idx, 15, row.get::<Option<String>, _>("contract_start").unwrap_or_default())?;
+            worksheet.write(row_idx, 16, row.get::<Option<String>, _>("contract_end").unwrap_or_default())?;
             row_idx += 1;
         }
         
@@ -901,6 +915,15 @@ pub async fn api_supplier_export() -> impl IntoResponse {
         worksheet.set_column_width(5, 20)?;
         worksheet.set_column_width(6, 20)?;
         worksheet.set_column_width(7, 12)?;
+        worksheet.set_column_width(8, 10)?;
+        worksheet.set_column_width(9, 14)?;
+        worksheet.set_column_width(10, 10)?;
+        worksheet.set_column_width(11, 22)?;
+        worksheet.set_column_width(12, 20)?;
+        worksheet.set_column_width(13, 14)?;
+        worksheet.set_column_width(14, 16)?;
+        worksheet.set_column_width(15, 14)?;
+        worksheet.set_column_width(16, 14)?;
         
         workbook.save_to_buffer()
     })();
@@ -1168,7 +1191,9 @@ pub async fn api_supplier_list(axum::extract::Query(params): axum::extract::Quer
     
     let rows = if let Some(cid) = category_id {
         sqlx::query(
-            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, s.audit_status, c.name as category_name 
+            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, s.audit_status, c.name as category_name,
+                    s.is_designated, s.designated_no, s.legal_person, s.credit_code, s.license_no, s.license_expire,
+                    s.contract_no, s.contract_start, s.contract_end
              FROM supplier s LEFT JOIN category c ON s.category_id = c.id
              WHERE s.category_id IN (
                  WITH RECURSIVE cat_tree(id) AS (
@@ -1189,7 +1214,9 @@ pub async fn api_supplier_list(axum::extract::Query(params): axum::extract::Quer
         .unwrap_or_default()
     } else {
         sqlx::query(
-            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, s.audit_status, c.name as category_name 
+            "SELECT s.id, s.name, s.contact, s.phone, s.address, s.business_scope, s.remark, s.category_id, s.audit_status, c.name as category_name,
+                    s.is_designated, s.designated_no, s.legal_person, s.credit_code, s.license_no, s.license_expire,
+                    s.contract_no, s.contract_start, s.contract_end
              FROM supplier s LEFT JOIN category c ON s.category_id = c.id
              WHERE s.name LIKE ?
              ORDER BY s.id DESC"
@@ -1213,6 +1240,15 @@ pub async fn api_supplier_list(axum::extract::Query(params): axum::extract::Quer
             "category_id": row.get::<Option<i64>, _>("category_id"),
             "category_name": row.get::<Option<String>, _>("category_name"),
             "audit_status": row.get::<Option<String>, _>("audit_status"),
+            "is_designated": row.get::<Option<i64>, _>("is_designated").unwrap_or(0),
+            "designated_no": row.get::<Option<String>, _>("designated_no"),
+            "legal_person": row.get::<Option<String>, _>("legal_person"),
+            "credit_code": row.get::<Option<String>, _>("credit_code"),
+            "license_no": row.get::<Option<String>, _>("license_no"),
+            "license_expire": row.get::<Option<String>, _>("license_expire"),
+            "contract_no": row.get::<Option<String>, _>("contract_no"),
+            "contract_start": row.get::<Option<String>, _>("contract_start"),
+            "contract_end": row.get::<Option<String>, _>("contract_end"),
         }))
         .collect();
     
@@ -1226,7 +1262,10 @@ pub async fn api_supplier_create(headers: axum::http::HeaderMap, Json(req): Json
     }
     
     let result = sqlx::query(
-        "INSERT INTO supplier(name, contact, phone, address, business_scope, remark, category_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO supplier(name, contact, phone, address, business_scope, remark, category_id,
+                              is_designated, designated_no, legal_person, credit_code, license_no, license_expire,
+                              contract_no, contract_start, contract_end)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&req.name)
     .bind(&req.contact)
@@ -1235,6 +1274,15 @@ pub async fn api_supplier_create(headers: axum::http::HeaderMap, Json(req): Json
     .bind(&req.business_scope)
     .bind(&req.remark)
     .bind(&req.category_id)
+    .bind(req.is_designated.unwrap_or(0))
+    .bind(&req.designated_no)
+    .bind(&req.legal_person)
+    .bind(&req.credit_code)
+    .bind(&req.license_no)
+    .bind(&req.license_expire)
+    .bind(&req.contract_no)
+    .bind(&req.contract_start)
+    .bind(&req.contract_end)
     .execute(crate::db::pool())
     .await;
     
@@ -1253,7 +1301,9 @@ pub async fn api_supplier_update(headers: axum::http::HeaderMap, Json(req): Json
         return (code, msg);
     }
     let result = sqlx::query(
-        "UPDATE supplier SET name=?, contact=?, phone=?, address=?, business_scope=?, remark=?, category_id=?, audit_status='pending' WHERE id=?"
+        "UPDATE supplier SET name=?, contact=?, phone=?, address=?, business_scope=?, remark=?, category_id=?,
+                              is_designated=?, designated_no=?, legal_person=?, credit_code=?, license_no=?, license_expire=?,
+                              contract_no=?, contract_start=?, contract_end=?, audit_status='pending' WHERE id=?"
     )
     .bind(&req.name)
     .bind(&req.contact)
@@ -1262,6 +1312,15 @@ pub async fn api_supplier_update(headers: axum::http::HeaderMap, Json(req): Json
     .bind(&req.business_scope)
     .bind(&req.remark)
     .bind(&req.category_id)
+    .bind(req.is_designated.unwrap_or(0))
+    .bind(&req.designated_no)
+    .bind(&req.legal_person)
+    .bind(&req.credit_code)
+    .bind(&req.license_no)
+    .bind(&req.license_expire)
+    .bind(&req.contract_no)
+    .bind(&req.contract_start)
+    .bind(&req.contract_end)
     .bind(req.id.unwrap_or(0))
     .execute(crate::db::pool())
     .await;
@@ -4787,6 +4846,8 @@ pub async fn api_purchase_order_settle(headers: axum::http::HeaderMap, Path(id):
 /// 返回 (production_date, batch_no)；无批次数据（无采购明细/全部消耗完）返回 (None, None)。
 pub(crate) async fn fifo_earliest_batch(product_id: i64) -> (Option<String>, Option<String>) {
     // 批次队列：入库口径与 write_stock_movements_for_audit 一致（审核及之后状态的采购单）
+    // 注意：历史数据 production_date 可能是空串而非 NULL，必须 NULLIF 归一，否则 COALESCE 不生效、
+    // 空串排序键反而排在真实日期之前，FIFO 指针会错误落在无批次采购行上
     let rows = sqlx::query(
         "SELECT poi.id,
                 CASE WHEN poi.base_quantity > 0 THEN poi.base_quantity
@@ -4794,12 +4855,13 @@ pub(crate) async fn fifo_earliest_batch(product_id: i64) -> (Option<String>, Opt
                          (SELECT pu.ratio FROM product_unit pu
                           WHERE pu.product_id = poi.product_id AND pu.unit_name = poi.unit), 1)
                 END AS eff_base,
-                poi.production_date, poi.batch_no
+                NULLIF(poi.production_date, '') AS production_date,
+                NULLIF(poi.batch_no, '') AS batch_no
          FROM purchase_order_item poi
          JOIN purchase_order po ON poi.order_id = po.id
          WHERE poi.product_id = ?
            AND po.status IN ('confirmed','sorting','sorted','delivering','delivered','accepted','settled')
-         ORDER BY COALESCE(poi.production_date, po.order_date) ASC, poi.id ASC"
+         ORDER BY COALESCE(NULLIF(poi.production_date, ''), po.order_date) ASC, poi.id ASC"
     )
     .bind(product_id)
     .fetch_all(crate::db::pool())
@@ -4826,7 +4888,7 @@ pub(crate) async fn fifo_earliest_batch(product_id: i64) -> (Option<String>, Opt
             remaining -= qty;
             continue;
         }
-        // 该批次仍有剩余 → 即最早未消耗完的批次
+        // 该批次仍有剩余 → 即最早未消耗完的批次（NULLIF 已把空串归一为 None）
         return (prod, batch);
     }
     (None, None)
@@ -4895,31 +4957,39 @@ async fn write_stock_movements_for_audit(
     action_label: &str,
 ) -> Result<(), sqlx::Error> {
     // base_quantity 缺失（老数据/部分开单入口未计算）时，用 quantity × product_unit.ratio 现算
+    // 同时取明细 id 与批次快照（采购=到货批次；销售=确认验收时写入的 FIFO 批次）
     let sql = format!(
-        "SELECT items.product_id,
+        "SELECT items.id, items.product_id,
                 CASE WHEN items.base_quantity > 0 THEN items.base_quantity
                      ELSE items.quantity * COALESCE(
                          (SELECT pu.ratio FROM product_unit pu
                           WHERE pu.product_id = items.product_id AND pu.unit_name = items.unit), 1)
                 END AS eff_base,
-                items.quantity, items.unit
+                items.quantity, items.unit, items.production_date, items.batch_no
          FROM {} items WHERE items.order_id = ?",
         item_table
     );
-    let items: Vec<(i64, f64, f64, String)> = sqlx::query_as(AssertSqlSafe(sql))
+    let items: Vec<(i64, i64, f64, f64, String, Option<String>, Option<String>)> = sqlx::query_as(AssertSqlSafe(sql))
         .bind(order_id)
         .fetch_all(&mut **tx)
         .await?;
-    // 业务归属日期取单据日期（定量），与实际审核时间分离
-    let order_table = if movement_type == "purchase" { "purchase_order" } else { "sales_order" };
-    let order_date: String = sqlx::query_scalar(AssertSqlSafe(
-        format!("SELECT order_date FROM {} WHERE id = ?", order_table)
-    ))
+    // 业务归属日期取单据日期（定量），与实际审核时间分离；同时快照单据号与往来单位名称
+    let (order_table, party_table, party_fk): (&str, &str, &str) = if movement_type == "purchase" {
+        ("purchase_order", "supplier", "supplier_id")
+    } else {
+        ("sales_order", "purchaser", "purchaser_id")
+    };
+    let order_info: (String, String, Option<String>) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT o.order_date, o.order_no, pt.name
+         FROM {} o JOIN {} pt ON o.{} = pt.id WHERE o.id = ?",
+        order_table, party_table, party_fk
+    )))
     .bind(order_id)
     .fetch_one(&mut **tx)
     .await?;
+    let (order_date, order_no, party_name) = order_info;
     let sign: f64 = if direction == "in" { 1.0 } else { -1.0 };
-    for (product_id, base_qty, orig_qty, unit) in items {
+    for (item_id, product_id, base_qty, orig_qty, unit, production_date, batch_no) in items {
         if base_qty == 0.0 { continue; }
         // 当前余额（事务内）
         let cur: f64 = sqlx::query_scalar(
@@ -4938,16 +5008,18 @@ async fn write_stock_movements_for_audit(
         )
         .bind(product_id).bind(new_balance)
         .execute(&mut **tx).await?;
-        // 写流水
+        // 写流水（含账本快照：明细id/批次/单据号/往来单位）
         let _ = sqlx::query(
-            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark, order_date)
-             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark, order_date,
+                                         ref_item_id, production_date, batch_no, ref_no, party_name, snapshot_version)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)"
         )
         .bind(product_id).bind(direction).bind(movement_type)
         .bind(base_qty).bind(orig_qty).bind(&unit).bind(new_balance)
         .bind(ref_type).bind(order_id)
         .bind(format!("{}-{}", remark_prefix, action_label))
         .bind(&order_date)
+        .bind(item_id).bind(production_date).bind(batch_no).bind(&order_no).bind(&party_name)
         .execute(&mut **tx).await?;
     }
     Ok(())
@@ -4965,34 +5037,41 @@ async fn write_stock_movements_for_unaudit(
     remark_prefix: &str,
     action_label: &str,       // 例如 "反审核冲销"/"撤销验收冲销"
 ) -> Result<(), sqlx::Error> {
-    // base_quantity 缺失时同样用 quantity × product_unit.ratio 现算
+    // base_quantity 缺失时同样用 quantity × product_unit.ratio 现算；批次取原明细当前快照
     let sql = format!(
-        "SELECT items.product_id,
+        "SELECT items.id, items.product_id,
                 CASE WHEN items.base_quantity > 0 THEN items.base_quantity
                      ELSE items.quantity * COALESCE(
                          (SELECT pu.ratio FROM product_unit pu
                           WHERE pu.product_id = items.product_id AND pu.unit_name = items.unit), 1)
                 END AS eff_base,
-                items.quantity, items.unit
+                items.quantity, items.unit, items.production_date, items.batch_no
          FROM {} items WHERE items.order_id = ?",
         item_table
     );
-    let items: Vec<(i64, f64, f64, String)> = sqlx::query_as(AssertSqlSafe(sql))
+    let items: Vec<(i64, i64, f64, f64, String, Option<String>, Option<String>)> = sqlx::query_as(AssertSqlSafe(sql))
         .bind(order_id)
         .fetch_all(&mut **tx)
         .await?;
-    // 冲销归属原单据日期：同月审核又反审核时净影响为 0
-    let order_table = if movement_type == "purchase" { "purchase_order" } else { "sales_order" };
-    let order_date: String = sqlx::query_scalar(AssertSqlSafe(
-        format!("SELECT order_date FROM {} WHERE id = ?", order_table)
-    ))
+    // 冲销归属原单据日期：同月审核又反审核时净影响为 0；单据号/往来单位随原单据快照
+    let (order_table, party_table, party_fk): (&str, &str, &str) = if movement_type == "purchase" {
+        ("purchase_order", "supplier", "supplier_id")
+    } else {
+        ("sales_order", "purchaser", "purchaser_id")
+    };
+    let order_info: (String, String, Option<String>) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT o.order_date, o.order_no, pt.name
+         FROM {} o JOIN {} pt ON o.{} = pt.id WHERE o.id = ?",
+        order_table, party_table, party_fk
+    )))
     .bind(order_id)
     .fetch_one(&mut **tx)
     .await?;
+    let (order_date, order_no, party_name) = order_info;
     // 冲销方向：原 in → out，原 out → in
     let reversal_direction = if original_direction == "in" { "out" } else { "in" };
     let sign: f64 = if reversal_direction == "in" { 1.0 } else { -1.0 };
-    for (product_id, base_qty, orig_qty, unit) in items {
+    for (item_id, product_id, base_qty, orig_qty, unit, production_date, batch_no) in items {
         if base_qty == 0.0 { continue; }
         let cur: f64 = sqlx::query_scalar(
             "SELECT quantity FROM inventory WHERE product_id=? AND warehouse_id=1"
@@ -5010,14 +5089,16 @@ async fn write_stock_movements_for_unaudit(
         .bind(product_id).bind(new_balance)
         .execute(&mut **tx).await?;
         let _ = sqlx::query(
-            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark, order_date)
-             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO stock_movement (product_id, warehouse_id, direction, movement_type, base_quantity, orig_quantity, orig_unit, balance_after, ref_type, ref_id, remark, order_date,
+                                         ref_item_id, production_date, batch_no, ref_no, party_name, snapshot_version)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)"
         )
         .bind(product_id).bind(reversal_direction).bind(movement_type)
         .bind(base_qty).bind(orig_qty).bind(&unit).bind(new_balance)
         .bind(ref_type).bind(order_id)
         .bind(format!("{}-{}", remark_prefix, action_label))
         .bind(&order_date)
+        .bind(item_id).bind(production_date).bind(batch_no).bind(&order_no).bind(&party_name)
         .execute(&mut **tx).await?;
     }
     Ok(())
@@ -5725,7 +5806,7 @@ pub async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Pa
     };
     
     let item_rows = match sqlx::query(
-        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, remark FROM sales_order_item WHERE order_id = ?"
+        "SELECT id, product_id, product_name, alias1, alias2, spec, unit, unit_price, quantity, base_quantity, amount, pre_sale_quantity, supplier_id, supplier_name, production_date, batch_no, remark FROM sales_order_item WHERE order_id = ?"
     )
     .bind(id)
     .fetch_all(crate::db::pool())
@@ -5753,6 +5834,8 @@ pub async fn api_sales_order_detail(headers: axum::http::HeaderMap, Path(id): Pa
             "pre_sale_quantity": r.get::<Option<f64>, _>("pre_sale_quantity"),
             "supplier_id": r.get::<Option<i64>, _>("supplier_id"),
             "supplier_name": r.get::<Option<String>, _>("supplier_name"),
+            "production_date": r.get::<Option<String>, _>("production_date"),
+            "batch_no": r.get::<Option<String>, _>("batch_no"),
             "remark": r.get::<Option<String>, _>("remark"),
         }))
         .collect();
@@ -8945,13 +9028,16 @@ pub async fn api_query_stock_balance(axum::extract::Query(params): axum::extract
 /// 按 (商品, order_date, src, sid) 顺序用净额累计计算。
 /// 返回的 SQL 不含外层 ORDER BY / LIMIT，由调用方追加。
 fn stock_flow_base_sql(where_clause: &str) -> String {
-    // 按订单最终状态聚合：同一订单同一商品的审核/反审核流水相互抵消，
+    // 按订单最终状态聚合：同一订单同一商品同一明细的审核/反审核流水相互抵消，
     // 净额为 0（最终未审核）的整组不显示，台账只保留最终生效的一条，不产生出入库虚数。
     // 审核与冲销归属同一 order_date，日期过滤不会拆散配对。
+    // 分组带 ref_item_id：同单同商品多行（补采/分行验收）各自成行，批次不同分行显示；历史行该列为 NULL 仍聚合成一行。
     format!(
         "SELECT * FROM (
             SELECT sm.order_date AS create_time,
-                   CASE WHEN sm.movement_type='purchase' THEN '入库' ELSE '出库' END AS type,
+                   sm.movement_type,
+                   CASE WHEN sm.movement_type='purchase' THEN '采购入库' ELSE '销售出库' END AS summary,
+                   CASE WHEN sm.movement_type='purchase' THEN 'in' ELSE 'out' END AS direction,
                    sm.product_id,
                    p.name AS product_name,
                    p.spec,
@@ -8962,17 +9048,20 @@ fn stock_flow_base_sql(where_clause: &str) -> String {
                    CASE WHEN sm.movement_type='sales'
                         THEN SUM(CASE WHEN sm.direction='out' THEN sm.base_quantity ELSE -sm.base_quantity END)
                         ELSE 0 END AS out_quantity,
-                   CASE WHEN sm.movement_type='purchase' THEN '入库-审核' ELSE '出库-验收' END AS remark,
                    ABS(SUM(CASE WHEN sm.direction=(CASE WHEN sm.movement_type='purchase' THEN 'in' ELSE 'out' END)
                            THEN sm.orig_quantity ELSE -sm.orig_quantity END)) AS orig_quantity,
                    MAX(sm.orig_unit) AS orig_unit,
+                   MAX(sm.ref_no) AS ref_no,
+                   MAX(sm.party_name) AS party_name,
+                   MAX(sm.production_date) AS production_date,
+                   MAX(sm.batch_no) AS batch_no,
                    CASE WHEN sm.movement_type='purchase' THEN 0 ELSE 1 END AS src,
                    MAX(sm.id) AS sid,
                    0.0 AS balance
             FROM stock_movement sm
             JOIN product p ON sm.product_id = p.id
             {}
-            GROUP BY sm.ref_type, sm.ref_id, sm.product_id, sm.movement_type, sm.order_date
+            GROUP BY sm.ref_type, sm.ref_id, sm.product_id, sm.movement_type, sm.order_date, sm.ref_item_id
         ) t
         WHERE t.in_quantity > 0.001 OR t.out_quantity > 0.001",
         where_clause
@@ -9024,6 +9113,7 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
     let start_date = params.get("start_date").map(|s| s.as_str()).unwrap_or("");
     let end_date = params.get("end_date").map(|s| s.as_str()).unwrap_or("");
     let product_id = params.get("product_id").and_then(|s| s.parse::<i64>().ok());
+    let group_view = params.get("view").map(|s| s.as_str()) == Some("group");
     let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
     let page_size: i64 = params.get("page_size").and_then(|s| s.parse().ok()).unwrap_or(200).clamp(1, 1000);
     let offset = (page - 1) * page_size;
@@ -9051,13 +9141,20 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
     // 分页查询：余额需从第 0 行开始累计才正确，故一次取到当前页末尾（LIMIT offset+page_size），
     // 应用层累计后再切出当前页；深度分页成本随页码线性增长，可接受
     let fetch_limit = offset + page_size;
-    // 与手工台账口径一致：按时间线（单据日期 → 先入后出 → 流水号）排序，
-    // 余额为各商品自身在该时间线下的逐笔结存
+    // 时间线视图：单据日期 → 先入后出 → 流水号；余额按各商品自身逐笔结存。
+    // 分户视图：先按商品聚拢，商品内仍按时间线——余额按 product_id 独立累计，行序变化不影响余额正确性。
+    let order_by = if group_view {
+        "product_id, create_time, src, sid"
+    } else {
+        "create_time, src, sid"
+    };
     let data_sql = format!(
-        "SELECT create_time, type, product_id, product_name, spec, unit, in_quantity, out_quantity, remark, orig_quantity, orig_unit
+        "SELECT create_time, movement_type, summary, direction, product_id, product_name, spec, unit,
+                in_quantity, out_quantity, orig_quantity, orig_unit,
+                ref_no, party_name, production_date, batch_no
          FROM ({})
-         ORDER BY create_time, src, sid LIMIT {}",
-        stock_flow_base_sql(&where_clause), fetch_limit
+         ORDER BY {} LIMIT {}",
+        stock_flow_base_sql(&where_clause), order_by, fetch_limit
     );
 
     let needs_bind = product_id.is_none() && !product_name.is_empty();
@@ -9080,13 +9177,19 @@ pub async fn api_query_stock_flow(axum::extract::Query(params): axum::extract::Q
         let out_qty = row.try_get::<f64, _>("out_quantity").unwrap_or(0.0);
         serde_json::json!({
             "create_time": row.get::<String, _>("create_time"),
-            "type": row.get::<String, _>("type"),
+            "movement_type": row.get::<String, _>("movement_type"),
+            "summary": row.get::<String, _>("summary"),
+            "direction": row.get::<String, _>("direction"),
+            "product_id": row.get::<i64, _>("product_id"),
             "product_name": row.get::<String, _>("product_name"),
             "spec": row.get::<Option<String>, _>("spec"),
             "unit": row.get::<Option<String>, _>("unit"),
             "in_quantity": in_qty,
             "out_quantity": out_qty,
-            "remark": row.get::<Option<String>, _>("remark"),
+            "ref_no": row.get::<Option<String>, _>("ref_no"),
+            "party_name": row.get::<Option<String>, _>("party_name"),
+            "production_date": row.get::<Option<String>, _>("production_date"),
+            "batch_no": row.get::<Option<String>, _>("batch_no"),
             "balance": balances.get(i).copied().unwrap_or(0.0),
             "orig_quantity": row.try_get::<f64, _>("orig_quantity").unwrap_or(0.0),
             "orig_unit": row.get::<Option<String>, _>("orig_unit"),
@@ -9560,7 +9663,7 @@ pub async fn api_query_purchase_price_export(headers: axum::http::HeaderMap, axu
     let mut binds: Vec<String> = Vec::new();
     if !product_name.is_empty() { base_sql.push_str(" AND poi.product_name LIKE ?"); binds.push(format!("%{}%", product_name)); }
     if !supplier_id.is_empty() { base_sql.push_str(" AND po.supplier_id = ?"); binds.push(supplier_id.to_string()); }
-    let data_sql = format!("SELECT poi.product_name, poi.unit, poi.unit_price, poi.quantity, poi.amount, poi.production_date, poi.remark, p.shelf_life, po.order_date, s.name as supplier_name, s.phone as contact_phone {} ORDER BY po.order_date ASC, poi.id ASC", base_sql);
+    let data_sql = format!("SELECT poi.product_name, poi.unit, poi.unit_price, poi.quantity, poi.amount, poi.production_date, poi.remark, p.shelf_life, po.order_date, s.name as supplier_name {} ORDER BY po.order_date ASC, poi.id ASC", base_sql);
     let mut query = sqlx::query(AssertSqlSafe(data_sql.as_str())); for b in &binds { query = query.bind(b); }
     let rows = query.fetch_all(crate::db::pool()).await.unwrap_or_default();
     let mut workbook = Workbook::new(); let ws = workbook.add_worksheet(); ws.set_name("采购台账").unwrap();
@@ -9589,15 +9692,16 @@ pub async fn api_query_purchase_price_export(headers: axum::http::HeaderMap, axu
     let grid_shrink_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center).set_shrink();
     // 表头大标题：商品进货台账
     let title_fmt = Format::new().set_bold().set_font_size(20.0).set_align(FormatAlign::Center);
-    ws.merge_range(0, 0, 0, 11, "商 品 进 货 台 账", &title_fmt).unwrap();
+    ws.merge_range(0, 0, 0, 10, "商 品 进 货 台 账", &title_fmt).unwrap();
     // 第2行为空白间隔行（表头与表格间隔一行）
-    // 列头（第3行）：进货日期 序号 品名规格 单位 单价 数量 金额 生产日期 保质期 供应商 联系电话 备注
-    let headers_arr = ["进货日期", "序号", "品名规格", "单位", "单价", "数量", "金额", "生产日期", "保质期", "供应商", "联系电话", "备注"];
+    // 列头（第3行）：进货日期 序号 品名规格 单位 单价 数量 金额 生产日期 保质期 供应商 备注
+    // 供应商地址/电话等高度重复信息已移至独立档案维护页，台账不再逐行重复
+    let headers_arr = ["进货日期", "序号", "品名规格", "单位", "单价", "数量", "金额", "生产日期", "保质期", "供应商", "备注"];
     for (col, h) in headers_arr.iter().enumerate() {
         let blank = !is_super_admin && (*h == "单价" || *h == "金额");
         ws.write_with_format(2, col as u16, if blank { "" } else { *h }, &hf).unwrap();
     }
-    let widths = [11u32, 5, 16, 5, 8, 8, 12, 11, 6, 14, 12, 10];
+    let widths = [11u32, 5, 20, 5, 8, 8, 12, 11, 6, 18, 14];
     for (col, w) in widths.iter().enumerate() { ws.set_column_width(col as u16, *w).unwrap(); }
     // 序号以日期重新计数（每行均为明细记录，逐行编号）
     let mut prev_date = String::new();
@@ -9626,8 +9730,7 @@ pub async fn api_query_purchase_price_export(headers: axum::http::HeaderMap, axu
         ws.write_with_format(r, 7, row.get::<Option<String>, _>("production_date").unwrap_or_default(), &grid_center).unwrap();
         ws.write_with_format(r, 8, row.get::<Option<String>, _>("shelf_life").unwrap_or_default(), &grid_center).unwrap();
         ws.write_with_format(r, 9, row.get::<String, _>("supplier_name"), &grid_shrink_center).unwrap();
-        ws.write_with_format(r, 10, row.get::<Option<String>, _>("contact_phone").unwrap_or_default(), &grid_center).unwrap();
-        ws.write_with_format(r, 11, row.get::<Option<String>, _>("remark").unwrap_or_default(), &grid_left).unwrap();
+        ws.write_with_format(r, 10, row.get::<Option<String>, _>("remark").unwrap_or_default(), &grid_left).unwrap();
     }
     // 数据不足 25 条时补空行，保证每页固定 25 条明细记录（空行带网格边框）
     const PAGE_SIZE: usize = 25;
@@ -9635,7 +9738,7 @@ pub async fn api_query_purchase_price_export(headers: axum::http::HeaderMap, axu
     let fill = (PAGE_SIZE - (total_data % PAGE_SIZE)) % PAGE_SIZE;
     for i in 0..fill {
         let r = (total_data + i + 3) as u32;
-        for col in 0..12u16 {
+        for col in 0..11u16 {
             ws.write_with_format(r, col, "", &grid_left).unwrap();
         }
     }
@@ -9941,18 +10044,265 @@ pub async fn api_query_stock_balance_export(axum::extract::Query(params): axum::
 
 pub async fn api_query_stock_flow_export(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
     let product_name=params.get("product_name").map(|s|s.as_str()).unwrap_or("");let start_date=params.get("start_date").map(|s|s.as_str()).unwrap_or("");let end_date=params.get("end_date").map(|s|s.as_str()).unwrap_or("");let product_id=params.get("product_id").and_then(|s|s.parse::<i64>().ok());
+    let fmt=params.get("format").map(|s|s.as_str()).unwrap_or("ledger");
     let pattern=format!("%{}%",product_name);let mut wc=String::from("WHERE 1=1");
     if let Some(pid)=product_id{wc.push_str(&format!(" AND sm.product_id={}",pid));}else if!product_name.is_empty(){wc.push_str(" AND p.name LIKE ?");}
     if!start_date.is_empty(){wc.push_str(&format!(" AND sm.order_date>='{}'",start_date));}if!end_date.is_empty(){wc.push_str(&format!(" AND sm.order_date<='{}'",end_date));}
-    // 与台账查询同一口径：时间线排序 + 应用层累计余额（与 api_query_stock_flow 一致）
-    let sql=format!("SELECT create_time,type,product_id,product_name,spec,unit,in_quantity,out_quantity,remark,orig_quantity,orig_unit FROM ({}) ORDER BY create_time,src,sid",stock_flow_base_sql(&wc));
+
+    // 时间线补打：全部商品按单据日期连续紧凑排列，不按户分页，只输出新期间薄薄几页续接旧账本。
+    // 每行结存仍是该商品自身余额（期初 = 开始日期前全历史净额），第一行即承接前期账。
+    if fmt == "timeline" {
+        let sql=format!("SELECT create_time,movement_type,summary,direction,product_id,product_name,spec,unit,in_quantity,out_quantity,orig_quantity,orig_unit,ref_no,party_name,production_date,batch_no FROM ({}) ORDER BY create_time,src,sid",stock_flow_base_sql(&wc));
+        let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()};
+        if rows.is_empty(){
+            return xlsx_response(Workbook::new().save_to_buffer().unwrap_or_default(), "出入库记录-时间线补打.xlsx");
+        }
+        let balances=compute_running_balances(&rows,start_date).await;
+        let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("出入库记录").unwrap();
+        let hf = Format::new().set_bold()
+            .set_background_color(Color::RGB(0xD9D9D9)).set_font_color(Color::Black)
+            .set_align(FormatAlign::Center).set_align(FormatAlign::VerticalCenter)
+            .set_text_wrap()
+            .set_border(FormatBorder::Thin);
+        ws.set_landscape(); ws.set_paper_size(9);
+        let margin_cm = 2.0f64/2.54;
+        ws.set_margins(margin_cm, margin_cm, 0.0, 0.0, 0.0, 0.0);
+        ws.set_print_center_horizontally(true);
+        ws.set_footer("&C第&[Page]页");
+        ws.set_repeat_rows(0, 2).unwrap();
+        let grid_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center);
+        let grid_left = Format::new().set_border(FormatBorder::Thin);
+        let grid_shrink_left = Format::new().set_border(FormatBorder::Thin).set_shrink();
+        let grid_shrink_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center).set_shrink();
+        let red_center = Format::new().set_font_color(Color::RGB(0xC00000)).set_border(FormatBorder::Thin).set_align(FormatAlign::Center);
+        let title_fmt = Format::new().set_bold().set_font_size(20.0).set_align(FormatAlign::Center);
+        // 标题含补打期间，便于与前期账本区分、装订排序
+        let period = match (start_date.is_empty(), end_date.is_empty()) {
+            (false,false)=>format!("（{} 至 {} 补打）",start_date,end_date),
+            (false,true)=>format!("（{} 起补打）",start_date),
+            (true,false)=>format!("（截至 {}）",end_date),
+            _=>String::new(),
+        };
+        let title = format!("出 入 库 流 水 账{}",period);
+        ws.merge_range(0,0,0,9,title.as_str(),&title_fmt).unwrap();
+        // 类型列只标方向（入库/出库），数量合并单列——出库数量红色，装订翻阅时一眼可辨；
+        // 品名规格取商品名称本身（名称已含规格，如"元宝大豆油20L"），不再单列规格
+        let headers_arr=["日期","类型","单据号","品名规格","单位","数量","结存","来源/去向","生产日期\n/批号","备注"];
+        for(c,h)in headers_arr.iter().enumerate(){ws.write_with_format(2,c as u16,*h,&hf).unwrap();}
+        // 日期/类型/单据号/生产日期批号 4 列按内容自适应宽度（中文按 2 宽计，初值含列头）；
+        // 品名规格/单位/数量/结存/来源去向/备注 6 列固定宽度
+        for(c,w)in [(3u16,26u32),(4,5),(5,9),(6,9),(7,16),(9,12)].iter(){ws.set_column_width(*c,*w).unwrap();}
+        let disp_w=|s:&str|->f64{s.chars().map(|c|if(c as u32)>=0x2E80{2.0}else{1.0}).sum()};
+        let mut aw=[11.0f64,5.0,8.0,8.0];
+        let fmt_qty = |q: f64| -> String { if q == 0.0 {String::new()} else {let r=(q*100.0).round()/100.0; format!("{}",r)} };
+        for(i,row)in rows.iter().enumerate(){
+            let r=(i+3)as u32;
+            let inq=row.try_get::<f64,_>("in_quantity").unwrap_or(0.0);
+            let outq=row.try_get::<f64,_>("out_quantity").unwrap_or(0.0);
+            let is_out = outq != 0.0;
+            let qty_s = fmt_qty(if is_out {outq} else {inq});
+            let bal=balances.get(i).copied().unwrap_or(0.0);
+            let unit=row.get::<Option<String>,_>("unit").unwrap_or_default();
+            let orig_q=row.try_get::<f64,_>("orig_quantity").unwrap_or(0.0);
+            let orig_u=row.get::<Option<String>,_>("orig_unit").unwrap_or_default();
+            let remark=if!orig_u.is_empty()&&orig_u!=unit&&orig_q!=0.0{format!("原{}{}",fmt_qty(orig_q),orig_u)}else{String::new()};
+            let prod=row.try_get::<Option<String>,_>("production_date").unwrap_or(None);
+            let batch=row.try_get::<Option<String>,_>("batch_no").unwrap_or(None);
+            let batch_s=match(prod.as_deref().unwrap_or(""),batch.as_deref().unwrap_or("")){
+                ("","")=>String::new(),(p,"")=>p.to_string(),("",b)=>b.to_string(),(p,b)=>format!("{} / {}",p,b)
+            };
+            let ref_s=row.get::<Option<String>,_>("ref_no").unwrap_or_default();
+            aw[0]=aw[0].max(disp_w(row.get::<String,_>("create_time").as_str()));
+            aw[2]=aw[2].max(disp_w(ref_s.as_str()));
+            aw[3]=aw[3].max(disp_w(batch_s.as_str()));
+            ws.write_with_format(r,0,row.get::<String,_>("create_time"),&grid_center).unwrap();
+            ws.write_with_format(r,1,if is_out {"出库"} else {"入库"},&grid_center).unwrap();
+            ws.write_with_format(r,2,ref_s,&grid_shrink_center).unwrap();
+            ws.write_with_format(r,3,row.get::<String,_>("product_name"),&grid_shrink_left).unwrap();
+            ws.write_with_format(r,4,unit,&grid_center).unwrap();
+            ws.write_with_format(r,5,qty_s,if is_out {&red_center} else {&grid_center}).unwrap();
+            ws.write_with_format(r,6,bal,if bal<0.0{&red_center}else{&grid_center}).unwrap();
+            ws.write_with_format(r,7,row.get::<Option<String>,_>("party_name").unwrap_or_default(),&grid_shrink_left).unwrap();
+            ws.write_with_format(r,8,batch_s,&grid_shrink_center).unwrap();
+            ws.write_with_format(r,9,remark,&grid_left).unwrap();
+        }
+        // 紧凑连续分页：每满 25 条一页，数据不足不补空行（补打页不浪费纸张）
+        let total=rows.len();
+        let breaks:Vec<u32>=(1..).map(|k|k*25).take_while(|&c|c<total).map(|c|c as u32+3).collect();
+        if!breaks.is_empty(){ws.set_page_breaks(&breaks).unwrap();}
+        // 4 列自适应宽度应用（+1 边距；列宽是列级元数据，数据写完后设置同样生效）
+        ws.set_column_width(0,aw[0]+1.0).unwrap();
+        ws.set_column_width(1,aw[1]+1.0).unwrap();
+        ws.set_column_width(2,aw[2]+1.0).unwrap();
+        ws.set_column_width(8,aw[3]+1.0).unwrap();
+        let last_row=(total+2)as u32;
+        // 行高：标题/间隔/数据行固定 20（标题 30）；列头行（r=2）不设固定行高，由 Excel 按换行内容自动撑高
+        for r in 1..=last_row{ if r!=2 { ws.set_row_height(r,20.0).unwrap(); } }
+        ws.set_row_height(0,30.0).unwrap();
+        return xlsx_response(workbook.save_to_buffer().unwrap(), "出入库记录-时间线补打.xlsx");
+    }
+
+    // 一品一户数量保管账：服务端按商品聚拢（户内时间线），余额按 product_id 独立累计
+    let sql=format!("SELECT create_time,movement_type,summary,direction,product_id,product_name,spec,unit,in_quantity,out_quantity,orig_quantity,orig_unit,ref_no,party_name,production_date,batch_no FROM ({}) ORDER BY product_id,create_time,src,sid",stock_flow_base_sql(&wc));
     let rows=if product_id.is_some()||product_name.is_empty(){sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default()}else{sqlx::query(AssertSqlSafe(sql.as_str())).bind(&pattern).fetch_all(crate::db::pool()).await.unwrap_or_default()};
-    let balances=compute_running_balances(&rows,start_date).await;
-    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("库存流水").unwrap();let hf=xlsx_header_format(0x2E75B6);
-    for(c,h)in["日期","类型","商品名称","规格","单位","入库数量","出库数量","余额","原始数量","原始单位","备注"].iter().enumerate(){ws.write_with_format(0,c as u16,*h,&hf).unwrap();}
-    ws.set_column_width(0,14).unwrap();ws.set_column_width(1,12).unwrap();ws.set_column_width(2,20).unwrap();ws.set_column_width(3,14).unwrap();ws.set_column_width(4,10).unwrap();ws.set_column_width(5,12).unwrap();ws.set_column_width(6,12).unwrap();ws.set_column_width(7,12).unwrap();ws.set_column_width(8,12).unwrap();ws.set_column_width(9,10).unwrap();ws.set_column_width(10,20).unwrap();
-    for(i,row)in rows.iter().enumerate(){let r=(i+1)as u32;ws.write(r,0,row.get::<String,_>("create_time")).unwrap();ws.write(r,1,row.get::<String,_>("type")).unwrap();ws.write(r,2,row.get::<String,_>("product_name")).unwrap();ws.write(r,3,row.get::<Option<String>,_>("spec").unwrap_or_default()).unwrap();ws.write(r,4,row.get::<Option<String>,_>("unit").unwrap_or_default()).unwrap();ws.write(r,5,row.try_get::<f64,_>("in_quantity").unwrap_or(0.0)).unwrap();ws.write(r,6,row.try_get::<f64,_>("out_quantity").unwrap_or(0.0)).unwrap();ws.write(r,7,balances.get(i).copied().unwrap_or(0.0)).unwrap();ws.write(r,8,row.try_get::<f64,_>("orig_quantity").unwrap_or(0.0)).unwrap();ws.write(r,9,row.get::<Option<String>,_>("orig_unit").unwrap_or_default()).unwrap();ws.write(r,10,row.get::<Option<String>,_>("remark").unwrap_or_default()).unwrap();}
-    xlsx_response(workbook.save_to_buffer().unwrap(), "库存流水查询.xlsx")
+    if rows.is_empty(){
+        return xlsx_response(Workbook::new().save_to_buffer().unwrap_or_default(), "出入库记录.xlsx");
+    }
+
+    // 期初：各商品在基准日期之前的聚合净额（与 compute_running_balances 同口径）
+    let mut pids: Vec<i64> = rows.iter().map(|r| r.get::<i64,_>("product_id")).collect();
+    pids.sort_unstable(); pids.dedup();
+    let pid_list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let first_date = rows.iter().map(|r| r.get::<String,_>("create_time")).min().unwrap_or_default();
+    let base_date = if start_date.is_empty() { first_date.as_str() } else { start_date };
+    let opening_sql = format!(
+        "SELECT product_id, SUM(in_quantity - out_quantity) AS net FROM ({}) GROUP BY product_id",
+        stock_flow_base_sql(&format!("WHERE sm.product_id IN ({}) AND sm.order_date < '{}'", pid_list, base_date))
+    );
+    let opening_rows = sqlx::query(AssertSqlSafe(opening_sql.as_str())).fetch_all(crate::db::pool()).await.unwrap_or_default();
+    let mut opening: std::collections::HashMap<i64,f64> = std::collections::HashMap::new();
+    for r in &opening_rows { opening.insert(r.get::<i64,_>("product_id"), r.get::<f64,_>("net")); }
+    let warehouse_name: String = sqlx::query_scalar("SELECT name FROM warehouse WHERE id=1")
+        .fetch_one(crate::db::pool()).await.unwrap_or_else(|_| "主仓".to_string());
+
+    let mut workbook=Workbook::new();let ws=workbook.add_worksheet();ws.set_name("出入库记录").unwrap();
+    // 打印布局与采购台账一致：A4 横版、浅灰列头黑字、行高 20、25 行/页、页脚页码
+    let hf = Format::new().set_bold()
+        .set_background_color(Color::RGB(0xD9D9D9)).set_font_color(Color::Black)
+        .set_align(FormatAlign::Center).set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin);
+    ws.set_landscape(); ws.set_paper_size(9);
+    let margin_cm = 2.0f64/2.54;
+    ws.set_margins(margin_cm, margin_cm, 0.0, 0.0, 0.0, 0.0);
+    ws.set_print_center_horizontally(true);
+    ws.set_footer("&C第&[Page]页");
+    ws.set_repeat_rows(0, 2).unwrap();
+    let grid_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center);
+    let grid_left = Format::new().set_border(FormatBorder::Thin);
+    let grid_shrink_left = Format::new().set_border(FormatBorder::Thin).set_shrink();
+    let grid_shrink_center = Format::new().set_border(FormatBorder::Thin).set_align(FormatAlign::Center).set_shrink();
+    let bold_center = Format::new().set_bold().set_border(FormatBorder::Thin).set_align(FormatAlign::Center);
+    let bold_left = Format::new().set_bold().set_border(FormatBorder::Thin);
+    let head_fmt = Format::new().set_bold().set_background_color(Color::RGB(0xF2F2F2))
+        .set_border(FormatBorder::Thin).set_align(FormatAlign::VerticalCenter);
+    let title_fmt = Format::new().set_bold().set_font_size(20.0).set_align(FormatAlign::Center);
+    ws.merge_range(0,0,0,8,"出 入 库 记 录（数量保管账）",&title_fmt).unwrap();
+    let headers_arr = ["日期","单据号","摘要","来源/去向","入库数量","出库数量","结存数量","生产日期/批号","备注"];
+    for (c,h) in headers_arr.iter().enumerate() { ws.write_with_format(2,c as u16,*h,&hf).unwrap(); }
+    let widths=[12u32,17,10,18,10,10,10,20,16];
+    for (c,w) in widths.iter().enumerate() { ws.set_column_width(c as u16,*w).unwrap(); }
+
+    // 数量为 0 留白；结存允许负数（红字提示账实异常）
+    let red_bold = Format::new().set_bold().set_font_color(Color::RGB(0xC00000)).set_border(FormatBorder::Thin).set_align(FormatAlign::Center);
+    let fmt_qty = |q: f64| -> String { if q == 0.0 { String::new() } else { let r=(q*100.0).round()/100.0; format!("{}",r) } };
+    let batch_text = |prod: &Option<String>, batch: &Option<String>| -> String {
+        match (prod.as_deref().unwrap_or(""), batch.as_deref().unwrap_or("")) {
+            ("","")=>String::new(), (p,"")=>p.to_string(), ("",b)=>b.to_string(), (p,b)=>format!("{} / {}",p,b)
+        }
+    };
+
+    const PER_PAGE: usize = 25;
+    let mut content_k: usize = 0;            // 内容区行计数（0 基，对应工作表行 content_k+3）
+    let mut breaks: Vec<u32> = Vec::new();
+    let mut idx = 0usize;
+    while idx < rows.len() {
+        let pid = rows[idx].get::<i64,_>("product_id");
+        let name = rows[idx].get::<String,_>("product_name");
+        let spec = rows[idx].get::<Option<String>,_>("spec").unwrap_or_default();
+        let unit = rows[idx].get::<Option<String>,_>("unit").unwrap_or_default();
+        let mut j = idx;
+        while j < rows.len() && rows[j].get::<i64,_>("product_id") == pid { j += 1; }
+        let block = &rows[idx..j];
+
+        // 补空行对齐到页边界，保证每个商品一户一页起打
+        let used = 2 + block.len() + 1;      // 账头 + 期初 + 流水 + 本期合计
+        let fill = (PER_PAGE - (used % PER_PAGE)) % PER_PAGE;
+        if content_k % PER_PAGE != 0 {
+            // 理论上每块结束都补齐，这里防御性处理（首块 k=0 不补）
+            let gap = PER_PAGE - content_k % PER_PAGE;
+            for _ in 0..gap {
+                let r = (content_k + 3) as u32;
+                for c in 0..9u16 { ws.write_with_format(r,c,"",&grid_left).unwrap(); }
+                content_k += 1;
+            }
+        }
+
+        // 账头行：品名规格 / 计量单位 / 仓库
+        let head_text = format!("品名规格：{} {}　　计量单位：{}　　仓库：{}", name, spec, unit, warehouse_name);
+        let r = (content_k + 3) as u32;
+        ws.merge_range(r,0,r,8,head_text.as_str(),&head_fmt).unwrap();
+        content_k += 1;
+
+        // 期初行
+        let mut bal = opening.get(&pid).copied().unwrap_or(0.0);
+        let r = (content_k + 3) as u32;
+        ws.write_with_format(r,0,"期初",&grid_center).unwrap();
+        ws.write_with_format(r,1,"",&grid_center).unwrap();
+        ws.write_with_format(r,2,"上期结转",&grid_center).unwrap();
+        for c in 3..6u16 { ws.write_with_format(r,c,"",&grid_left).unwrap(); }
+        ws.write_with_format(r,6,bal,if bal<0.0 {&red_bold}else{&bold_center}).unwrap();
+        ws.write_with_format(r,7,"",&grid_center).unwrap();
+        ws.write_with_format(r,8,"",&grid_left).unwrap();
+        content_k += 1;
+
+        // 流水行
+        let mut sum_in = 0.0; let mut sum_out = 0.0;
+        for row in block {
+            let inq = row.try_get::<f64,_>("in_quantity").unwrap_or(0.0);
+            let outq = row.try_get::<f64,_>("out_quantity").unwrap_or(0.0);
+            sum_in += inq; sum_out += outq; bal += inq - outq;
+            let r = (content_k + 3) as u32;
+            ws.write_with_format(r,0,row.get::<String,_>("create_time"),&grid_center).unwrap();
+            ws.write_with_format(r,1,row.get::<Option<String>,_>("ref_no").unwrap_or_default(),&grid_shrink_center).unwrap();
+            ws.write_with_format(r,2,row.get::<String,_>("summary"),&grid_center).unwrap();
+            ws.write_with_format(r,3,row.get::<Option<String>,_>("party_name").unwrap_or_default(),&grid_shrink_left).unwrap();
+            ws.write_with_format(r,4,fmt_qty(inq),&grid_left).unwrap();
+            ws.write_with_format(r,5,fmt_qty(outq),&grid_left).unwrap();
+            ws.write_with_format(r,6,bal,if bal<0.0 {&red_bold}else{&grid_center}).unwrap();
+            ws.write_with_format(r,7,batch_text(&row.try_get::<Option<String>,_>("production_date").unwrap_or(None),
+                                               &row.try_get::<Option<String>,_>("batch_no").unwrap_or(None)),&grid_shrink_center).unwrap();
+            // 备注：原始大单位与基础单位不同时显示「原X大单位」
+            let orig_q = row.try_get::<f64,_>("orig_quantity").unwrap_or(0.0);
+            let orig_u = row.get::<Option<String>,_>("orig_unit").unwrap_or_default();
+            let remark = if !orig_u.is_empty() && orig_u != unit && orig_q != 0.0 {
+                format!("原{}{}", fmt_qty(orig_q), orig_u)
+            } else { String::new() };
+            ws.write_with_format(r,8,remark,&grid_left).unwrap();
+            content_k += 1;
+        }
+
+        // 本期合计行
+        let r = (content_k + 3) as u32;
+        ws.write_with_format(r,0,"",&grid_center).unwrap();
+        ws.write_with_format(r,1,"",&grid_center).unwrap();
+        ws.write_with_format(r,2,"本期合计",&bold_center).unwrap();
+        ws.write_with_format(r,3,"",&grid_left).unwrap();
+        ws.write_with_format(r,4,fmt_qty(sum_in),&bold_left).unwrap();
+        ws.write_with_format(r,5,fmt_qty(sum_out),&bold_left).unwrap();
+        ws.write_with_format(r,6,bal,if bal<0.0 {&red_bold}else{&bold_center}).unwrap();
+        ws.write_with_format(r,7,"",&grid_center).unwrap();
+        ws.write_with_format(r,8,"",&grid_left).unwrap();
+        content_k += 1;
+
+        // 补带框空行至本页满 25 行
+        for _ in 0..fill {
+            let r = (content_k + 3) as u32;
+            for c in 0..9u16 { ws.write_with_format(r,c,"",&grid_left).unwrap(); }
+            content_k += 1;
+        }
+        // 下一户另起一页（最后一户不分页）
+        if j < rows.len() {
+            breaks.push((content_k + 3) as u32);
+        }
+        idx = j;
+    }
+    if !breaks.is_empty() { ws.set_page_breaks(&breaks).unwrap(); }
+    // 行高统一 20（大标题行 30）
+    let last_row = (content_k + 2) as u32;
+    for r in 0..=last_row { ws.set_row_height(r,20.0).unwrap(); }
+    ws.set_row_height(0,30.0).unwrap();
+
+    xlsx_response(workbook.save_to_buffer().unwrap(), "出入库记录.xlsx")
 }
 
 pub async fn api_query_stock_warning_export() -> impl IntoResponse {
@@ -14390,24 +14740,9 @@ pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(
     //   进入 accepted（confirmed/delivered -> accepted）：写销售出库（out）
     //   离开 accepted（accepted -> delivered，撤销验收）  ：写冲销（in）
     // pending -> confirmed（审核）、confirmed -> pending（反审核）均不动库存。
-    let mv_res: Result<(), sqlx::Error> = if new_status == "accepted" {
-        write_stock_movements_for_audit(
-            &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "确认验收"
-        ).await
-    } else if current_status == "accepted" {
-        write_stock_movements_for_unaudit(
-            &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "撤销验收冲销"
-        ).await
-    } else {
-        Ok(())
-    };
-    if let Err(e) = mv_res {
-        let _ = tx.rollback().await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("状态更新失败：写库存流水失败 {}", e));
-    }
 
-    // FIFO 快照：确认验收时按先进先出取当前库存最早批次的 生产日期/批号 写入销售明细，
-    // 供验收单/报销单导出直接读取；撤销验收时清空（重新验收会重算）。
+    // FIFO 快照必须在写出库流水之前完成：流水行要携带本次出库实际消耗批次（销售明细快照）。
+    // 撤销验收时快照在冲销流水之后才清空（冲销行沿用原批次，保证与原出库行配对抵消）。
     if new_status == "accepted" {
         let items: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT id, COALESCE(product_id, 0) FROM sales_order_item WHERE order_id = ?"
@@ -14428,7 +14763,26 @@ pub async fn api_sales_order_update_status(headers: axum::http::HeaderMap, Json(
             .execute(&mut *tx)
             .await;
         }
-    } else if current_status == "accepted" && new_status != "accepted" {
+    }
+
+    let mv_res: Result<(), sqlx::Error> = if new_status == "accepted" {
+        write_stock_movements_for_audit(
+            &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "确认验收"
+        ).await
+    } else if current_status == "accepted" {
+        write_stock_movements_for_unaudit(
+            &mut tx, id, "sales_order_item", "out", "sales", "sales", "销售出库", "撤销验收冲销"
+        ).await
+    } else {
+        Ok(())
+    };
+    if let Err(e) = mv_res {
+        let _ = tx.rollback().await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("状态更新失败：写库存流水失败 {}", e));
+    }
+
+    // 撤销验收清空批次快照（重新验收会重算）
+    if current_status == "accepted" && new_status != "accepted" {
         let _ = sqlx::query(
             "UPDATE sales_order_item SET production_date = NULL, batch_no = NULL WHERE order_id = ?"
         )

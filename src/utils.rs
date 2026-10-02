@@ -204,7 +204,7 @@ pub fn sidebar_html() -> String {
                                     <a href="/query/stock_balance"><span class="node-icon">📊</span><span class="node-label">实时库存余额</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_flow">
-                                    <a href="/query/stock_flow"><span class="node-icon">📋</span><span class="node-label">库存明细台账</span></a>
+                                    <a href="/query/stock_flow"><span class="node-icon">📋</span><span class="node-label">出入库记录</span></a>
                                 </li>
                                 <li class="tree-node leaf" data-path="/query/stock_summary">
                                     <a href="/query/stock_summary"><span class="node-icon">📈</span><span class="node-label">真实出入库统计</span></a>

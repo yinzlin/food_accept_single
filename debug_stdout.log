@@ -1,0 +1,7 @@
+﻿food_accept_single.exe : 数据库完整性检查通过
+At line:15 char:2706
++ ... win7-windows-msvc\release"; & ".\food_accept_single.exe" 2>&1 | Tee-O ...
++                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (数据库完整性检查通过:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

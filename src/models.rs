@@ -19,6 +19,25 @@ pub struct SupplierReq {
     pub business_scope: Option<String>,
     pub remark: Option<String>,
     pub category_id: Option<i64>,
+    // 定点供应商档案字段
+    #[serde(default)]
+    pub is_designated: Option<i64>,
+    #[serde(default)]
+    pub designated_no: Option<String>,
+    #[serde(default)]
+    pub legal_person: Option<String>,
+    #[serde(default)]
+    pub credit_code: Option<String>,
+    #[serde(default)]
+    pub license_no: Option<String>,
+    #[serde(default)]
+    pub license_expire: Option<String>,
+    #[serde(default)]
+    pub contract_no: Option<String>,
+    #[serde(default)]
+    pub contract_start: Option<String>,
+    #[serde(default)]
+    pub contract_end: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
